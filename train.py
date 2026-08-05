@@ -139,32 +139,36 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             # Forward qua CoANetWithTopo
-            out_dict = self.model(image)
-            
+            out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
+
             fused_mask = out_dict['fused_mask']       # [B, 1, H, W]
             seg_logits = out_dict['seg_logits']       # [B, 1, H, W]
             connect = out_dict['connect']             # [B, 9, H, W]
             connect_d1 = out_dict['connect_d1']       # [B, 9, H, W]
-            topo_scores = out_dict['topo_scores']     # [B, N_pairs, 1] hoặc None
-            gt_topo_targets = out_dict.get('gt_topo_targets', None)
-
+            aux_seg = out_dict.get('aux_seg', None)   # [B, 1, H, W]
+            topo_out = out_dict['topo']               # Dictionary chứa kết quả từ TopoNet
+            
             # 1. Tính CoANet Segmentation & Connectivity Loss
             c_loss, _ = self.coanet_loss_fn(
                 seg=seg_logits,
                 connect=connect,
                 connect_d1=connect_d1,
-                aux_seg=None,
+                aux_seg=aux_seg,
                 gt_seg=gt_mask,
                 gt_connect=gt_connect,
                 gt_connect_d1=gt_connect_d1
             )
-
-            # 2. Tính TopoNet Edge Loss (nếu có điểm/cạnh tạo ra)
+            
+            # 2. Tính TopoNet Loss từ dictionary topo_out
             t_loss = torch.tensor(0.0, device=image.device)
-            if topo_scores is not None and gt_topo_targets is not None:
-                t_loss = self.topo_loss_fn(topo_scores, gt_topo_targets)
-
-            # Tổng Loss huấn luyện
+            if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
+                t_loss = compute_topo_loss(
+                    logits=topo_out['logits'],
+                    edge_gt=topo_out['edge_gt'],
+                    pairs_valid=topo_out['pairs_valid']
+                )
+            
+            # Tổng Loss
             total_loss = c_loss + self.args.topo_weight * t_loss
 
             total_loss.backward()
