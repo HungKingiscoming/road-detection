@@ -267,7 +267,7 @@ class Trainer(object):
             else:
                 fused_mask_eval = fused_mask
 
-            pred = (torch.sigmoid(fused_mask_eval) > 0.5).detach().cpu().numpy().astype(np.int64)
+            pred = (fused_mask_eval > 0.5).detach().cpu().numpy().astype(np.int64)
             target_n = gt_mask.detach().cpu().numpy().astype(np.int64)
             self.evaluator.add_batch(target_n, pred)
 
@@ -354,7 +354,7 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                pred = (torch.sigmoid(fused_mask_eval) > 0.5).cpu().numpy().astype(np.int64)
+                pred = (fused_mask_eval > 0.5).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
 
