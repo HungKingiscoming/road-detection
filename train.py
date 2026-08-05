@@ -67,9 +67,9 @@ class Trainer(object):
 
         # 5. Khởi tạo Loss Function
         self.coanet_loss_fn = CoANetLoss(
-            weight_seg=1.0,
-            weight_connect=0.12,  # 0.2 * 0.6
-            weight_connect_d1=0.08 # 0.2 * 0.4
+            seg_loss_weight=1.0,
+            connect_loss_weight=0.12,     
+            connect_d1_loss_weight=0.08   
         )
         self.topo_loss_fn = TopoLoss(pos_weight=2.0)
 
