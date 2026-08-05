@@ -36,22 +36,23 @@ class Trainer(object):
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
-        # 3. Khởi tạo Mô hình CoANet + TopoNet
         topo_config = TopoConfig(
-            max_points=args.max_points,
-            k_neighbors=args.k_neighbors,
-            graph_mask_score_threshold=args.topo_score_thresh, 
-            coord_format='pixel'
+        max_points=args.max_points,
+        k_neighbors=args.k_neighbors,
+        graph_mask_score_threshold=args.topo_score_thresh,
+        coord_format='pixel'
         )
-
-        model = CoANetWithTopo(
+        base_coanet = CoANet(
+            backbone=args.backbone,
+            output_stride=args.out_stride,
             num_classes=self.nclass,
-            backbone_name=args.backbone,
-            out_stride=args.out_stride,
-            topo_config=topo_config,
             freeze_bn=args.freeze_bn
         )
-
+        model = CoANetWithTopo(
+            coanet=base_coanet,
+            topo_cfg=topo_config,
+            decoder_feature_dim=64
+        )
         # 4. Cấu hình Optimizer (Học phí khác nhau cho các module nếu cần)
         train_params = [
             {'params': model.coanet.parameters(), 'lr': args.lr},
