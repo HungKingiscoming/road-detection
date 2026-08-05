@@ -40,8 +40,8 @@ class Trainer(object):
         topo_config = TopoConfig(
             max_points=args.max_points,
             k_neighbors=args.k_neighbors,
-            score_thresh=args.topo_score_thresh,
-            coord_format='pixel'  # Đồng bộ dạng Pixel
+            graph_mask_score_threshold=args.topo_score_thresh, 
+            coord_format='pixel'
         )
 
         model = CoANetWithTopo(
