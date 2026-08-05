@@ -24,6 +24,25 @@ from utils.metrics import Evaluator
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
+def compute_grad_norm(model, norm_type: float = 2.0) -> float:
+    """Tính tổng grad-norm của toàn bộ parameters có requires_grad và grad != None.
+    Dùng để phát hiện gradient exploding (norm tăng đột biến) hoặc vanishing (norm ~0)."""
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(norm_type)
+            total_norm += param_norm.item() ** norm_type
+    return total_norm ** (1.0 / norm_type)
+
+
+def positive_ratio(x) -> float:
+    """Tỉ lệ pixel/giá trị > 0 (hoặc == 1) trong tensor/array. Dùng để theo dõi
+    mất cân bằng lớp và phát hiện hiện tượng model 'collapse' (dự đoán toàn 0 hoặc toàn 1)."""
+    if hasattr(x, 'float'):
+        return x.float().mean().item()
+    return float(np.mean(x))
+
+
 class Trainer(object):
     def __init__(self, args):
         self.args = args
@@ -152,7 +171,7 @@ class Trainer(object):
             topo_out = out_dict.get('topo', {})       # Dictionary chứa kết quả từ TopoNet
             
             # 1. Tính CoANet Segmentation & Connectivity Loss
-            c_loss, _ = self.coanet_loss_fn(
+            c_loss, c_loss_dict = self.coanet_loss_fn(
                 seg=seg_logits,
                 connect=connect,
                 connect_d1=connect_d1,
@@ -175,6 +194,10 @@ class Trainer(object):
             total_loss = c_loss + self.args.topo_weight * t_loss
 
             total_loss.backward()
+
+            # --- Debug: Grad-norm TRƯỚC khi optimizer.step() (norm bằng 0/NaN/Inf là dấu hiệu bug) ---
+            grad_norm = compute_grad_norm(self.model)
+
             self.optimizer.step()
 
             # Tích lũy Log Loss
@@ -182,10 +205,60 @@ class Trainer(object):
             train_coanet_loss += c_loss.item()
             train_topo_loss += t_loss.item()
 
+            global_step = i + num_img_tr * epoch
+            current_lr = self.optimizer.param_groups[0]['lr']
+
             tbar.set_description(
                 f'Loss: {train_loss/(i+1):.4f} | CoANet: {train_coanet_loss/(i+1):.4f} | Topo: {train_topo_loss/(i+1):.4f}'
             )
-            self.writer.add_scalar('train/total_loss_iter', total_loss.item(), i + num_img_tr * epoch)
+            self.writer.add_scalar('train/total_loss_iter', total_loss.item(), global_step)
+            self.writer.add_scalar('train/lr_iter', current_lr, global_step)
+            self.writer.add_scalar('train/grad_norm_iter', grad_norm, global_step)
+
+            # --- Debug: log định kỳ (không log mọi iter để đỡ nặng I/O) ---
+            if global_step % self.args.log_interval == 0:
+                # 2a. Log từng thành phần loss con của CoANet (seg / connect / connect_d1 / aux...)
+                if isinstance(c_loss_dict, dict):
+                    for k, v in c_loss_dict.items():
+                        v_val = v.item() if torch.is_tensor(v) else v
+                        self.writer.add_scalar(f'train/loss_{k}', v_val, global_step)
+
+                # 2b. Cảnh báo sớm nếu loss/grad bất thường (NaN, Inf, hoặc grad "chết")
+                if not np.isfinite(total_loss.item()):
+                    print(f"[CẢNH BÁO] total_loss không hợp lệ (NaN/Inf) tại step {global_step}: {total_loss.item()}")
+                if grad_norm == 0.0:
+                    print(f"[CẢNH BÁO] grad_norm = 0 tại step {global_step} — có thể gradient không chảy qua model (vanishing/branch bị detach nhầm).")
+                elif not np.isfinite(grad_norm):
+                    print(f"[CẢNH BÁO] grad_norm không hợp lệ (NaN/Inf) tại step {global_step}.")
+
+                # 2c. Thống kê tỉ lệ pixel "dương" (road) của seg_logits so với GT
+                #     -> phát hiện model bị "collapse" (dự đoán gần như toàn 0 hoặc toàn 1)
+                with torch.no_grad():
+                    seg_pos_ratio = positive_ratio(torch.sigmoid(seg_logits) > 0.5)
+                    gt_pos_ratio = positive_ratio(gt_mask > 0.5)
+                self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
+                self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
+
+                # 2d. Thống kê nhánh TopoNet: số cạnh candidate hợp lệ, tỉ lệ cạnh dương (edge_gt),
+                #     điểm số trung bình -> phát hiện trường hợp không có cạnh nào hợp lệ
+                #     (topo loss luôn = 0, hoặc mất cân bằng lớp cực đoan giữa cạnh dương/âm).
+                pairs_valid = topo_out.get('pairs_valid', None)
+                if pairs_valid is not None:
+                    n_valid_pairs = pairs_valid.float().sum().item()
+                    self.writer.add_scalar('train/topo_num_valid_pairs', n_valid_pairs, global_step)
+                    edge_gt = topo_out.get('edge_gt', None)
+                    if edge_gt is not None and n_valid_pairs > 0:
+                        edge_pos_ratio = (edge_gt * pairs_valid.float()).sum().item() / n_valid_pairs
+                        self.writer.add_scalar('train/topo_edge_positive_ratio', edge_pos_ratio, global_step)
+                    if 'scores' in topo_out:
+                        mean_score = topo_out['scores'].detach().mean().item()
+                        self.writer.add_scalar('train/topo_mean_score', mean_score, global_step)
+
+                # 2e. In gọn ra console để dễ theo dõi khi chạy trên Kaggle/Colab (log không lưu tensorboard)
+                tqdm.write(
+                    f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} "
+                    f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f}"
+                )
 
             # --- Đánh giá Metric trên Fused Mask đầu ra ---
             # Align kích thước Spatial (H, W) của fused_mask khớp với gt_mask trước khi nhị phân hóa
@@ -194,7 +267,7 @@ class Trainer(object):
             else:
                 fused_mask_eval = fused_mask
 
-            pred = (fused_mask_eval > 0.5).detach().cpu().numpy().astype(np.int64)
+            pred = (torch.sigmoid(fused_mask_eval) > 0.5).detach().cpu().numpy().astype(np.int64)
             target_n = gt_mask.detach().cpu().numpy().astype(np.int64)
             self.evaluator.add_batch(target_n, pred)
 
@@ -206,14 +279,25 @@ class Trainer(object):
         F1 = self.evaluator.Pixel_F1()
 
         self.writer.add_scalar('train/total_loss_epoch', train_loss / num_img_tr, epoch)
+        self.writer.add_scalar('train/coanet_loss_epoch', train_coanet_loss / num_img_tr, epoch)
+        self.writer.add_scalar('train/topo_loss_epoch', train_topo_loss / num_img_tr, epoch)
         self.writer.add_scalar('train/mIoU', mIoU, epoch)
         self.writer.add_scalar('train/Acc', Acc, epoch)
         self.writer.add_scalar('train/Precision', Precision, epoch)
         self.writer.add_scalar('train/Recall', Recall, epoch)
         self.writer.add_scalar('train/F1', F1, epoch)
+        self.writer.add_scalar('train/lr_epoch', self.optimizer.param_groups[0]['lr'], epoch)
 
         print(f'\n--- Train Epoch {epoch} Results ---')
         print(f'mIoU: {mIoU:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
+
+        # --- Debug: cảnh báo sớm nếu Recall gần 1.0 nhưng Precision rất thấp
+        # (dấu hiệu kinh điển của việc model/metric dự đoán gần như toàn bộ ảnh là "road")
+        if Recall > 0.98 and Precision < 0.2:
+            print(f"[CẢNH BÁO] Recall={Recall:.4f} rất cao trong khi Precision={Precision:.4f} rất thấp "
+                  f"-> khả năng cao model đang dự đoán gần như toàn bộ pixel là positive. "
+                  f"Kiểm tra lại: (1) có bị sigmoid 2 lần trên xác suất không, "
+                  f"(2) class imbalance / pos_weight trong loss, (3) ngưỡng threshold khi nhị phân hoá.")
 
         if self.args.no_val:
             is_best = False
@@ -270,9 +354,18 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                pred = (fused_mask_eval > 0.5).cpu().numpy().astype(np.int64)
+                pred = (torch.sigmoid(fused_mask_eval) > 0.5).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
+
+                # --- Debug: theo dõi tỉ lệ pixel dương của val prediction so với GT ---
+                # Nếu pred_pos_ratio lệch rất xa gt_pos_ratio (vd luôn gần 1.0) -> model đang
+                # collapse / có bug tương tự lỗi sigmoid-kép trước đây.
+                if i % max(1, num_img_val // 10) == 0:
+                    val_pred_pos_ratio = positive_ratio(pred)
+                    val_gt_pos_ratio = positive_ratio(target_n)
+                    self.writer.add_scalar('val/pred_positive_ratio', val_pred_pos_ratio, epoch * num_img_val + i)
+                    self.writer.add_scalar('val/gt_positive_ratio', val_gt_pos_ratio, epoch * num_img_val + i)
 
                 if i % max(1, num_img_val // 5) == 0:
                     self.summary.visualize_image(
@@ -345,6 +438,8 @@ def main():
     parser.add_argument('--ft', action='store_true', default=False, help='finetuning mode')
     parser.add_argument('--eval-interval', type=int, default=1, help='evaluation interval')
     parser.add_argument('--no-val', action='store_true', default=False, help='skip validation')
+    parser.add_argument('--log-interval', type=int, default=20,
+                         help='số iteration giữa mỗi lần log chi tiết (grad-norm, sub-loss, topo stats,...) vào tensorboard')
 
     args = parser.parse_args()
     if args.data_dir is None:
