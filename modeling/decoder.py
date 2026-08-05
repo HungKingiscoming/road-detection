@@ -14,7 +14,7 @@ class DecoderBlock(nn.Module):
         super(DecoderBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
         self.bn1 = BatchNorm(in_channels // 4)
-        self.relu1 = nn.ReLU()
+        self.relu1 = nn.ReLU(inplace=True)
         self.inp = inp
 
         self.deconv1 = nn.Conv2d(
@@ -31,16 +31,16 @@ class DecoderBlock(nn.Module):
         )
 
         self.bn2 = BatchNorm(in_channels // 4 + in_channels // 4)
-        self.relu2 = nn.ReLU()
+        self.relu2 = nn.ReLU(inplace=True)
         self.conv3 = nn.Conv2d(
             in_channels // 4 + in_channels // 4, n_filters, 1
         )
         self.bn3 = BatchNorm(n_filters)
-        self.relu3 = nn.ReLU()
+        self.relu3 = nn.ReLU(inplace=True)
 
         self._init_weight()
 
-    def forward(self, x, inp=False):
+    def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu1(x)
@@ -49,11 +49,11 @@ class DecoderBlock(nn.Module):
         x2 = self.deconv2(x)
         x3 = self.inv_h_transform(self.deconv3(self.h_transform(x)))
         x4 = self.inv_v_transform(self.deconv4(self.v_transform(x)))
-        x = torch.cat((x1, x2, x3, x4), 1)
-        
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+
         if self.inp:
             x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
-            
+
         x = self.bn2(x)
         x = self.relu2(x)
         x = self.conv3(x)
@@ -109,11 +109,10 @@ class DecoderBlock(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, num_classes, backbone, BatchNorm, base_channels=32):
         super(Decoder, self).__init__()
-        
+
         if backbone == 'gcnet':
-            # c1=32, c2=64, c3=128, e4_dappm=128
             c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
-            in_inplanes = base_channels * 8 
+            in_inplanes = base_channels * 8
             self.decoder4 = DecoderBlock(in_inplanes, 256, BatchNorm, inp=True)
             self.decoder3 = DecoderBlock(256 + 128, 128, BatchNorm, inp=True)
             self.decoder2 = DecoderBlock(128 + 64, 64, BatchNorm, inp=True)
@@ -121,50 +120,71 @@ class Decoder(nn.Module):
             self.conv_e3 = nn.Sequential(
                 nn.Conv2d(c3, 128, 1, bias=False),
                 BatchNorm(128),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
             self.conv_e2 = nn.Sequential(
                 nn.Conv2d(c2, 64, 1, bias=False),
                 BatchNorm(64),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
             self.conv_e1 = nn.Sequential(
                 nn.Conv2d(c1, 32, 1, bias=False),
                 BatchNorm(32),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
         elif backbone == 'resnet':
             in_inplanes = 256
-            self.decoder4 = DecoderBlock(in_inplanes, 256, BatchNorm)
-            self.decoder3 = DecoderBlock(512, 128, BatchNorm)
+            self.decoder4 = DecoderBlock(in_inplanes, 256, BatchNorm, inp=True)
+            self.decoder3 = DecoderBlock(512, 128, BatchNorm, inp=True)
             self.decoder2 = DecoderBlock(256, 64, BatchNorm, inp=True)
             self.decoder1 = DecoderBlock(128, 64, BatchNorm, inp=True)
 
             self.conv_e3 = nn.Sequential(
                 nn.Conv2d(1024, 256, 1, bias=False),
                 BatchNorm(256),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
             self.conv_e2 = nn.Sequential(
                 nn.Conv2d(512, 128, 1, bias=False),
                 BatchNorm(128),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
             self.conv_e1 = nn.Sequential(
                 nn.Conv2d(256, 64, 1, bias=False),
                 BatchNorm(64),
-                nn.ReLU()
+                nn.ReLU(inplace=True)
             )
         else:
             raise NotImplementedError(f"Backbone {backbone} chưa được hỗ trợ trong Decoder!")
 
         self._init_weight()
 
+    def _match_size(self, source, target_tensor):
+        """Hàm trợ giúp đảm bảo source có cùng kích thước HxW với target_tensor."""
+        if source.shape[-2:] != target_tensor.shape[-2:]:
+            source = F.interpolate(source, size=target_tensor.shape[-2:], mode='bilinear', align_corners=True)
+        return source
+
     def forward(self, e1, e2, e3, e4):
-        d4 = torch.cat((self.decoder4(e4), self.conv_e3(e3)), dim=1)
-        d3 = torch.cat((self.decoder3(d4), self.conv_e2(e2)), dim=1)
-        d2 = torch.cat((self.decoder2(d3), self.conv_e1(e1)), dim=1)
+        # Tầng decoder4
+        out_d4 = self.decoder4(e4)
+        feat_e3 = self._match_size(self.conv_e3(e3), out_d4)
+        d4 = torch.cat((out_d4, feat_e3), dim=1)
+
+        # Tầng decoder3
+        out_d3 = self.decoder3(d4)
+        feat_e2 = self._match_size(self.conv_e2(e2), out_d3)
+        d3 = torch.cat((out_d3, feat_e2), dim=1)
+
+        # Tầng decoder2
+        out_d2 = self.decoder2(d3)
+        feat_e1 = self._match_size(self.conv_e1(e1), out_d2)
+        d2 = torch.cat((out_d2, feat_e1), dim=1)
+
+        # Tầng decoder1
         d1 = self.decoder1(d2)
+
+        # Upsample cuối cùng về tỷ lệ ảnh mong muốn
         x = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=True)
 
         return x
