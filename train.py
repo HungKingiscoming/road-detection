@@ -4,8 +4,10 @@ import time
 import numpy as np
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
 from modeling.bridge import compute_topo_loss
 from mypath import Path
 from dataloaders import make_data_loader
@@ -37,10 +39,10 @@ class Trainer(object):
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
         topo_config = TopoConfig(
-        max_points=args.max_points,
-        k_neighbors=args.k_neighbors,
-        graph_mask_score_threshold=args.topo_score_thresh,
-        coord_format='pixel'
+            max_points=args.max_points,
+            k_neighbors=args.k_neighbors,
+            graph_mask_score_threshold=args.topo_score_thresh,
+            coord_format='pixel'
         )
         base_coanet = CoANet(
             backbone=args.backbone,
@@ -53,7 +55,8 @@ class Trainer(object):
             topo_cfg=topo_config,
             decoder_feature_dim=64
         )
-        # 4. Cấu hình Optimizer (Học phí khác nhau cho các module nếu cần)
+        
+        # 4. Cấu hình Optimizer
         train_params = [
             {'params': model.coanet.parameters(), 'lr': args.lr},
             {'params': model.topo_head.parameters(), 'lr': args.lr}
@@ -146,7 +149,7 @@ class Trainer(object):
             connect = out_dict['connect']             # [B, 9, H, W]
             connect_d1 = out_dict['connect_d1']       # [B, 9, H, W]
             aux_seg = out_dict.get('aux_seg', None)   # [B, 1, H, W]
-            topo_out = out_dict['topo']               # Dictionary chứa kết quả từ TopoNet
+            topo_out = out_dict.get('topo', {})       # Dictionary chứa kết quả từ TopoNet
             
             # 1. Tính CoANet Segmentation & Connectivity Loss
             c_loss, _ = self.coanet_loss_fn(
@@ -184,9 +187,15 @@ class Trainer(object):
             )
             self.writer.add_scalar('train/total_loss_iter', total_loss.item(), i + num_img_tr * epoch)
 
-            # Đánh giá Metric trên Fused Mask đầu ra
-            pred = (torch.sigmoid(fused_mask) > 0.5).cpu().numpy().astype(np.uint8)
-            target_n = gt_mask.cpu().numpy().astype(np.uint8)
+            # --- Đánh giá Metric trên Fused Mask đầu ra ---
+            # Align kích thước Spatial (H, W) của fused_mask khớp với gt_mask trước khi nhị phân hóa
+            if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
+                fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
+            else:
+                fused_mask_eval = fused_mask
+
+            pred = (torch.sigmoid(fused_mask_eval) > 0.5).detach().cpu().numpy().astype(np.int64)
+            target_n = gt_mask.detach().cpu().numpy().astype(np.int64)
             self.evaluator.add_batch(target_n, pred)
 
         # Tính Metrics sau 1 Epoch
@@ -255,13 +264,19 @@ class Trainer(object):
                 val_loss += c_loss.item()
                 tbar.set_description(f'Val Loss: {val_loss / (i + 1):.4f}')
 
-                pred = (torch.sigmoid(fused_mask) > 0.5).cpu().numpy().astype(np.uint8)
-                target_n = gt_mask.cpu().numpy().astype(np.uint8)
+                # Align kích thước Spatial (H, W) của fused_mask khớp với gt_mask
+                if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
+                    fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
+                else:
+                    fused_mask_eval = fused_mask
+
+                pred = (torch.sigmoid(fused_mask_eval) > 0.5).cpu().numpy().astype(np.int64)
+                target_n = gt_mask.cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
 
                 if i % max(1, num_img_val // 5) == 0:
                     self.summary.visualize_image(
-                        self.writer, self.args.dataset, image, gt_mask, fused_mask, i, split='Val'
+                        self.writer, self.args.dataset, image, gt_mask, fused_mask_eval, i, split='Val'
                     )
 
         mIoU = self.evaluator.Mean_Intersection_over_Union()
