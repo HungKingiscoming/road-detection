@@ -56,10 +56,9 @@ class Trainer(object):
         # 4. Cấu hình Optimizer (Học phí khác nhau cho các module nếu cần)
         train_params = [
             {'params': model.coanet.parameters(), 'lr': args.lr},
-            {'params': model.topo_bridge.parameters(), 'lr': args.lr * 0.1 if hasattr(model, 'topo_bridge') else args.lr},
-            {'params': model.toponet.parameters(), 'lr': args.lr}
+            {'params': model.topo_head.parameters(), 'lr': args.lr}
         ]
-
+        
         optimizer = torch.optim.AdamW(
             train_params,
             lr=args.lr,
