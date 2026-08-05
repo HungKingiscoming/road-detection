@@ -11,29 +11,33 @@ import torchvision.transforms.functional as TF
 
 def generate_connectivity_gt(gt_mask_np: np.ndarray, dilation: int = 1) -> np.ndarray:
     """
-    Tạo GT Connectivity 9 kênh từ Binary Mask (Numpy) [9, H, W].
-    dilation = 1 -> connect_d1
-    dilation = 3 -> connect_d3
+    Tạo GT Connectivity 9 kênh [9, H, W] chuẩn CoANet.
+    Kênh 4 (index 4) là điểm tâm (center).
+    8 kênh còn lại tương ứng với 8 hướng kết nối trong bán kính dilation.
     """
     h, w = gt_mask_np.shape
-    pad = 2 * dilation
-    stride = 2 * dilation
-
+    pad = dilation
+    
+    # Pad viền bằng 0 với khoảng cách đúng bằng dilation
     mask_pad = np.pad(gt_mask_np, pad_width=pad, mode='constant', constant_values=0)
-
+    
     conn_channels = []
-    for i in range(3):
-        for j in range(3):
-            r_start = i * stride
-            c_start = j * stride
+    # Quét theo 8 hướng xung quanh tâm (i, j thuộc {-dilation, 0, +dilation})
+    for dy in [-dilation, 0, dilation]:
+        for dx in [-dilation, 0, dilation]:
+            # Dịch chuyển window theo vector (dy, dx)
+            r_start = pad + dy
+            c_start = pad + dx
             patch = mask_pad[r_start : r_start + h, c_start : c_start + w]
             conn_channels.append(patch)
 
     conn_map = np.stack(conn_channels, axis=0).astype(np.float32)
-    # Chỉ giữ giá trị kết nối tại các vị trí đường giao thông (mask > 0)
-    conn_map *= (gt_mask_np > 0).astype(np.float32)[None, ...]
-    return conn_map
-
+    
+    # Một kết nối chỉ hợp lệ (bằng 1) nếu CẢ PIXEL TÂM VÀ PIXEL LÂN CẬN đều là đường (gt_mask > 0)
+    center_mask = (gt_mask_np > 0).astype(np.float32)[None, ...] # [1, H, W]
+    conn_map = (conn_map > 0).astype(np.float32) * center_mask
+    
+    return conn_map # [9, H, W]
 
 class SpaceNetDataset(Dataset):
     def __init__(
