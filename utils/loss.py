@@ -216,13 +216,14 @@ class CoANetLoss(nn.Module):
                 gt_connect: torch.Tensor,
                 gt_connect_d1: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        gt_seg = self._match_size(gt_seg, seg)
-        gt_connect = self._match_size(gt_connect, connect)
-        gt_connect_d1 = self._match_size(gt_connect_d1, connect_d1)
+        # Căn chỉnh kích thước Ground Truth khớp với từng Output tương ứng
+        gt_seg_matched = self._match_size(gt_seg, seg)
+        gt_connect_matched = self._match_size(gt_connect, connect)
+        gt_connect_d1_matched = self._match_size(gt_connect_d1, connect_d1)
 
-        loss_seg = self.seg_criterion(seg, gt_seg)
-        loss_connect = self.connect_criterion(connect, gt_connect)
-        loss_connect_d1 = self.connect_d1_criterion(connect_d1, gt_connect_d1)
+        loss_seg = self.seg_criterion(seg, gt_seg_matched)
+        loss_connect = self.connect_criterion(connect, gt_connect_matched)
+        loss_connect_d1 = self.connect_d1_criterion(connect_d1, gt_connect_d1_matched)
 
         total = (self.seg_loss_weight * loss_seg +
                  self.connect_loss_weight * loss_connect +
@@ -234,13 +235,28 @@ class CoANetLoss(nn.Module):
             'loss_connect_d1': loss_connect_d1.detach(),
         }
 
+        # Xử lý aux_seg nếu có
         if aux_seg is not None:
-            loss_aux = self.aux_criterion(aux_seg, gt_seg)
+            gt_aux_matched = self._match_size(gt_seg, aux_seg)
+            loss_aux = self.aux_criterion(aux_seg, gt_aux_matched)
             total = total + self.aux_loss_weight * loss_aux
             loss_dict['loss_aux'] = loss_aux.detach()
 
         loss_dict['loss_total'] = total.detach()
         return total, loss_dict
+
+    @staticmethod
+    def _match_size(gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        """Resize GT về đúng kích thước pred nếu bị lệch (vd GT full-res, pred bị crop khác)."""
+        if gt.shape[-2:] == pred.shape[-2:]:
+            return gt
+        if gt.dim() == 3:  # [B,H,W] nhãn lớp (multi-class index) -> resize kiểu nearest
+            gt = gt.unsqueeze(1).float()
+            gt = F.interpolate(gt, size=pred.shape[-2:], mode='nearest')
+            return gt.squeeze(1).long()
+        mode = 'nearest' if gt.dtype in (torch.long, torch.int64, torch.bool) else 'bilinear'
+        kwargs = {} if mode == 'nearest' else {'align_corners': True}
+        return F.interpolate(gt.float(), size=pred.shape[-2:], mode=mode, **kwargs)
 
     @staticmethod
     def _match_size(gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
