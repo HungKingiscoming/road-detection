@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from mypath import Path
 from dataloaders import make_data_loader
 from modeling.sync_batchnorm.replicate import patch_replication_callback
-
+from modeling.coanet import CoANet
 # Import kiến trúc CoANet + TopoNet và Loss
 from modeling.coanet_topo import CoANetWithTopo, TopoConfig
 from utils.loss import CoANetLoss, TopoLoss
