@@ -46,7 +46,7 @@ class SpaceNetDataset(Dataset):
         """
         Args:
             data_dir: Thư mục chứa các file mẫu (ví dụ: RGB, GT, pickle, json)
-            transform: Các phép biến đổi Augmentation (Albumenations hoặc Torchvision)
+            transform: Các phép biến đổi Augmentation (Albumentations)
             is_train: Chế độ Train hay Val
             load_graph_data: Có đọc kèm file Pickle/JSON Graph hay không
         """
@@ -55,12 +55,18 @@ class SpaceNetDataset(Dataset):
         self.is_train = is_train
         self.load_graph_data = load_graph_data
 
-        # Lấy danh sách các prefix file (ví dụ: 'AOI_2_Vegas_1001')
-        rgb_files = glob.glob(os.path.join(data_dir, "*__rgb.png"))
-        self.prefixes = [f.replace("__rgb.png", "") for f in rgb_files]
+        # Lấy danh sách các prefix file (chỉ giữ lại những file có đủ cặp __rgb.png và __gt.png)
+        rgb_files = sorted(glob.glob(os.path.join(data_dir, "*__rgb.png")))
+        self.prefixes = []
+        
+        for f in rgb_files:
+            prefix = f.replace("__rgb.png", "")
+            gt_path = f"{prefix}__gt.png"
+            if os.path.exists(gt_path):
+                self.prefixes.append(prefix)
 
         if len(self.prefixes) == 0:
-            raise FileNotFoundError(f"Không tìm thấy file ảnh *_rgb.png nào trong {data_dir}")
+            raise FileNotFoundError(f"Không tìm thấy các cặp file (*__rgb.png, *__gt.png) hợp lệ nào trong {data_dir}")
 
     def __len__(self):
         return len(self.prefixes)
@@ -71,23 +77,16 @@ class SpaceNetDataset(Dataset):
         # 1. Đường dẫn các file tương ứng
         rgb_path = f"{prefix}__rgb.png"
         gt_path = f"{prefix}__gt.png"
-        graph_dense_pkl_path = f"{prefix}__gt_graph_dense.p"
         graph_json_path = f"{prefix}__gt_graph_dense_spacenet.json"
 
-        # 2. Đọc ảnh RGB & GT Mask
+        # 2. Đọc ảnh RGB & GT Mask dưới dạng NumPy Array
         rgb_img = np.array(Image.open(rgb_path).convert('RGB'))
 
         gt_mask_img = Image.open(gt_path).convert('L')
-        gt_mask = np.array(gt_mask_img).astype(np.float32)
-        gt_mask = (gt_mask > 0).astype(np.float32)
+        gt_mask = (np.array(gt_mask_img) > 0).astype(np.float32)
 
-        # 3. Đọc hoặc tự động tạo Connectivity Maps (d1 & d3)
-        gt_connect_d1 = generate_connectivity_gt(gt_mask, dilation=1)  # [9, H, W]
-        gt_connect_d3 = generate_connectivity_gt(gt_mask, dilation=3)  # [9, H, W]
-
-        # 4. Áp dụng Data Augmentation (nếu có)
+        # 3. Áp dụng Data Augmentation (Albumentations)
         if self.transform is not None:
-            # Nếu dùng thư viện albumentations (khuyên dùng cho Segmentation)
             augmented = self.transform(
                 image=rgb_img, 
                 mask=gt_mask
@@ -95,14 +94,18 @@ class SpaceNetDataset(Dataset):
             rgb_img = augmented['image']
             gt_mask = augmented['mask']
             
-            # Tính lại connectivity nếu mask bị xoay/flip/crop
-            gt_connect_d1 = generate_connectivity_gt(gt_mask, dilation=1)
-            gt_connect_d3 = generate_connectivity_gt(gt_mask, dilation=3)
+            # Chuyển đổi về numpy nếu transform trả về Tensor trước khi tính connectivity
+            if isinstance(rgb_img, torch.Tensor):
+                rgb_img = rgb_img.numpy()
+            if isinstance(gt_mask, torch.Tensor):
+                gt_mask = gt_mask.numpy()
 
-        # 5. Chuyển đổi sang PyTorch Tensor
-        # Normalization cho Image
+        # 4. Tính toán Connectivity Maps (d1 & d3) trên NumPy Array đã Augment
+        gt_connect_d1 = generate_connectivity_gt(gt_mask, dilation=1)  # [9, H, W]
+        gt_connect_d3 = generate_connectivity_gt(gt_mask, dilation=3)  # [9, H, W]
+
+        # 5. Chuyển đổi sang PyTorch Tensor & Normalization
         rgb_tensor = torch.from_numpy(rgb_img).permute(2, 0, 1).float() / 255.0
-        # Standard Normalization (ImageNet)
         rgb_tensor = TF.normalize(
             rgb_tensor, 
             mean=[0.485, 0.456, 0.406], 
@@ -121,7 +124,7 @@ class SpaceNetDataset(Dataset):
             'prefix': os.path.basename(prefix)
         }
 
-        # 6. Đọc thông tin Graph cấu trúc (Pickle/JSON) cho TopoNet (tuỳ chọn)
+        # 6. Đọc thông tin Graph cấu trúc cho TopoNet (nếu có)
         if self.load_graph_data and os.path.exists(graph_json_path):
             try:
                 with open(graph_json_path, 'r') as f:
