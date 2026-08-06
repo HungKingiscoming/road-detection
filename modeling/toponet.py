@@ -83,63 +83,45 @@ class TopoNet(nn.Module):
         self.output_proj = nn.Linear(self.hidden_dim, 1)
 
     def forward(self, points, point_features, pairs, pairs_valid):
-        # points: [B, N_points, 2]
-        # point_features: [B, N_points, D]
-        # pairs: [B, N_samples, N_pairs, 2]
-        # pairs_valid: [B, N_samples, N_pairs]
-        
         point_features = F.relu(self.feature_proj(point_features))
-        # gathers pairs
         batch_size, n_samples, n_pairs, _ = pairs.shape
         pairs = pairs.view(batch_size, -1, 2)
         
-        batch_indices = torch.arange(batch_size).view(-1, 1).expand(-1, n_samples * n_pairs)
-        # Use advanced indexing to fetch the corresponding feature vectors
-        # [B, N_samples * N_pairs, D]
+        batch_indices = torch.arange(batch_size, device=points.device).view(-1, 1).expand(-1, n_samples * n_pairs)
+        
         src_features = point_features[batch_indices, pairs[:, :, 0]]
         tgt_features = point_features[batch_indices, pairs[:, :, 1]]
-        # [B, N_samples * N_pairs, 2]
         src_points = points[batch_indices, pairs[:, :, 0]]
         tgt_points = points[batch_indices, pairs[:, :, 1]]
         offset = tgt_points - src_points
 
-        ## ablation study
-        # [B, N_samples * N_pairs, 2D + 2]
         if self.config.TOPONET_VERSION == 'no_tgt_features':
-            pair_features = torch.concat([src_features, torch.zeros_like(tgt_features), offset], dim=2)
+            pair_features = torch.cat([src_features, torch.zeros_like(tgt_features), offset], dim=2)
         elif self.config.TOPONET_VERSION == 'no_offset':
-            pair_features = torch.concat([src_features, tgt_features, torch.zeros_like(offset)], dim=2)
+            pair_features = torch.cat([src_features, tgt_features, torch.zeros_like(offset)], dim=2)
         else:
-            pair_features = torch.concat([src_features, tgt_features, offset], dim=2)
+            pair_features = torch.cat([src_features, tgt_features, offset], dim=2)
         
-        
-        # [B, N_samples * N_pairs, D]
         pair_features = F.relu(self.pair_proj(pair_features))
         
-        # attn applies within each local graph sample
         pair_features = pair_features.view(batch_size * n_samples, n_pairs, -1)
-        # valid->not a padding
         pairs_valid = pairs_valid.view(batch_size * n_samples, n_pairs)
 
-        # [B * N_samples, 1]
-        #### flips mask for all-invalid pairs to prevent NaN
-        all_invalid_pair_mask = torch.eq(torch.sum(pairs_valid, dim=-1), 0).unsqueeze(-1)
-        pairs_valid = torch.logical_or(pairs_valid, all_invalid_pair_mask)
+        # SỬA: Chống NaN chuẩn xác khi một sample có n_valid = 0
+        all_invalid_samples = (pairs_valid.sum(dim=-1) == 0)
+        if all_invalid_samples.any():
+            pairs_valid = pairs_valid.clone()
+            pairs_valid[all_invalid_samples, 0] = True  # Mở giả định 1 điểm để không bị bẫy Mask All-False
 
         padding_mask = ~pairs_valid
         
-        ## ablation study
         if self.config.TOPONET_VERSION != 'no_transformer':
             pair_features = self.transformer_encoder(pair_features, src_key_padding_mask=padding_mask)
         
-        ## Seems like at inference time, the returned n_pairs heres might be less - it's the
-        # max num of valid pairs across all samples in the batch
         _, n_pairs, _ = pair_features.shape
         pair_features = pair_features.view(batch_size, n_samples, n_pairs, -1)
 
-        # [B, N_samples, N_pairs, 1]
         logits = self.output_proj(pair_features)
-
         scores = torch.sigmoid(logits)
 
         return logits, scores
