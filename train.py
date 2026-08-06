@@ -23,6 +23,104 @@ from utils.metrics import Evaluator
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
+# =============================================================================
+# HÀM BỔ TRỢ: LOAD WEIGHTS AN TOÀN & SO SÁNH TÍNH TƯƠNG THÍCH (KEY & SHAPE)
+# =============================================================================
+def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) -> nn.Module:
+    """
+    Load weights từ checkpoint cho CoANet và kiểm tra độ khớp (Key & Shape).
+    Báo cáo chi tiết % khớp của Backbone, ASPP, Decoder và Connect.
+    """
+    print(f"\n==================================================")
+    print(f"🔍 BẮT ĐẦU KIỂM TRA & LOAD WEIGHTS TỪ: {checkpoint_path}")
+    print(f"==================================================")
+    
+    if not os.path.isfile(checkpoint_path):
+        print(f"⚠️ [CẢNH BÁO] Không tìm thấy file weights tại '{checkpoint_path}'. Bỏ qua bước load weights.")
+        return coanet_model
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    # Xử lý trường hợp checkpoint lưu dưới nhiều định dạng dict
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
+
+    # Clean prefix từ DataParallel ('module.') hoặc CoANetWithTopo ('coanet.')
+    cleaned_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace('module.', '')
+        if name.startswith('coanet.'):
+            name = name.replace('coanet.', '')
+        cleaned_state_dict[name] = v
+
+    model_state_dict = coanet_model.state_dict()
+    
+    matched_keys = []
+    shape_mismatched_keys = []
+    missing_in_ckpt_keys = []
+
+    # Phân loại thống kê theo từng module con
+    module_stats = {
+        'backbone': {'total': 0, 'matched': 0},
+        'aspp': {'total': 0, 'matched': 0},
+        'decoder': {'total': 0, 'matched': 0},
+        'connect': {'total': 0, 'matched': 0},
+    }
+
+    filtered_state_dict = {}
+
+    for name, param in model_state_dict.items():
+        sub_module = name.split('.')[0] if '.' in name else 'other'
+        if sub_module in module_stats:
+            module_stats[sub_module]['total'] += 1
+
+        if name in cleaned_state_dict:
+            ckpt_param = cleaned_state_dict[name]
+            if param.shape == ckpt_param.shape:
+                filtered_state_dict[name] = ckpt_param
+                matched_keys.append(name)
+                if sub_module in module_stats:
+                    module_stats[sub_module]['matched'] += 1
+            else:
+                shape_mismatched_keys.append((name, tuple(param.shape), tuple(ckpt_param.shape)))
+        else:
+            missing_in_ckpt_keys.append(name)
+
+    # In báo cáo độ khớp (Matching Report)
+    total_model_keys = len(model_state_dict)
+    total_matched = len(matched_keys)
+    match_percentage = (total_matched / total_model_keys) * 100 if total_model_keys > 0 else 0
+
+    print(f"\n📊 BÁO CÁO TỔNG QUAN TƯƠNG THÍCH WEIGHTS:")
+    print(f" - Tổng số tham số trong CoANet:       {total_model_keys}")
+    print(f" - Số tham số KHỚP HOÀN HẢO:           {total_matched} ({match_percentage:.2f}%)")
+    print(f" - Số tham số LỆCH SHAPE:               {len(shape_mismatched_keys)}")
+    print(f" - Số tham số THIẾU trong Checkpoint:  {len(missing_in_ckpt_keys)}")
+    
+    print(f"\n🧩 TỶ LỆ KHỚP THEO TỪNG MODULE CON:")
+    for mod_name, stats in module_stats.items():
+        if stats['total'] > 0:
+            pct = (stats['matched'] / stats['total']) * 100
+            print(f"  • {mod_name.upper():<10}: {stats['matched']}/{stats['total']} keys ({pct:.1f}%)")
+
+    if len(shape_mismatched_keys) > 0:
+        print(f"\n⚠️ DANH SÁCH TENSOR LỆCH SHAPE:")
+        for name, m_shape, c_shape in shape_mismatched_keys[:5]:
+            print(f"  - {name}: Model={m_shape} vs Checkpoint={c_shape}")
+        if len(shape_mismatched_keys) > 5:
+            print(f"  ... và {len(shape_mismatched_keys) - 5} keys khác.")
+
+    coanet_model.load_state_dict(filtered_state_dict, strict=False)
+    print(f"\n✅ Đã load thành công {len(filtered_state_dict)} weights vào CoANet!")
+    print(f"==================================================\n")
+    
+    return coanet_model
+
+
 def compute_grad_norm(model, norm_type: float = 2.0) -> float:
     """Tính tổng grad-norm của toàn bộ parameters có requires_grad và grad != None."""
     total_norm = 0.0
@@ -50,7 +148,6 @@ def get_road_iou(evaluator: Evaluator) -> float:
     predicted_set = confusion_matrix.sum(axis=0)
     union = ground_truth_set + predicted_set - intersection
 
-    # Tránh chia cho 0 nếu lớp Road chưa có sample
     if union[1] == 0:
         return 0.0
     
@@ -72,18 +169,24 @@ class Trainer(object):
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
-        # 3. Khởi tạo Kiến trúc Mô hình
-        topo_config = TopoConfig(
-            max_points=args.max_points,
-            k_neighbors=args.k_neighbors,
-            graph_mask_score_threshold=args.topo_score_thresh,
-            coord_format='pixel'
-        )
+        # 3. Khởi tạo Mô hình CoANet
         base_coanet = CoANet(
             backbone=args.backbone,
             output_stride=args.out_stride,
             num_classes=self.nclass,
             freeze_bn=args.freeze_bn
+        )
+
+        # 4. Load Pretrained Weights cho CoANet (nếu khai báo path)
+        if hasattr(args, 'coanet_weights') and args.coanet_weights is not None:
+            base_coanet = load_coanet_weights_safely(base_coanet, args.coanet_weights)
+
+        # 5. Khởi tạo Mô hình bọc Đồ thị Topo (CoANetWithTopo)
+        topo_config = TopoConfig(
+            max_points=args.max_points,
+            k_neighbors=args.k_neighbors,
+            graph_mask_score_threshold=args.topo_score_thresh,
+            coord_format='pixel'
         )
         model = CoANetWithTopo(
             coanet=base_coanet,
@@ -91,29 +194,20 @@ class Trainer(object):
             decoder_feature_dim=64
         )
         
-        # 4. Cấu hình Optimizer
-        train_params = [
-            {'params': model.coanet.parameters(), 'lr': args.lr},
-            {'params': model.topo_head.parameters(), 'lr': args.lr}
-        ]
-        
-        optimizer = torch.optim.AdamW(
-            train_params,
-            lr=args.lr,
-            weight_decay=args.weight_decay
-        )
-
-        # 5. Khởi tạo Loss Function
+        # 6. Khởi tạo Loss Function
         self.coanet_loss_fn = CoANetLoss(
             seg_loss_weight=1.0,
             connect_loss_weight=0.12,     
             connect_d1_loss_weight=0.08   
         )
         self.topo_loss_fn = TopoLoss(pos_weight=2.0)
+        self.model = model
 
-        self.model, self.optimizer = model, optimizer
+        # 7. Cấu hình Optimizer theo Stage & Differential Learning Rates
+        self.current_stage = 1 if args.freeze_coanet_epochs > 0 else 2
+        self.optimizer = self.build_optimizer(stage=self.current_stage)
 
-        # 6. Khởi tạo Evaluator & Scheduler
+        # 8. Khởi tạo Evaluator & Scheduler
         self.evaluator = Evaluator(num_class=2)  # Binary Segmentation (Background / Road)
         self.scheduler = LR_Scheduler(
             args.lr_scheduler, 
@@ -122,13 +216,13 @@ class Trainer(object):
             len(self.train_loader)
         )
 
-        # 7. Cấu hình GPU (CUDA & DataParallel)
+        # 9. Cấu hình GPU (CUDA & DataParallel)
         if args.cuda:
             self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
             patch_replication_callback(self.model)
             self.model = self.model.cuda()
 
-        # 8. Load Checkpoint (Resume)
+        # 10. Load Checkpoint (Resume)
         self.best_pred = 0.0
         if args.resume is not None:
             if not os.path.isfile(args.resume):
@@ -149,7 +243,47 @@ class Trainer(object):
         if args.ft:
             args.start_epoch = 0
 
+    def build_optimizer(self, stage: int = 2):
+        """
+        Cấu hình Optimizer theo 2 giai đoạn:
+        - Stage 1: Lock CoANet (requires_grad=False), chỉ train TopoHead
+        - Stage 2: Fine-tune toàn bộ với Tỷ lệ Learning Rate khác nhau (Differential LR)
+        """
+        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+        if stage == 1:
+            print(f"🔒 [Stage 1] Đóng băng CoANet. Chỉ tập trung huấn luyện TopoHead trong {self.args.freeze_coanet_epochs} epoch đầu.")
+            for param in raw_model.coanet.parameters():
+                param.requires_grad = False
+            for param in raw_model.topo_head.parameters():
+                param.requires_grad = True
+
+            train_params = filter(lambda p: p.requires_grad, raw_model.parameters())
+            return torch.optim.AdamW(train_params, lr=self.args.lr, weight_decay=self.args.weight_decay)
+
+        else:
+            print("🔓 [Stage 2] Mở khóa toàn bộ mô hình (Chạy Fine-tune End-to-End với Differential LR).")
+            for param in raw_model.parameters():
+                param.requires_grad = True
+
+            train_params = [
+                {'params': raw_model.coanet.backbone.parameters(), 'lr': self.args.lr * 0.1},
+                {'params': raw_model.coanet.aspp.parameters(), 'lr': self.args.lr * 0.5},
+                {'params': raw_model.coanet.decoder.parameters(), 'lr': self.args.lr * 0.5},
+                {'params': raw_model.coanet.connect.parameters(), 'lr': self.args.lr * 0.5},
+                {'params': raw_model.topo_head.parameters(), 'lr': self.args.lr * 1.0},
+            ]
+            return torch.optim.AdamW(train_params, lr=self.args.lr, weight_decay=self.args.weight_decay)
+
+    def check_and_update_stage(self, epoch: int):
+        """Tự động chuyển từ Stage 1 sang Stage 2 khi hết số epoch đóng băng CoANet."""
+        if epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
+            self.current_stage = 2
+            self.optimizer = self.build_optimizer(stage=2)
+
     def training(self, epoch):
+        self.check_and_update_stage(epoch)
+
         train_loss = 0.0
         train_coanet_loss = 0.0
         train_topo_loss = 0.0
@@ -165,7 +299,9 @@ class Trainer(object):
             gt_connect = sample['gt_connect_d1']  # [B, 9, H, W]
             gt_connect_d1 = sample['gt_connect_d3']# [B, 9, H, W]
 
-            if args.cuda if 'args' in locals() else self.args.cuda:
+            gt_mask = (gt_mask > 0.5).float() # Ép kiểu binary chuẩn
+
+            if self.args.cuda:
                 image = image.cuda(non_blocking=True)
                 gt_mask = gt_mask.cuda(non_blocking=True)
                 gt_connect = gt_connect.cuda(non_blocking=True)
@@ -196,7 +332,7 @@ class Trainer(object):
             
             # 2. TopoNet Loss
             t_loss = torch.tensor(0.0, device=image.device)
-            if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
+            if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None and 'logits' in topo_out:
                 t_loss = compute_topo_loss(
                     logits=topo_out['logits'],
                     edge_gt=topo_out['edge_gt'],
@@ -269,7 +405,7 @@ class Trainer(object):
             target_n = gt_mask.detach().cpu().numpy().astype(np.int64)
             self.evaluator.add_batch(target_n, pred)
 
-        # --- LẤY CHỈ SỐ ROAD IOU THAY VÌ MIOU ---
+        # Tính chỉ số Road IoU
         Acc = self.evaluator.Pixel_Accuracy()
         road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
@@ -319,6 +455,8 @@ class Trainer(object):
                 gt_connect = sample['gt_connect_d1']
                 gt_connect_d1 = sample['gt_connect_d3']
 
+                gt_mask = (gt_mask > 0.5).float()
+
                 if self.args.cuda:
                     image = image.cuda(non_blocking=True)
                     gt_mask = gt_mask.cuda(non_blocking=True)
@@ -343,7 +481,7 @@ class Trainer(object):
                 )
 
                 t_loss = torch.tensor(0.0, device=image.device)
-                if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
+                if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None and 'logits' in topo_out:
                     t_loss = compute_topo_loss(
                         logits=topo_out['logits'],
                         edge_gt=topo_out['edge_gt'],
@@ -377,7 +515,7 @@ class Trainer(object):
                         self.writer, self.args.dataset, image, gt_mask, fused_mask_eval, i, split='Val'
                     )
 
-        # --- LẤY CHỈ SỐ ROAD IOU THAY VÌ MIOU ---
+        # Chỉ số Road IoU
         road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
         Recall = self.evaluator.Pixel_Recall()
@@ -422,6 +560,10 @@ def main():
     parser.add_argument('--loss-type', type=str, default='ce', help='loss type tag for logging')
     parser.add_argument('--base-size', type=int, default=1024, help='base image size for preprocessing')
     parser.add_argument('--crop-size', type=int, default=512, help='crop size for preprocessing')
+
+    # Load Pretrained CoANet Weights
+    parser.add_argument('--coanet-weights', type=str, default=None, help='đường dẫn tới pretrained weights của CoANet')
+    parser.add_argument('--freeze-coanet-epochs', type=int, default=0, help='số epoch khóa CoANet chỉ train TopoHead (Warmup)')
 
     # TopoNet Params
     parser.add_argument('--max-points', type=int, default=128, help='Số điểm nút tối đa trích xuất từ Skeleton')
