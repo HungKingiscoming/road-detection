@@ -451,6 +451,13 @@ class Trainer(object):
     def validation(self, epoch):
         self.model.eval()
         self.evaluator.reset()
+        # --- Evaluator riêng cho seg_logits THUẦN (chưa qua TopoNet/fusion) ---
+        # Mục đích: cô lập xem CoANet pretrained tự nó tốt tới đâu, tách khỏi
+        # ảnh hưởng (có thể đang làm nhiễu) của graph_mask từ TopoNet mới train.
+        if not hasattr(self, 'evaluator_seg_only'):
+            self.evaluator_seg_only = Evaluator(num_class=2)
+        self.evaluator_seg_only.reset()
+
         tbar = tqdm(self.val_loader, desc=f"Val Epoch {epoch}")
         val_loss = 0.0
         val_coanet_loss = 0.0
@@ -512,18 +519,34 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                # --- FIX: fused_mask (từ bridge.py đã sửa) giờ LUÔN LUÔN là xác suất
-                # trong [0, 1] rồi -> KHÔNG áp sigmoid() thêm nữa, chỉ threshold trực tiếp.
+                # --- Đánh giá FUSED mask (CoANet + TopoNet) ---
                 pred = (fused_mask_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
-                
-                # Cập nhật Evaluator
                 self.evaluator.add_batch(target_n, pred)
+
+                # --- Đánh giá seg_logits THUẦN (bỏ qua TopoNet/fusion hoàn toàn) ---
+                if seg_logits.shape[-2:] != gt_mask.shape[-2:]:
+                    seg_logits_eval = F.interpolate(seg_logits, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
+                else:
+                    seg_logits_eval = seg_logits
+                pred_seg = (torch.sigmoid(seg_logits_eval) > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
+                self.evaluator_seg_only.add_batch(target_n, pred_seg)
 
         road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
+
+        # --- Kết quả seg-only (thuần CoANet, không qua TopoNet/fusion) ---
+        road_iou_seg = get_road_iou(self.evaluator_seg_only)
+        Precision_seg = self.evaluator_seg_only.Pixel_Precision()
+        Recall_seg = self.evaluator_seg_only.Pixel_Recall()
+        F1_seg = self.evaluator_seg_only.Pixel_F1()
+
+        self.writer.add_scalar('val/Road_IoU_seg_only', road_iou_seg, epoch)
+        self.writer.add_scalar('val/Precision_seg_only', Precision_seg, epoch)
+        self.writer.add_scalar('val/Recall_seg_only', Recall_seg, epoch)
+        self.writer.add_scalar('val/F1_seg_only', F1_seg, epoch)
 
         self.writer.add_scalar('val/total_loss_epoch', val_loss / num_img_val, epoch)
         self.writer.add_scalar('val/Road_IoU', road_iou, epoch)
@@ -532,7 +555,8 @@ class Trainer(object):
         self.writer.add_scalar('val/F1', F1, epoch)
 
         print(f'\n--- Validation Epoch {epoch} Results ---')
-        print(f'Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
+        print(f'[FUSED   ] Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
+        print(f'[SEG-ONLY] Road IoU: {road_iou_seg:.4f} | Precision: {Precision_seg:.4f} | Recall: {Recall_seg:.4f} | F1: {F1_seg:.4f}   <-- Chỉ số này phản ánh đúng chất lượng CoANet pretrained
 
         new_pred = road_iou
         if new_pred > self.best_pred:
