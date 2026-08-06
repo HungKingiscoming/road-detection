@@ -310,13 +310,19 @@ class CoANetWithTopo(nn.Module):
     seg_prob = torch.sigmoid(seg_logits_detach)
     topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
 
+    # --- FIX: fused_mask LUÔN LUÔN là xác suất trong [0, 1], bất kể train/eval ---
+    # Trước đây: lúc training fused_mask = seg_logits (logits thô, chưa fuse),
+    # lúc eval fused_mask = fuse_mask_and_graph(...) (đã là xác suất, do hàm này
+    # tự áp sigmoid bên trong). Hai nhánh trả về 2 loại giá trị khác nhau khiến
+    # nơi tiêu thụ (train.py) áp sigmoid thêm 1 lần nữa cho nhánh eval -> lỗi
+    # "double sigmoid" (mọi giá trị >= sigmoid(0) = 0.5 -> Recall ~ 1, Precision sập).
     if not self.training:
       with torch.no_grad():
         fused_mask, graph_mask = rasterize_and_fuse(
             seg_logits, topo_out, self.topo_cfg
         )
     else:
-      fused_mask = torch.sigmoid(seg_logits)
+      fused_mask = torch.sigmoid(seg_logits)  # xác suất, KHÔNG phải logits thô
       graph_mask = None
 
     return {
