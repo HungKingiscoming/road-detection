@@ -23,9 +23,51 @@ from utils.metrics import Evaluator
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
-# =============================================================================
-# HÀM BỔ TRỢ: LOAD WEIGHTS AN TOÀN & SO SÁNH TÍNH TƯƠNG THÍCH (KEY & SHAPE)
-# =============================================================================
+def print_freeze_status(model, epoch: int):
+    """In ra trạng thái freeze/unfreeze của các module trong mô hình."""
+    raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    
+    print(f"\n==================================================")
+    print(f"🔒 TRẠNG THÁI FREEZE/UNFREEZE - EPOCH {epoch}")
+    print(f"==================================================")
+    
+    modules_to_check = {
+        'Backbone': getattr(raw_model.coanet, 'backbone', None),
+        'ASPP': getattr(raw_model.coanet, 'aspp', None),
+        'Decoder': getattr(raw_model.coanet, 'decoder', None),
+        'Connect': getattr(raw_model.coanet, 'connect', None),
+        'Topo Head': getattr(raw_model, 'topo_head', None),
+    }
+
+    total_trainable_params = 0
+    total_frozen_params = 0
+
+    for name, module in modules_to_check.items():
+        if module is None:
+            continue
+        
+        # Đếm tham số trainable và frozen
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in module.parameters() if not p.requires_grad)
+        
+        total_trainable_params += trainable
+        total_frozen_params += frozen
+
+        if trainable > 0 and frozen == 0:
+            status = "🔓 UNFROZEN (Đang Train)"
+        elif trainable == 0 and frozen > 0:
+            status = "🔒 FROZEN (Đã Đóng Băng)"
+        elif trainable > 0 and frozen > 0:
+            status = "🌗 PARTIAL (Một phần đang train)"
+        else:
+            status = "❓ EMPTY (Không có tham số)"
+
+        print(f" • {name:<12}: {status:<28} | Trainable: {trainable:,} | Frozen: {frozen:,}")
+
+    print(f"--------------------------------------------------")
+    print(f"📊 TỔNG THAM SỐ TRAINABLE : {total_trainable_params:,}")
+    print(f"📊 TỔNG THAM SỐ FROZEN    : {total_frozen_params:,}")
+    print(f"==================================================\n")
 def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) -> nn.Module:
     """
     Load weights từ checkpoint cho CoANet và kiểm tra độ khớp (Key & Shape).
@@ -277,9 +319,21 @@ class Trainer(object):
 
     def check_and_update_stage(self, epoch: int):
         """Tự động chuyển từ Stage 1 sang Stage 2 khi hết số epoch đóng băng CoANet."""
-        if epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
+        stage_changed = False
+        
+        if epoch < self.args.freeze_coanet_epochs and self.current_stage != 1:
+            self.current_stage = 1
+            self.optimizer = self.build_optimizer(stage=1)
+            stage_changed = True
+            
+        elif epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
             self.current_stage = 2
             self.optimizer = self.build_optimizer(stage=2)
+            stage_changed = True
+
+        # In bảng kiểm tra trạng thái freeze ở epoch đầu tiên hoặc khi chuyển stage
+        if epoch == self.args.start_epoch or stage_changed:
+            print_freeze_status(self.model, epoch)
 
     def training(self, epoch):
         self.check_and_update_stage(epoch)
