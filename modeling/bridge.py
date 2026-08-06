@@ -43,7 +43,7 @@ class TopoConfig:
     # --- Rasterize graph -> mask & fusion ---
     graph_mask_sigma: float = 2.0
     graph_mask_score_threshold: float = 0.3
-    fusion_mode: str = 'gated_v3'        # 'baseline_v0' | 'union_v1' | 'conditional_v2' | 'gated_v3'
+    fusion_mode: str = 'conditional_v2'      
     fusion_threshold: float = 0.5
 
     def __post_init__(self):
