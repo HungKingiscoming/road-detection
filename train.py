@@ -75,9 +75,7 @@ def print_freeze_status(model, epoch: int):
 
 
 def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) -> nn.Module:
-    """
-    Load weights từ checkpoint cho CoANet và kiểm tra độ khớp (Key & Shape).
-    """
+    """Load weights từ checkpoint cho CoANet và kiểm tra độ khớp (Key & Shape)."""
     print(f"\n==================================================")
     print(f"🔍 BẮT ĐẦU KIỂM TRA & LOAD WEIGHTS TỪ: {checkpoint_path}")
     print(f"==================================================")
@@ -353,11 +351,7 @@ class Trainer(object):
 
         self.model.train()
 
-        # --- FIX: self.model.train() vừa set TẤT CẢ submodule (kể cả coanet đang
-        # bị freeze) sang train-mode, khiến BatchNorm dùng batch statistics của
-        # batch hiện tại thay vì running mean/var đã pretrain -> phá hỏng hoàn
-        # toàn chất lượng CoANet dù trọng số Conv đã load đúng 100%.
-        # Ép lại coanet về eval() để BN dùng đúng running stats đã học.
+        # Giữ BatchNorm của CoANet ở chế độ eval() khi đang Freeze
         raw_model = (
             self.model.module
             if isinstance(self.model, nn.DataParallel)
@@ -451,9 +445,7 @@ class Trainer(object):
     def validation(self, epoch):
         self.model.eval()
         self.evaluator.reset()
-        # --- Evaluator riêng cho seg_logits THUẦN (chưa qua TopoNet/fusion) ---
-        # Mục đích: cô lập xem CoANet pretrained tự nó tốt tới đâu, tách khỏi
-        # ảnh hưởng (có thể đang làm nhiễu) của graph_mask từ TopoNet mới train.
+
         if not hasattr(self, 'evaluator_seg_only'):
             self.evaluator_seg_only = Evaluator(num_class=2)
         self.evaluator_seg_only.reset()
@@ -479,7 +471,6 @@ class Trainer(object):
                     gt_connect = gt_connect.cuda(non_blocking=True)
                     gt_connect_d1 = gt_connect_d1.cuda(non_blocking=True)
 
-                # ✅ Đã sửa API AMP tương thích mới
                 with torch.amp.autocast('cuda', enabled=self.args.cuda):
                     out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
                     fused_mask = out_dict['fused_mask']
@@ -519,12 +510,12 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                # --- Đánh giá FUSED mask (CoANet + TopoNet) ---
-                pred = (fused_mask_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
+                # ✅ ĐÃ SỬA: Ép qua torch.sigmoid trước khi so sánh với threshold 0.5
+                pred = (torch.sigmoid(fused_mask_eval) > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
 
-                # --- Đánh giá seg_logits THUẦN (bỏ qua TopoNet/fusion hoàn toàn) ---
+                # Đánh giá seg_logits THUẦN
                 if seg_logits.shape[-2:] != gt_mask.shape[-2:]:
                     seg_logits_eval = F.interpolate(seg_logits, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
                 else:
@@ -537,7 +528,6 @@ class Trainer(object):
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
 
-        # --- Kết quả seg-only (thuần CoANet, không qua TopoNet/fusion) ---
         road_iou_seg = get_road_iou(self.evaluator_seg_only)
         Precision_seg = self.evaluator_seg_only.Pixel_Precision()
         Recall_seg = self.evaluator_seg_only.Pixel_Recall()
