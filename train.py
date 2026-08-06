@@ -13,7 +13,6 @@ from mypath import Path
 from dataloaders import make_data_loader
 from modeling.sync_batchnorm.replicate import patch_replication_callback
 from modeling.coanet import CoANet
-# Import kiến trúc CoANet + TopoNet và Loss
 from modeling.coanet_topo import CoANetWithTopo, TopoConfig
 from utils.loss import CoANetLoss, TopoLoss
 from utils.lr_scheduler import LR_Scheduler
@@ -25,8 +24,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 
 def compute_grad_norm(model, norm_type: float = 2.0) -> float:
-    """Tính tổng grad-norm của toàn bộ parameters có requires_grad và grad != None.
-    Dùng để phát hiện gradient exploding (norm tăng đột biến) hoặc vanishing (norm ~0)."""
+    """Tính tổng grad-norm của toàn bộ parameters có requires_grad và grad != None."""
     total_norm = 0.0
     for p in model.parameters():
         if p.grad is not None:
@@ -36,11 +34,28 @@ def compute_grad_norm(model, norm_type: float = 2.0) -> float:
 
 
 def positive_ratio(x) -> float:
-    """Tỉ lệ pixel/giá trị > 0 (hoặc == 1) trong tensor/array. Dùng để theo dõi
-    mất cân bằng lớp và phát hiện hiện tượng model 'collapse' (dự đoán toàn 0 hoặc toàn 1)."""
+    """Tỉ lệ pixel/giá trị > 0 (hoặc == 1) trong tensor/array."""
     if hasattr(x, 'float'):
         return x.float().mean().item()
     return float(np.mean(x))
+
+
+def get_road_iou(evaluator: Evaluator) -> float:
+    """Trích xuất IoU riêng cho lớp Road (Class index 1) từ Evaluator.
+    Loại bỏ lớp Background (Class index 0) khỏi kết quả tính toán.
+    """
+    confusion_matrix = evaluator.confusion_matrix
+    intersection = np.diag(confusion_matrix)
+    ground_truth_set = confusion_matrix.sum(axis=1)
+    predicted_set = confusion_matrix.sum(axis=0)
+    union = ground_truth_set + predicted_set - intersection
+
+    # Tránh chia cho 0 nếu lớp Road chưa có sample
+    if union[1] == 0:
+        return 0.0
+    
+    road_iou = intersection[1] / union[1]
+    return float(road_iou)
 
 
 class Trainer(object):
@@ -121,7 +136,6 @@ class Trainer(object):
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
 
-            # Restore state_dict
             if args.cuda:
                 self.model.module.load_state_dict(checkpoint['state_dict'])
             else:
@@ -146,13 +160,12 @@ class Trainer(object):
         num_img_tr = len(self.train_loader)
 
         for i, sample in enumerate(tbar):
-            # Lấy dữ liệu từ DataLoader
             image = sample['image']               # [B, 3, H, W]
             gt_mask = sample['gt_mask']           # [B, 1, H, W]
             gt_connect = sample['gt_connect_d1']  # [B, 9, H, W]
             gt_connect_d1 = sample['gt_connect_d3']# [B, 9, H, W]
 
-            if self.args.cuda:
+            if args.cuda if 'args' in locals() else self.args.cuda:
                 image = image.cuda(non_blocking=True)
                 gt_mask = gt_mask.cuda(non_blocking=True)
                 gt_connect = gt_connect.cuda(non_blocking=True)
@@ -161,7 +174,6 @@ class Trainer(object):
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
             self.optimizer.zero_grad()
 
-            # Forward qua CoANetWithTopo
             out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
 
             fused_mask = out_dict['fused_mask']       # [B, 1, H, W]
@@ -169,9 +181,9 @@ class Trainer(object):
             connect = out_dict['connect']             # [B, 9, H, W]
             connect_d1 = out_dict['connect_d1']       # [B, 9, H, W]
             aux_seg = out_dict.get('aux_seg', None)   # [B, 1, H, W]
-            topo_out = out_dict.get('topo', {})       # Dictionary chứa kết quả từ TopoNet
-            
-            # 1. Tính CoANet Segmentation & Connectivity Loss
+            topo_out = out_dict.get('topo', {})       # TopoNet output
+
+            # 1. CoANet Loss
             c_loss, c_loss_dict = self.coanet_loss_fn(
                 seg=seg_logits,
                 connect=connect,
@@ -182,7 +194,7 @@ class Trainer(object):
                 gt_connect_d1=gt_connect_d1
             )
             
-            # 2. Tính TopoNet Loss từ dictionary topo_out
+            # 2. TopoNet Loss
             t_loss = torch.tensor(0.0, device=image.device)
             if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
                 t_loss = compute_topo_loss(
@@ -191,17 +203,12 @@ class Trainer(object):
                     pairs_valid=topo_out['pairs_valid']
                 )
             
-            # Tổng Loss
             total_loss = c_loss + self.args.topo_weight * t_loss
-
             total_loss.backward()
 
-            # --- Debug: Grad-norm TRƯỚC khi optimizer.step() ---
             grad_norm = compute_grad_norm(self.model)
-
             self.optimizer.step()
 
-            # Tích lũy Log Loss
             train_loss += total_loss.item()
             train_coanet_loss += c_loss.item()
             train_topo_loss += t_loss.item()
@@ -216,30 +223,25 @@ class Trainer(object):
             self.writer.add_scalar('train/lr_iter', current_lr, global_step)
             self.writer.add_scalar('train/grad_norm_iter', grad_norm, global_step)
 
-            # --- Debug: log định kỳ ---
             if global_step % self.args.log_interval == 0:
-                # 2a. Log từng thành phần loss con của CoANet
                 if isinstance(c_loss_dict, dict):
                     for k, v in c_loss_dict.items():
                         v_val = v.item() if torch.is_tensor(v) else v
                         self.writer.add_scalar(f'train/loss_{k}', v_val, global_step)
 
-                # 2b. Cảnh báo sớm nếu loss/grad bất thường
                 if not np.isfinite(total_loss.item()):
                     print(f"[CẢNH BÁO] total_loss không hợp lệ (NaN/Inf) tại step {global_step}: {total_loss.item()}")
                 if grad_norm == 0.0:
-                    print(f"[CẢNH BÁO] grad_norm = 0 tại step {global_step} — có thể gradient không chảy qua model (vanishing/branch bị detach nhầm).")
+                    print(f"[CẢNH BÁO] grad_norm = 0 tại step {global_step}.")
                 elif not np.isfinite(grad_norm):
                     print(f"[CẢNH BÁO] grad_norm không hợp lệ (NaN/Inf) tại step {global_step}.")
 
-                # 2c. Thống kê tỉ lệ pixel "dương" (road) của seg_logits so với GT
                 with torch.no_grad():
                     seg_pos_ratio = positive_ratio(torch.sigmoid(seg_logits) > 0.5)
                     gt_pos_ratio = positive_ratio(gt_mask > 0.5)
                 self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
                 self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
 
-                # 2d. Thống kê nhánh TopoNet
                 pairs_valid = topo_out.get('pairs_valid', None)
                 if pairs_valid is not None:
                     n_valid_pairs = pairs_valid.float().sum().item()
@@ -252,13 +254,12 @@ class Trainer(object):
                         mean_score = topo_out['scores'].detach().mean().item()
                         self.writer.add_scalar('train/topo_mean_score', mean_score, global_step)
 
-                # 2e. In gọn ra console
                 tqdm.write(
                     f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} "
                     f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f}"
                 )
 
-            # --- Đánh giá Metric trên Fused Mask đầu ra ---
+            # Cập nhật Evaluator
             if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
                 fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
             else:
@@ -268,9 +269,9 @@ class Trainer(object):
             target_n = gt_mask.detach().cpu().numpy().astype(np.int64)
             self.evaluator.add_batch(target_n, pred)
 
-        # Tính Metrics sau 1 Epoch
+        # --- LẤY CHỈ SỐ ROAD IOU THAY VÌ MIOU ---
         Acc = self.evaluator.Pixel_Accuracy()
-        mIoU = self.evaluator.Mean_Intersection_over_Union()
+        road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
@@ -278,7 +279,7 @@ class Trainer(object):
         self.writer.add_scalar('train/total_loss_epoch', train_loss / num_img_tr, epoch)
         self.writer.add_scalar('train/coanet_loss_epoch', train_coanet_loss / num_img_tr, epoch)
         self.writer.add_scalar('train/topo_loss_epoch', train_topo_loss / num_img_tr, epoch)
-        self.writer.add_scalar('train/mIoU', mIoU, epoch)
+        self.writer.add_scalar('train/Road_IoU', road_iou, epoch)
         self.writer.add_scalar('train/Acc', Acc, epoch)
         self.writer.add_scalar('train/Precision', Precision, epoch)
         self.writer.add_scalar('train/Recall', Recall, epoch)
@@ -286,13 +287,11 @@ class Trainer(object):
         self.writer.add_scalar('train/lr_epoch', self.optimizer.param_groups[0]['lr'], epoch)
 
         print(f'\n--- Train Epoch {epoch} Results ---')
-        print(f'mIoU: {mIoU:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
+        print(f'Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
 
         if Recall > 0.98 and Precision < 0.2:
             print(f"[CẢNH BÁO] Recall={Recall:.4f} rất cao trong khi Precision={Precision:.4f} rất thấp "
-                  f"-> khả năng cao model đang dự đoán gần như toàn bộ pixel là positive. "
-                  f"Kiểm tra lại: (1) có bị sigmoid 2 lần trên xác suất không, "
-                  f"(2) class imbalance / pos_weight trong loss, (3) ngưỡng threshold khi nhị phân hoá.")
+                  f"-> khả năng cao model đang dự đoán gần như toàn bộ pixel là positive.")
 
         if self.args.no_val:
             is_best = False
@@ -333,7 +332,6 @@ class Trainer(object):
                 connect_d1 = out_dict['connect_d1']
                 topo_out = out_dict.get('topo', {})
 
-                # 1. Tính CoANet Loss
                 c_loss, _ = self.coanet_loss_fn(
                     seg=seg_logits,
                     connect=connect,
@@ -344,7 +342,6 @@ class Trainer(object):
                     gt_connect_d1=gt_connect_d1
                 )
 
-                # 2. Tính TopoNet Loss
                 t_loss = torch.tensor(0.0, device=image.device)
                 if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
                     t_loss = compute_topo_loss(
@@ -360,7 +357,6 @@ class Trainer(object):
 
                 tbar.set_description(f'Val Loss: {val_loss / (i + 1):.4f}')
 
-                # Align spatial size
                 if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
                     fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
                 else:
@@ -370,37 +366,36 @@ class Trainer(object):
                 target_n = gt_mask.cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
 
-                # Track ratio
                 if i % max(1, num_img_val // 10) == 0:
                     val_pred_pos_ratio = positive_ratio(pred)
                     val_gt_pos_ratio = positive_ratio(target_n)
                     self.writer.add_scalar('val/pred_positive_ratio', val_pred_pos_ratio, epoch * num_img_val + i)
                     self.writer.add_scalar('val/gt_positive_ratio', val_gt_pos_ratio, epoch * num_img_val + i)
 
-                # Image logging
                 if i % max(1, num_img_val // 5) == 0:
                     self.summary.visualize_image(
                         self.writer, self.args.dataset, image, gt_mask, fused_mask_eval, i, split='Val'
                     )
 
-        mIoU = self.evaluator.Mean_Intersection_over_Union()
+        # --- LẤY CHỈ SỐ ROAD IOU THAY VÌ MIOU ---
+        road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
 
-        # Log đầy đủ loss thành phần validation
         self.writer.add_scalar('val/total_loss_epoch', val_loss / num_img_val, epoch)
         self.writer.add_scalar('val/coanet_loss_epoch', val_coanet_loss / num_img_val, epoch)
         self.writer.add_scalar('val/topo_loss_epoch', val_topo_loss / num_img_val, epoch)
-        self.writer.add_scalar('val/mIoU', mIoU, epoch)
+        self.writer.add_scalar('val/Road_IoU', road_iou, epoch)
         self.writer.add_scalar('val/Precision', Precision, epoch)
         self.writer.add_scalar('val/Recall', Recall, epoch)
         self.writer.add_scalar('val/F1', F1, epoch)
 
         print(f'\n--- Validation Epoch {epoch} Results ---')
-        print(f'mIoU: {mIoU:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
+        print(f'Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
 
-        new_pred = mIoU
+        # Cập nhật Best Checkpoint theo Road IoU
+        new_pred = road_iou
         if new_pred > self.best_pred:
             is_best = True
             self.best_pred = new_pred
@@ -411,7 +406,7 @@ class Trainer(object):
                 'optimizer': self.optimizer.state_dict(),
                 'best_pred': self.best_pred,
             }, is_best)
-            print(f"==> Đã lưu Best Checkpoint mới với mIoU: {self.best_pred:.4f}")
+            print(f"==> Đã lưu Best Checkpoint mới với Road IoU: {self.best_pred:.4f}")
 
 
 def main():
