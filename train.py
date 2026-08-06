@@ -81,7 +81,7 @@ def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) ->
         print(f"⚠️ [CẢNH BÁO] Không tìm thấy file weights tại '{checkpoint_path}'. Bỏ qua bước load weights.")
         return coanet_model
 
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
     # Xử lý trường hợp checkpoint lưu dưới nhiều định dạng dict
     if 'state_dict' in checkpoint:
