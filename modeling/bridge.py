@@ -1,3 +1,8 @@
+"""topo_bridge.py
+================
+Cầu nối giữa CoANet và TopoNet (đã tối ưu hóa tốc độ cực đại).
+"""
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
