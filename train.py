@@ -309,6 +309,8 @@ class Trainer(object):
         self.evaluator.reset()
         tbar = tqdm(self.val_loader, desc=f"Val Epoch {epoch}")
         val_loss = 0.0
+        val_coanet_loss = 0.0
+        val_topo_loss = 0.0
         num_img_val = len(self.val_loader)
 
         with torch.no_grad():
@@ -324,12 +326,14 @@ class Trainer(object):
                     gt_connect = gt_connect.cuda(non_blocking=True)
                     gt_connect_d1 = gt_connect_d1.cuda(non_blocking=True)
 
-                out_dict = self.model(image)
+                out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
                 fused_mask = out_dict['fused_mask']
                 seg_logits = out_dict['seg_logits']
                 connect = out_dict['connect']
                 connect_d1 = out_dict['connect_d1']
+                topo_out = out_dict.get('topo', {})
 
+                # 1. Tính CoANet Loss
                 c_loss, _ = self.coanet_loss_fn(
                     seg=seg_logits,
                     connect=connect,
@@ -340,9 +344,23 @@ class Trainer(object):
                     gt_connect_d1=gt_connect_d1
                 )
 
-                val_loss += c_loss.item()
+                # 2. Tính TopoNet Loss
+                t_loss = torch.tensor(0.0, device=image.device)
+                if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
+                    t_loss = compute_topo_loss(
+                        logits=topo_out['logits'],
+                        edge_gt=topo_out['edge_gt'],
+                        pairs_valid=topo_out['pairs_valid']
+                    )
+
+                total_val_loss = c_loss + self.args.topo_weight * t_loss
+                val_loss += total_val_loss.item()
+                val_coanet_loss += c_loss.item()
+                val_topo_loss += t_loss.item()
+
                 tbar.set_description(f'Val Loss: {val_loss / (i + 1):.4f}')
 
+                # Align spatial size
                 if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
                     fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
                 else:
@@ -352,12 +370,14 @@ class Trainer(object):
                 target_n = gt_mask.cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
 
+                # Track ratio
                 if i % max(1, num_img_val // 10) == 0:
                     val_pred_pos_ratio = positive_ratio(pred)
                     val_gt_pos_ratio = positive_ratio(target_n)
                     self.writer.add_scalar('val/pred_positive_ratio', val_pred_pos_ratio, epoch * num_img_val + i)
                     self.writer.add_scalar('val/gt_positive_ratio', val_gt_pos_ratio, epoch * num_img_val + i)
 
+                # Image logging
                 if i % max(1, num_img_val // 5) == 0:
                     self.summary.visualize_image(
                         self.writer, self.args.dataset, image, gt_mask, fused_mask_eval, i, split='Val'
@@ -368,7 +388,10 @@ class Trainer(object):
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
 
+        # Log đầy đủ loss thành phần validation
         self.writer.add_scalar('val/total_loss_epoch', val_loss / num_img_val, epoch)
+        self.writer.add_scalar('val/coanet_loss_epoch', val_coanet_loss / num_img_val, epoch)
+        self.writer.add_scalar('val/topo_loss_epoch', val_topo_loss / num_img_val, epoch)
         self.writer.add_scalar('val/mIoU', mIoU, epoch)
         self.writer.add_scalar('val/Precision', Precision, epoch)
         self.writer.add_scalar('val/Recall', Recall, epoch)
