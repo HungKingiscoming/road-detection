@@ -352,6 +352,20 @@ class Trainer(object):
         train_topo_loss = 0.0
 
         self.model.train()
+
+        # --- FIX: self.model.train() vừa set TẤT CẢ submodule (kể cả coanet đang
+        # bị freeze) sang train-mode, khiến BatchNorm dùng batch statistics của
+        # batch hiện tại thay vì running mean/var đã pretrain -> phá hỏng hoàn
+        # toàn chất lượng CoANet dù trọng số Conv đã load đúng 100%.
+        # Ép lại coanet về eval() để BN dùng đúng running stats đã học.
+        raw_model = (
+            self.model.module
+            if isinstance(self.model, nn.DataParallel)
+            else self.model
+        )
+        if getattr(raw_model, 'freeze_coanet', False):
+            raw_model.coanet.eval()
+
         tbar = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
         num_img_tr = len(self.train_loader)
 
