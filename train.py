@@ -498,6 +498,8 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
+                # --- FIX: fused_mask (từ bridge.py đã sửa) giờ LUÔN LUÔN là xác suất
+                # trong [0, 1] rồi -> KHÔNG áp sigmoid() thêm nữa, chỉ threshold trực tiếp.
                 pred = (fused_mask_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
                 
