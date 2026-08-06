@@ -357,11 +357,6 @@ def compute_topo_loss(logits: torch.Tensor, edge_gt: torch.Tensor,
 # ============================================================================
 
 class CoANetWithTopo(nn.Module):
-    """
-    Bọc CoANet có sẵn + TopoGraphHead + bước fuse mask. `coanet` truyền vào là 1
-    instance của model.coanet.CoANet đã khởi tạo sẵn (backbone/decoder/connect/aux_head).
-    """
-
     def __init__(self, coanet: nn.Module, topo_cfg: TopoConfig, decoder_feature_dim: int = 64):
         super().__init__()
         self.coanet = coanet
@@ -370,15 +365,16 @@ class CoANetWithTopo(nn.Module):
 
     def forward(self, input: torch.Tensor, gt_mask: Optional[torch.Tensor] = None,
                 return_aux: bool = False) -> Dict[str, torch.Tensor]:
-        e1, e2, e3, e4, x_spp, fused_backbone, c4_feat = self.coanet.backbone(
-            input, return_aux=(return_aux or self.training))
+        
+        # SỬA: Lấy 4 mảng đặc trưng chuẩn từ ResNet / GCNet
+        e1, e2, e3, e4 = self.coanet.backbone(input)
+        
+        # SỬA: Cho e4 đi qua ASPP trước khi vào Decoder
+        e4_aspp = self.coanet.aspp(e4)
 
-        feat = self.coanet.decoder(e1, e2, e3, e4)           # [B,64,H,W] full-res
+        feat = self.coanet.decoder(e1, e2, e3, e4_aspp)       # [B, 64, H, W] full-res
         seg_logits, con0, con1 = self.coanet.connect(feat)
 
-        # detach seg_prob: bước trích điểm graph không differentiable (skeletonize),
-        # nên không cần (và không nên) lan gradient của topo loss ngược qua chính seg mask
-        # theo đường này — seg vẫn được học bình thường qua loss_seg riêng.
         seg_prob = torch.sigmoid(seg_logits.detach())
         topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
 
@@ -392,10 +388,5 @@ class CoANetWithTopo(nn.Module):
             'graph_mask': graph_mask,
             'topo': topo_out,
         }
-
-        if (return_aux or self.training) and c4_feat is not None:
-            aux_seg = self.coanet.aux_head(c4_feat)
-            aux_seg = F.interpolate(aux_seg, size=input.shape[2:], mode='bilinear', align_corners=True)
-            result['aux_seg'] = aux_seg
 
         return result
