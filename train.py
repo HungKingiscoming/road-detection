@@ -410,7 +410,6 @@ def main():
                     choices=['gcnet', 'convnextv2_tiny', 'convnextv2_nano'],
                     help='Backbone architecture')
     # Model Hyperparams
-    parser.add_argument('--backbone', type=str, default='resnet', help='backbone name (default: resnet)')
     parser.add_argument('--out-stride', type=int, default=8, help='network output stride (default: 8)')
     parser.add_argument('--dataset', type=str, default='spacenet', choices=['spacenet', 'DeepGlobe'])
     parser.add_argument('--workers', type=int, default=8, help='dataloader threads')
