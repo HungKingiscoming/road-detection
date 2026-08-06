@@ -141,38 +141,47 @@ class Trainer(object):
         train_loss = 0.0
         train_coanet_loss = 0.0
         train_topo_loss = 0.0
-
+    
         self.model.train()
         self.evaluator.reset()
         tbar = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
         num_img_tr = len(self.train_loader)
-
+    
         for i, sample in enumerate(tbar):
-            # Lấy dữ liệu từ DataLoader
+            # Lấy dữ liệu từ DataLoader & ép contiguous() trên GPU
             image = sample['image']               # [B, 3, H, W]
             gt_mask = sample['gt_mask']           # [B, 1, H, W]
             gt_connect = sample['gt_connect_d1']  # [B, 9, H, W]
             gt_connect_d1 = sample['gt_connect_d3']# [B, 9, H, W]
-
+    
             if self.args.cuda:
-                image = image.cuda(non_blocking=True)
-                gt_mask = gt_mask.cuda(non_blocking=True)
-                gt_connect = gt_connect.cuda(non_blocking=True)
-                gt_connect_d1 = gt_connect_d1.cuda(non_blocking=True)
-
+                image = image.cuda(non_blocking=True).contiguous()
+                gt_mask = gt_mask.cuda(non_blocking=True).contiguous()
+                gt_connect = gt_connect.cuda(non_blocking=True).contiguous()
+                gt_connect_d1 = gt_connect_d1.cuda(non_blocking=True).contiguous()
+    
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
             self.optimizer.zero_grad()
-
-            # Forward qua CoANetWithTopo
+    
+            # Forward qua CoANetWithTopo (Multi-GPU DataParallel)
             out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
-
-            fused_mask = out_dict['fused_mask']       # [B, 1, H, W]
-            seg_logits = out_dict['seg_logits']       # [B, 1, H, W]
-            connect = out_dict['connect']             # [B, 9, H, W]
-            connect_d1 = out_dict['connect_d1']       # [B, 9, H, W]
-            aux_seg = out_dict.get('aux_seg', None)   # [B, 1, H, W]
-            topo_out = out_dict.get('topo', {})       # Dictionary chứa kết quả từ TopoNet
+    
+            # =========================================================================
+            # GIẢI PHÁP SỬA LỖI CUDA MISALIGNED ADDRESS (DATA PARALLEL):
+            # DataParallel tự động gather dictionary từ 2 GPUs làm lệch offset bộ nhớ.
+            # Bắt buộc bóc tách từng Tensor ra và gọi .clone().contiguous()
+            # =========================================================================
+            fused_mask = out_dict['fused_mask'].clone().contiguous()   # [B, 1, H, W]
+            seg_logits = out_dict['seg_logits'].clone().contiguous()   # [B, 1, H, W]
+            connect = out_dict['connect'].clone().contiguous()         # [B, 9, H, W]
+            connect_d1 = out_dict['connect_d1'].clone().contiguous()   # [B, 9, H, W]
             
+            aux_seg = out_dict.get('aux_seg', None)
+            if aux_seg is not None:
+                aux_seg = aux_seg.clone().contiguous()
+    
+            topo_out = out_dict.get('topo', {})
+    
             # 1. Tính CoANet Segmentation & Connectivity Loss
             c_loss, c_loss_dict = self.coanet_loss_fn(
                 seg=seg_logits,
@@ -183,104 +192,101 @@ class Trainer(object):
                 gt_connect=gt_connect,
                 gt_connect_d1=gt_connect_d1
             )
-            
-            # 2. Tính TopoNet Loss từ dictionary topo_out
+    
+            # 2. Tính TopoNet Loss từ dictionary topo_out (Clean memory)
             t_loss = torch.tensor(0.0, device=image.device)
             if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None:
+                t_logits = topo_out['logits'].clone().contiguous()
+                t_edge_gt = topo_out['edge_gt'].clone().contiguous()
+                t_pairs_valid = topo_out['pairs_valid'].clone().contiguous()
+    
                 t_loss = compute_topo_loss(
-                    logits=topo_out['logits'],
-                    edge_gt=topo_out['edge_gt'],
-                    pairs_valid=topo_out['pairs_valid']
+                    logits=t_logits,
+                    edge_gt=t_edge_gt,
+                    pairs_valid=t_pairs_valid
                 )
-            
+    
             # Tổng Loss
             total_loss = c_loss + self.args.topo_weight * t_loss
-
+    
             total_loss.backward()
-
-            # --- Debug: Grad-norm TRƯỚC khi optimizer.step() (norm bằng 0/NaN/Inf là dấu hiệu bug) ---
+    
+            # --- Debug: Grad-norm TRƯỚC khi optimizer.step() ---
             grad_norm = compute_grad_norm(self.model)
-
+    
             self.optimizer.step()
-
+    
             # Tích lũy Log Loss
             train_loss += total_loss.item()
             train_coanet_loss += c_loss.item()
             train_topo_loss += t_loss.item()
-
+    
             global_step = i + num_img_tr * epoch
             current_lr = self.optimizer.param_groups[0]['lr']
-
+    
             tbar.set_description(
                 f'Loss: {train_loss/(i+1):.4f} | CoANet: {train_coanet_loss/(i+1):.4f} | Topo: {train_topo_loss/(i+1):.4f}'
             )
             self.writer.add_scalar('train/total_loss_iter', total_loss.item(), global_step)
             self.writer.add_scalar('train/lr_iter', current_lr, global_step)
             self.writer.add_scalar('train/grad_norm_iter', grad_norm, global_step)
-
-            # --- Debug: log định kỳ (không log mọi iter để đỡ nặng I/O) ---
+    
+            # --- Debug: log định kỳ ---
             if global_step % self.args.log_interval == 0:
-                # 2a. Log từng thành phần loss con của CoANet (seg / connect / connect_d1 / aux...)
                 if isinstance(c_loss_dict, dict):
                     for k, v in c_loss_dict.items():
                         v_val = v.item() if torch.is_tensor(v) else v
                         self.writer.add_scalar(f'train/loss_{k}', v_val, global_step)
-
-                # 2b. Cảnh báo sớm nếu loss/grad bất thường (NaN, Inf, hoặc grad "chết")
+    
                 if not np.isfinite(total_loss.item()):
                     print(f"[CẢNH BÁO] total_loss không hợp lệ (NaN/Inf) tại step {global_step}: {total_loss.item()}")
                 if grad_norm == 0.0:
-                    print(f"[CẢNH BÁO] grad_norm = 0 tại step {global_step} — có thể gradient không chảy qua model (vanishing/branch bị detach nhầm).")
+                    print(f"[CẢNH BÁO] grad_norm = 0 tại step {global_step} — có thể gradient không chảy qua model.")
                 elif not np.isfinite(grad_norm):
                     print(f"[CẢNH BÁO] grad_norm không hợp lệ (NaN/Inf) tại step {global_step}.")
-
-                # 2c. Thống kê tỉ lệ pixel "dương" (road) của seg_logits so với GT
-                #     -> phát hiện model bị "collapse" (dự đoán gần như toàn 0 hoặc toàn 1)
+    
                 with torch.no_grad():
                     seg_pos_ratio = positive_ratio(torch.sigmoid(seg_logits) > 0.5)
                     gt_pos_ratio = positive_ratio(gt_mask > 0.5)
                 self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
                 self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
-
-                # 2d. Thống kê nhánh TopoNet: số cạnh candidate hợp lệ, tỉ lệ cạnh dương (edge_gt),
-                #     điểm số trung bình -> phát hiện trường hợp không có cạnh nào hợp lệ
-                #     (topo loss luôn = 0, hoặc mất cân bằng lớp cực đoan giữa cạnh dương/âm).
+    
                 pairs_valid = topo_out.get('pairs_valid', None)
                 if pairs_valid is not None:
+                    pairs_valid = pairs_valid.clone().contiguous()
                     n_valid_pairs = pairs_valid.float().sum().item()
                     self.writer.add_scalar('train/topo_num_valid_pairs', n_valid_pairs, global_step)
                     edge_gt = topo_out.get('edge_gt', None)
                     if edge_gt is not None and n_valid_pairs > 0:
+                        edge_gt = edge_gt.clone().contiguous()
                         edge_pos_ratio = (edge_gt * pairs_valid.float()).sum().item() / n_valid_pairs
                         self.writer.add_scalar('train/topo_edge_positive_ratio', edge_pos_ratio, global_step)
                     if 'scores' in topo_out:
                         mean_score = topo_out['scores'].detach().mean().item()
                         self.writer.add_scalar('train/topo_mean_score', mean_score, global_step)
-
-                # 2e. In gọn ra console để dễ theo dõi khi chạy trên Kaggle/Colab (log không lưu tensorboard)
+    
                 tqdm.write(
                     f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} "
                     f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f}"
                 )
-
+    
             # --- Đánh giá Metric trên Fused Mask đầu ra ---
-            # Align kích thước Spatial (H, W) của fused_mask khớp với gt_mask trước khi nhị phân hóa
             if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
                 fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
             else:
                 fused_mask_eval = fused_mask
-
+    
             pred = (fused_mask_eval > 0.5).detach().cpu().numpy().astype(np.int64)
             target_n = gt_mask.detach().cpu().numpy().astype(np.int64)
             self.evaluator.add_batch(target_n, pred)
-
+    
         # Tính Metrics sau 1 Epoch
         Acc = self.evaluator.Pixel_Accuracy()
         mIoU = self.evaluator.Mean_Intersection_over_Union()
         Precision = self.evaluator.Pixel_Precision()
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
-
+    
         self.writer.add_scalar('train/total_loss_epoch', train_loss / num_img_tr, epoch)
         self.writer.add_scalar('train/coanet_loss_epoch', train_coanet_loss / num_img_tr, epoch)
         self.writer.add_scalar('train/topo_loss_epoch', train_topo_loss / num_img_tr, epoch)
@@ -290,18 +296,14 @@ class Trainer(object):
         self.writer.add_scalar('train/Recall', Recall, epoch)
         self.writer.add_scalar('train/F1', F1, epoch)
         self.writer.add_scalar('train/lr_epoch', self.optimizer.param_groups[0]['lr'], epoch)
-
+    
         print(f'\n--- Train Epoch {epoch} Results ---')
         print(f'mIoU: {mIoU:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
-
-        # --- Debug: cảnh báo sớm nếu Recall gần 1.0 nhưng Precision rất thấp
-        # (dấu hiệu kinh điển của việc model/metric dự đoán gần như toàn bộ ảnh là "road")
+    
         if Recall > 0.98 and Precision < 0.2:
             print(f"[CẢNH BÁO] Recall={Recall:.4f} rất cao trong khi Precision={Precision:.4f} rất thấp "
-                  f"-> khả năng cao model đang dự đoán gần như toàn bộ pixel là positive. "
-                  f"Kiểm tra lại: (1) có bị sigmoid 2 lần trên xác suất không, "
-                  f"(2) class imbalance / pos_weight trong loss, (3) ngưỡng threshold khi nhị phân hoá.")
-
+                  f"-> khả năng cao model đang dự đoán gần như toàn bộ pixel là positive.")
+    
         if self.args.no_val:
             is_best = False
             model_state = self.model.module.state_dict() if self.args.cuda else self.model.state_dict()
