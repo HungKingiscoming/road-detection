@@ -258,22 +258,53 @@ class CoANetWithTopo(nn.Module):
     self.topo_cfg = topo_cfg
     self.topo_head = TopoGraphHead(decoder_feature_dim, topo_cfg)
 
+    # Cờ trạng thái freeze CoANet (Mặc định Stage 1 là True)
+    self.freeze_coanet = True
+
+  def set_freeze_coanet(self, freeze: bool = True):
+    """Hàm helper để switch linh hoạt giữa Stage 1 (Freeze) và Stage 2 (Unfreeze)"""
+    self.freeze_coanet = freeze
+    # Đóng/Mở requires_grad cho các tham số CoANet
+    for p in self.coanet.parameters():
+      p.requires_grad = not freeze
+
   def forward(
       self,
       input: torch.Tensor,
       gt_mask: Optional[torch.Tensor] = None,
       return_aux: bool = False,
   ) -> Dict[str, torch.Tensor]:
-    e1, e2, e3, e4 = self.coanet.backbone(input)
-    e4_aspp = self.coanet.aspp(e4)
 
-    feat = self.coanet.decoder(e1, e2, e3, e4_aspp)
-    seg_logits, con0, con1 = self.coanet.connect(feat)
+    # =========================================================================
+    # STAGE 1: Khi Freeze CoANet trong quá trình Training
+    # =========================================================================
+    if self.training and self.freeze_coanet:
+      # 1. Bọc no_grad hoàn toàn cho CoANet để PyTorch KHÔNG tạo Autograd Graph
+      with torch.no_grad():
+        e1, e2, e3, e4 = self.coanet.backbone(input)
+        e4_aspp = self.coanet.aspp(e4)
+        feat = self.coanet.decoder(e1, e2, e3, e4_aspp)
+        seg_logits, con0, con1 = self.coanet.connect(feat)
 
-    seg_prob = torch.sigmoid(seg_logits.detach())
+      # 2. Ngắt triệt để mọi dây nối gradient còn sót lại sang TopoHead
+      feat = feat.detach()
+      seg_logits_detach = seg_logits.detach()
+
+    # =========================================================================
+    # STAGE 2: Khi Unfreeze CoANet (hoặc khi đang Eval/Validation)
+    # =========================================================================
+    else:
+      e1, e2, e3, e4 = self.coanet.backbone(input)
+      e4_aspp = self.coanet.aspp(e4)
+      feat = self.coanet.decoder(e1, e2, e3, e4_aspp)
+      seg_logits, con0, con1 = self.coanet.connect(feat)
+      seg_logits_detach = seg_logits.detach()
+
+    # 3. Tính toán cho TopoHead
+    seg_prob = torch.sigmoid(seg_logits_detach)
     topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
 
-    # 🚀 TỐI ƯU: Chỉ Rasterize khi Eval. Khi Train dùng thẳng seg_logits
+    # 4. Rasterize & Fusion (Chỉ chạy khi Eval)
     if not self.training:
       with torch.no_grad():
         fused_mask, graph_mask = rasterize_and_fuse(
