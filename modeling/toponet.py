@@ -143,4 +143,3 @@ class TopoNet(nn.Module):
         scores = torch.sigmoid(logits)
 
         return logits, scores
-
