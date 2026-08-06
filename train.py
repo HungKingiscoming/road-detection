@@ -57,6 +57,7 @@ class Trainer(object):
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
+        # 3. Khởi tạo Kiến trúc Mô hình
         topo_config = TopoConfig(
             max_points=args.max_points,
             k_neighbors=args.k_neighbors,
@@ -195,7 +196,7 @@ class Trainer(object):
 
             total_loss.backward()
 
-            # --- Debug: Grad-norm TRƯỚC khi optimizer.step() (norm bằng 0/NaN/Inf là dấu hiệu bug) ---
+            # --- Debug: Grad-norm TRƯỚC khi optimizer.step() ---
             grad_norm = compute_grad_norm(self.model)
 
             self.optimizer.step()
@@ -215,15 +216,15 @@ class Trainer(object):
             self.writer.add_scalar('train/lr_iter', current_lr, global_step)
             self.writer.add_scalar('train/grad_norm_iter', grad_norm, global_step)
 
-            # --- Debug: log định kỳ (không log mọi iter để đỡ nặng I/O) ---
+            # --- Debug: log định kỳ ---
             if global_step % self.args.log_interval == 0:
-                # 2a. Log từng thành phần loss con của CoANet (seg / connect / connect_d1 / aux...)
+                # 2a. Log từng thành phần loss con của CoANet
                 if isinstance(c_loss_dict, dict):
                     for k, v in c_loss_dict.items():
                         v_val = v.item() if torch.is_tensor(v) else v
                         self.writer.add_scalar(f'train/loss_{k}', v_val, global_step)
 
-                # 2b. Cảnh báo sớm nếu loss/grad bất thường (NaN, Inf, hoặc grad "chết")
+                # 2b. Cảnh báo sớm nếu loss/grad bất thường
                 if not np.isfinite(total_loss.item()):
                     print(f"[CẢNH BÁO] total_loss không hợp lệ (NaN/Inf) tại step {global_step}: {total_loss.item()}")
                 if grad_norm == 0.0:
@@ -232,16 +233,13 @@ class Trainer(object):
                     print(f"[CẢNH BÁO] grad_norm không hợp lệ (NaN/Inf) tại step {global_step}.")
 
                 # 2c. Thống kê tỉ lệ pixel "dương" (road) của seg_logits so với GT
-                #     -> phát hiện model bị "collapse" (dự đoán gần như toàn 0 hoặc toàn 1)
                 with torch.no_grad():
                     seg_pos_ratio = positive_ratio(torch.sigmoid(seg_logits) > 0.5)
                     gt_pos_ratio = positive_ratio(gt_mask > 0.5)
                 self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
                 self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
 
-                # 2d. Thống kê nhánh TopoNet: số cạnh candidate hợp lệ, tỉ lệ cạnh dương (edge_gt),
-                #     điểm số trung bình -> phát hiện trường hợp không có cạnh nào hợp lệ
-                #     (topo loss luôn = 0, hoặc mất cân bằng lớp cực đoan giữa cạnh dương/âm).
+                # 2d. Thống kê nhánh TopoNet
                 pairs_valid = topo_out.get('pairs_valid', None)
                 if pairs_valid is not None:
                     n_valid_pairs = pairs_valid.float().sum().item()
@@ -254,14 +252,13 @@ class Trainer(object):
                         mean_score = topo_out['scores'].detach().mean().item()
                         self.writer.add_scalar('train/topo_mean_score', mean_score, global_step)
 
-                # 2e. In gọn ra console để dễ theo dõi khi chạy trên Kaggle/Colab (log không lưu tensorboard)
+                # 2e. In gọn ra console
                 tqdm.write(
                     f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} "
                     f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f}"
                 )
 
             # --- Đánh giá Metric trên Fused Mask đầu ra ---
-            # Align kích thước Spatial (H, W) của fused_mask khớp với gt_mask trước khi nhị phân hóa
             if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
                 fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
             else:
@@ -291,8 +288,6 @@ class Trainer(object):
         print(f'\n--- Train Epoch {epoch} Results ---')
         print(f'mIoU: {mIoU:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
 
-        # --- Debug: cảnh báo sớm nếu Recall gần 1.0 nhưng Precision rất thấp
-        # (dấu hiệu kinh điển của việc model/metric dự đoán gần như toàn bộ ảnh là "road")
         if Recall > 0.98 and Precision < 0.2:
             print(f"[CẢNH BÁO] Recall={Recall:.4f} rất cao trong khi Precision={Precision:.4f} rất thấp "
                   f"-> khả năng cao model đang dự đoán gần như toàn bộ pixel là positive. "
@@ -348,7 +343,6 @@ class Trainer(object):
                 val_loss += c_loss.item()
                 tbar.set_description(f'Val Loss: {val_loss / (i + 1):.4f}')
 
-                # Align kích thước Spatial (H, W) của fused_mask khớp với gt_mask
                 if fused_mask.shape[-2:] != gt_mask.shape[-2:]:
                     fused_mask_eval = F.interpolate(fused_mask, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
                 else:
@@ -358,9 +352,6 @@ class Trainer(object):
                 target_n = gt_mask.cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
 
-                # --- Debug: theo dõi tỉ lệ pixel dương của val prediction so với GT ---
-                # Nếu pred_pos_ratio lệch rất xa gt_pos_ratio (vd luôn gần 1.0) -> model đang
-                # collapse / có bug tương tự lỗi sigmoid-kép trước đây.
                 if i % max(1, num_img_val // 10) == 0:
                     val_pred_pos_ratio = positive_ratio(pred)
                     val_gt_pos_ratio = positive_ratio(target_n)
@@ -386,7 +377,6 @@ class Trainer(object):
         print(f'\n--- Validation Epoch {epoch} Results ---')
         print(f'mIoU: {mIoU:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
 
-        # Lưu Checkpoint nếu đạt mIoU tốt nhất
         new_pred = mIoU
         if new_pred > self.best_pred:
             is_best = True
@@ -439,7 +429,7 @@ def main():
     parser.add_argument('--eval-interval', type=int, default=1, help='evaluation interval')
     parser.add_argument('--no-val', action='store_true', default=False, help='skip validation')
     parser.add_argument('--log-interval', type=int, default=20,
-                         help='số iteration giữa mỗi lần log chi tiết (grad-norm, sub-loss, topo stats,...) vào tensorboard')
+                        help='số iteration giữa mỗi lần log chi tiết vào tensorboard')
 
     args = parser.parse_args()
     if args.data_dir is None:
