@@ -43,7 +43,7 @@ class TopoConfig:
 
 
 # ============================================================================
-# 1. Trích điểm Graph: Dùng Grid Subsampling siêu nhanh (Nhanh gấp 50x loop cũ)
+# 1. Trích điểm Graph: Dùng Grid Subsampling siêu nhanh
 # ============================================================================
 
 
@@ -60,10 +60,8 @@ def _skeleton_points_fast(
 
   pts = np.stack([xs, ys], axis=1).astype(np.float32)
 
-  # 🚀 TỐI ƯU CỰC ĐẠI: Grid Subsampling thay cho vòng lặp NMS Python
   if min_spacing > 1 and len(pts) > 1:
     grid_coords = (pts / min_spacing).astype(np.int32)
-    # Lấy 1 điểm đại diện cho mỗi ô grid kích thước (min_spacing x min_spacing)
     _, unique_indices = np.unique(grid_coords, axis=0, return_index=True)
     pts = pts[unique_indices]
 
@@ -81,7 +79,6 @@ def extract_graph_points(
   B, _, H, W = mask.shape
   device = mask.device
 
-  # Resize nhẹ về 256x256 để giảm chi phí Skeletonize
   target_size = (256, 256)
   scale_x = W / target_size[1]
   scale_y = H / target_size[0]
@@ -241,7 +238,29 @@ class TopoGraphHead(nn.Module):
 
 
 # ============================================================================
-# 5. CoANetWithTopo (Tối ưu hóa skip rasterize khi đang Train)
+# 5. Hàm tính Loss cho Topology
+# ============================================================================
+
+
+def compute_topo_loss(
+    logits: torch.Tensor, edge_gt: torch.Tensor, pairs_valid: torch.Tensor
+) -> torch.Tensor:
+  """Tính BCE loss cho nhánh Topo, bỏ qua các padding pairs."""
+  logits = logits.squeeze(1).squeeze(-1)  # [B, P]
+  edge_gt = edge_gt.squeeze(1)  # [B, P]
+  pairs_valid = pairs_valid.squeeze(1)  # [B, P]
+
+  n_valid = pairs_valid.float().sum()
+  if n_valid.item() == 0:
+    return logits.sum() * 0.0
+
+  loss = F.binary_cross_entropy_with_logits(logits, edge_gt, reduction='none')
+  loss = (loss * pairs_valid.float()).sum() / n_valid
+  return loss
+
+
+# ============================================================================
+# 6. CoANetWithTopo Module
 # ============================================================================
 
 
@@ -257,14 +276,10 @@ class CoANetWithTopo(nn.Module):
     self.coanet = coanet
     self.topo_cfg = topo_cfg
     self.topo_head = TopoGraphHead(decoder_feature_dim, topo_cfg)
-
-    # Cờ trạng thái freeze CoANet (Mặc định Stage 1 là True)
     self.freeze_coanet = True
 
   def set_freeze_coanet(self, freeze: bool = True):
-    """Hàm helper để switch linh hoạt giữa Stage 1 (Freeze) và Stage 2 (Unfreeze)"""
     self.freeze_coanet = freeze
-    # Đóng/Mở requires_grad cho các tham số CoANet
     for p in self.coanet.parameters():
       p.requires_grad = not freeze
 
@@ -275,24 +290,16 @@ class CoANetWithTopo(nn.Module):
       return_aux: bool = False,
   ) -> Dict[str, torch.Tensor]:
 
-    # =========================================================================
-    # STAGE 1: Khi Freeze CoANet trong quá trình Training
-    # =========================================================================
     if self.training and self.freeze_coanet:
-      # 1. Bọc no_grad hoàn toàn cho CoANet để PyTorch KHÔNG tạo Autograd Graph
       with torch.no_grad():
         e1, e2, e3, e4 = self.coanet.backbone(input)
         e4_aspp = self.coanet.aspp(e4)
         feat = self.coanet.decoder(e1, e2, e3, e4_aspp)
         seg_logits, con0, con1 = self.coanet.connect(feat)
 
-      # 2. Ngắt triệt để mọi dây nối gradient còn sót lại sang TopoHead
       feat = feat.detach()
       seg_logits_detach = seg_logits.detach()
 
-    # =========================================================================
-    # STAGE 2: Khi Unfreeze CoANet (hoặc khi đang Eval/Validation)
-    # =========================================================================
     else:
       e1, e2, e3, e4 = self.coanet.backbone(input)
       e4_aspp = self.coanet.aspp(e4)
@@ -300,11 +307,9 @@ class CoANetWithTopo(nn.Module):
       seg_logits, con0, con1 = self.coanet.connect(feat)
       seg_logits_detach = seg_logits.detach()
 
-    # 3. Tính toán cho TopoHead
     seg_prob = torch.sigmoid(seg_logits_detach)
     topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
 
-    # 4. Rasterize & Fusion (Chỉ chạy khi Eval)
     if not self.training:
       with torch.no_grad():
         fused_mask, graph_mask = rasterize_and_fuse(
