@@ -556,7 +556,7 @@ class Trainer(object):
 
         print(f'\n--- Validation Epoch {epoch} Results ---')
         print(f'[FUSED   ] Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
-                print(
+        print(
             f'[SEG-ONLY] Road IoU: {road_iou_seg:.4f} | '
             f'Precision: {Precision_seg:.4f} | '
             f'Recall: {Recall_seg:.4f} | '
