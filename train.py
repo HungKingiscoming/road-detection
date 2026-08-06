@@ -424,7 +424,8 @@ def main():
     parser.add_argument('--k-neighbors', type=int, default=5, help='Số lân cận k-NN nối cạnh đồ thị')
     parser.add_argument('--topo-score-thresh', type=float, default=0.3, help='Ngưỡng lọc cạnh Topology')
     parser.add_argument('--topo-weight', type=float, default=0.5, help='Trọng số Topology Loss')
-
+    parser.add_argument('--sync-bn', type=bool, default=False,
+                    help='Whether to use synchronized batch normalization (default: False)')
     # Training Hyperparams
     parser.add_argument('--epochs', type=int, default=100, help='number of epochs to train')
     parser.add_argument('--start_epoch', type=int, default=0, help='start epoch')
