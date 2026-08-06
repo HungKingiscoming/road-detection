@@ -369,33 +369,32 @@ class CoANetWithTopo(nn.Module):
     self.topo_cfg = topo_cfg
     self.topo_head = TopoGraphHead(decoder_feature_dim, topo_cfg)
 
-  def forward(
-      self,
-      input: torch.Tensor,
-      gt_mask: Optional[torch.Tensor] = None,
-      return_aux: bool = False,
-  ) -> Dict[str, torch.Tensor]:
-    e1, e2, e3, e4 = self.coanet.backbone(input)
-    e4_aspp = self.coanet.aspp(e4)
+  def forward(self, input: torch.Tensor, gt_mask: Optional[torch.Tensor] = None,
+                return_aux: bool = False) -> Dict[str, torch.Tensor]:
+        e1, e2, e3, e4 = self.coanet.backbone(input)
+        e4_aspp = self.coanet.aspp(e4)
 
-    feat = self.coanet.decoder(e1, e2, e3, e4_aspp)  # [B, 64, H, W]
-    seg_logits, con0, con1 = self.coanet.connect(feat)
+        feat = self.coanet.decoder(e1, e2, e3, e4_aspp)  # [B, 64, H, W]
+        seg_logits, con0, con1 = self.coanet.connect(feat)
 
-    seg_prob = torch.sigmoid(seg_logits.detach())
-    topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
+        seg_prob = torch.sigmoid(seg_logits.detach())
+        topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
 
-    with torch.no_grad():
-      fused_mask, graph_mask = build_fused_mask(
-          seg_logits, topo_out, self.topo_cfg
-      )
+        # 🚀 TỐI ƯU: Bỏ rasterize khi đang Train để tránh tốn thời gian tính toán đồ thị dense
+        if not self.training:
+            with torch.no_grad():
+                fused_mask, graph_mask = build_fused_mask(seg_logits, topo_out, self.topo_cfg)
+        else:
+            fused_mask = seg_logits
+            graph_mask = None
 
-    result = {
-        'seg_logits': seg_logits,
-        'connect': con0,
-        'connect_d1': con1,
-        'fused_mask': fused_mask,
-        'graph_mask': graph_mask,
-        'topo': topo_out,
-    }
+        result = {
+            'seg_logits': seg_logits,
+            'connect': con0,
+            'connect_d1': con1,
+            'fused_mask': fused_mask,
+            'graph_mask': graph_mask,
+            'topo': topo_out,
+        }
 
-    return result
+        return result
