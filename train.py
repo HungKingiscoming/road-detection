@@ -21,7 +21,14 @@ from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+import os
+import cv2
+import torch
 
+# Khống chế CPU thread contention giữa DataLoader workers
+cv2.setNumThreads(0)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 def print_freeze_status(model, epoch: int):
     """In ra trạng thái freeze/unfreeze của các module trong mô hình."""
