@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from modeling.bridge import compute_topo_loss
+from modeling.topo_bridge import compute_topo_loss
 from mypath import Path
 from dataloaders import make_data_loader
 from modeling.sync_batchnorm.replicate import patch_replication_callback
@@ -21,9 +21,7 @@ from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
-import os
 import cv2
-import torch
 
 # Khống chế CPU thread contention giữa DataLoader workers
 cv2.setNumThreads(0)
@@ -79,7 +77,6 @@ def print_freeze_status(model, epoch: int):
 def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) -> nn.Module:
     """
     Load weights từ checkpoint cho CoANet và kiểm tra độ khớp (Key & Shape).
-    Báo cáo chi tiết % khớp của Backbone, ASPP, Decoder và Connect.
     """
     print(f"\n==================================================")
     print(f"🔍 BẮT ĐẦU KIỂM TRA & LOAD WEIGHTS TỪ: {checkpoint_path}")
@@ -153,13 +150,6 @@ def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) ->
             pct = (stats['matched'] / stats['total']) * 100
             print(f"  • {mod_name.upper():<10}: {stats['matched']}/{stats['total']} keys ({pct:.1f}%)")
 
-    if len(shape_mismatched_keys) > 0:
-        print(f"\n⚠️ DANH SÁCH TENSOR LỆCH SHAPE:")
-        for name, m_shape, c_shape in shape_mismatched_keys[:5]:
-            print(f"  - {name}: Model={m_shape} vs Checkpoint={c_shape}")
-        if len(shape_mismatched_keys) > 5:
-            print(f"  ... và {len(shape_mismatched_keys) - 5} keys khác.")
-
     coanet_model.load_state_dict(filtered_state_dict, strict=False)
     print(f"\n✅ Đã load thành công {len(filtered_state_dict)} weights vào CoANet!")
     print(f"==================================================\n")
@@ -168,7 +158,6 @@ def load_coanet_weights_safely(coanet_model: nn.Module, checkpoint_path: str) ->
 
 
 def compute_grad_norm(model, norm_type: float = 2.0) -> float:
-    """Tính tổng grad-norm của toàn bộ parameters có requires_grad và grad != None."""
     total_norm = 0.0
     for p in model.parameters():
         if p.grad is not None:
@@ -178,14 +167,12 @@ def compute_grad_norm(model, norm_type: float = 2.0) -> float:
 
 
 def positive_ratio(x) -> float:
-    """Tỉ lệ pixel/giá trị > 0 (hoặc == 1) trong tensor/array."""
     if hasattr(x, 'float'):
         return x.float().mean().item()
     return float(np.mean(x))
 
 
 def get_road_iou(evaluator: Evaluator) -> float:
-    """Trích xuất IoU riêng cho lớp Road (Class index 1) từ Evaluator."""
     confusion_matrix = evaluator.confusion_matrix
     intersection = np.diag(confusion_matrix)
     ground_truth_set = confusion_matrix.sum(axis=1)
@@ -203,13 +190,11 @@ class Trainer(object):
     def __init__(self, args):
         self.args = args
 
-        # 1. Khởi tạo Saver & Tensorboard
         self.saver = Saver(args)
         self.saver.save_experiment_config()
         self.summary = TensorboardSummary(self.saver.experiment_dir)
         self.writer = self.summary.create_summary()
 
-        # 🚀 TỐI ƯU DATALOADER: Bổ sung persistent_workers
         kwargs = {
             'num_workers': args.workers, 
             'pin_memory': True,
@@ -217,7 +202,6 @@ class Trainer(object):
         }
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
-        # 3. Khởi tạo Mô hình CoANet
         base_coanet = CoANet(
             backbone=args.backbone,
             output_stride=args.out_stride,
@@ -225,11 +209,9 @@ class Trainer(object):
             freeze_bn=args.freeze_bn
         )
 
-        # 4. Load Pretrained Weights cho CoANet
         if hasattr(args, 'coanet_weights') and args.coanet_weights is not None:
             base_coanet = load_coanet_weights_safely(base_coanet, args.coanet_weights)
 
-        # 5. Khởi tạo Mô hình bọc Đồ thị Topo
         topo_config = TopoConfig(
             max_points=args.max_points,
             k_neighbors=args.k_neighbors,
@@ -242,7 +224,6 @@ class Trainer(object):
             decoder_feature_dim=64
         )
         
-        # 6. Khởi tạo Loss Function
         self.coanet_loss_fn = CoANetLoss(
             seg_loss_weight=1.0,
             connect_loss_weight=0.12,     
@@ -251,14 +232,11 @@ class Trainer(object):
         self.topo_loss_fn = TopoLoss(pos_weight=2.0)
         self.model = model
 
-        # 7. Cấu hình Optimizer theo Stage & Differential Learning Rates
         self.current_stage = 1 if args.freeze_coanet_epochs > 0 else 2
         self.optimizer = self.build_optimizer(stage=self.current_stage)
 
-        # 🚀 TỐI ƯU AMP: Khởi tạo GradScaler cho FP16
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.args.cuda)
 
-        # 8. Khởi tạo Evaluator & Scheduler
         self.evaluator = Evaluator(num_class=2)
         self.scheduler = LR_Scheduler(
             args.lr_scheduler, 
@@ -267,13 +245,11 @@ class Trainer(object):
             len(self.train_loader)
         )
 
-        # 9. Cấu hình GPU (CUDA & DataParallel)
         if args.cuda:
             self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
             patch_replication_callback(self.model)
             self.model = self.model.cuda()
 
-        # 10. Load Checkpoint (Resume)
         self.best_pred = 0.0
         if args.resume is not None:
             if not os.path.isfile(args.resume):
@@ -295,94 +271,78 @@ class Trainer(object):
             args.start_epoch = 0
 
     def build_optimizer(self, stage: int = 2):
-      raw_model = (
-          self.model.module
-          if isinstance(self.model, nn.DataParallel)
-          else self.model
-      )
-
-      if stage == 1:
-        print(
-            f'🔒 [Stage 1] Đóng băng CoANet. Chỉ tập trung huấn luyện TopoHead'
-            f' trong {self.args.freeze_coanet_epochs} epoch đầu.'
+        raw_model = (
+            self.model.module
+            if isinstance(self.model, nn.DataParallel)
+            else self.model
         )
-        if hasattr(raw_model, 'set_freeze_coanet'):
-          raw_model.set_freeze_coanet(True)
+
+        if stage == 1:
+            print(
+                f'🔒 [Stage 1] Đóng băng CoANet. Chỉ tập trung huấn luyện TopoHead'
+                f' trong {self.args.freeze_coanet_epochs} epoch đầu.'
+            )
+            if hasattr(raw_model, 'set_freeze_coanet'):
+                raw_model.set_freeze_coanet(True)
+            else:
+                for param in raw_model.coanet.parameters():
+                    param.requires_grad = False
+                for param in raw_model.topo_head.parameters():
+                    param.requires_grad = True
+
+            train_params = filter(
+                lambda p: p.requires_grad, raw_model.parameters()
+            )
+            return torch.optim.AdamW(
+                train_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+            )
+
         else:
-          for param in raw_model.coanet.parameters():
-            param.requires_grad = False
-          for param in raw_model.topo_head.parameters():
-            param.requires_grad = True
+            print(
+                '🔓 [Stage 2] Mở khóa toàn bộ mô hình (Chạy Fine-tune End-to-End'
+                ' với Differential LR).'
+            )
+            if hasattr(raw_model, 'set_freeze_coanet'):
+                raw_model.set_freeze_coanet(False)
+            else:
+                for param in raw_model.parameters():
+                    param.requires_grad = True
 
-        train_params = filter(
-            lambda p: p.requires_grad, raw_model.parameters()
-        )
-        return torch.optim.AdamW(
-            train_params, lr=self.args.lr, weight_decay=self.args.weight_decay
-        )
-
-      else:
-        print(
-            '🔓 [Stage 2] Mở khóa toàn bộ mô hình (Chạy Fine-tune End-to-End'
-            ' với Differential LR).'
-        )
-        if hasattr(raw_model, 'set_freeze_coanet'):
-          raw_model.set_freeze_coanet(False)
-        else:
-          for param in raw_model.parameters():
-            param.requires_grad = True
-
-        train_params = [
-            {
-                'params': raw_model.coanet.backbone.parameters(),
-                'lr': self.args.lr * 0.1,
-            },
-            {
-                'params': raw_model.coanet.aspp.parameters(),
-                'lr': self.args.lr * 0.5,
-            },
-            {
-                'params': raw_model.coanet.decoder.parameters(),
-                'lr': self.args.lr * 0.5,
-            },
-            {
-                'params': raw_model.coanet.connect.parameters(),
-                'lr': self.args.lr * 0.5,
-            },
-            {
-                'params': raw_model.topo_head.parameters(),
-                'lr': self.args.lr * 1.0,
-            },
-        ]
-        return torch.optim.AdamW(
-            train_params, lr=self.args.lr, weight_decay=self.args.weight_decay
-        )
+            train_params = [
+                {'params': raw_model.coanet.backbone.parameters(), 'lr': self.args.lr * 0.1},
+                {'params': raw_model.coanet.aspp.parameters(), 'lr': self.args.lr * 0.5},
+                {'params': raw_model.coanet.decoder.parameters(), 'lr': self.args.lr * 0.5},
+                {'params': raw_model.coanet.connect.parameters(), 'lr': self.args.lr * 0.5},
+                {'params': raw_model.topo_head.parameters(), 'lr': self.args.lr * 1.0},
+            ]
+            return torch.optim.AdamW(
+                train_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+            )
 
     def check_and_update_stage(self, epoch: int):
-      stage_changed = False
+        stage_changed = False
 
-      if epoch < self.args.freeze_coanet_epochs and self.current_stage != 1:
-        self.current_stage = 1
-        self.optimizer = self.build_optimizer(stage=1)
-        stage_changed = True
+        if epoch < self.args.freeze_coanet_epochs and self.current_stage != 1:
+            self.current_stage = 1
+            self.optimizer = self.build_optimizer(stage=1)
+            stage_changed = True
 
-      elif epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
-        self.current_stage = 2
-        self.optimizer = self.build_optimizer(stage=2)
-        stage_changed = True
+        elif epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
+            self.current_stage = 2
+            self.optimizer = self.build_optimizer(stage=2)
+            stage_changed = True
 
-      # 🚀 ĐỒNG BỘ TRẠNG THÁI FREEZE VÀO MODEL WAPPER
-      raw_model = (
-          self.model.module
-          if isinstance(self.model, nn.DataParallel)
-          else self.model
-      )
-      is_frozen = epoch < self.args.freeze_coanet_epochs
-      if hasattr(raw_model, 'set_freeze_coanet'):
-        raw_model.set_freeze_coanet(is_frozen)
+        raw_model = (
+            self.model.module
+            if isinstance(self.model, nn.DataParallel)
+            else self.model
+        )
+        is_frozen = epoch < self.args.freeze_coanet_epochs
+        if hasattr(raw_model, 'set_freeze_coanet'):
+            raw_model.set_freeze_coanet(is_frozen)
 
-      if epoch == self.args.start_epoch or stage_changed:
-        print_freeze_status(self.model, epoch)
+        if epoch == self.args.start_epoch or stage_changed:
+            print_freeze_status(self.model, epoch)
 
     def training(self, epoch):
         self.check_and_update_stage(epoch)
@@ -396,10 +356,10 @@ class Trainer(object):
         num_img_tr = len(self.train_loader)
 
         for i, sample in enumerate(tbar):
-            image = sample['image']               # [B, 3, H, W]
-            gt_mask = sample['gt_mask']           # [B, 1, H, W]
-            gt_connect = sample['gt_connect_d1']  # [B, 9, H, W]
-            gt_connect_d1 = sample['gt_connect_d3']# [B, 9, H, W]
+            image = sample['image']               
+            gt_mask = sample['gt_mask']           
+            gt_connect = sample['gt_connect_d1']  
+            gt_connect_d1 = sample['gt_connect_d3']
 
             gt_mask = (gt_mask > 0.5).float()
 
@@ -412,18 +372,16 @@ class Trainer(object):
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
             self.optimizer.zero_grad()
 
-            # 🚀 TỐI ƯU AMP: Bọc Forward pass trong autocast
             with torch.amp.autocast('cuda', enabled=self.args.cuda):
                 out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
 
-                fused_mask = out_dict['fused_mask']       # [B, 1, H, W]
-                seg_logits = out_dict['seg_logits']       # [B, 1, H, W]
-                connect = out_dict['connect']             # [B, 9, H, W]
-                connect_d1 = out_dict['connect_d1']       # [B, 9, H, W]
-                aux_seg = out_dict.get('aux_seg', None)   # [B, 1, H, W]
-                topo_out = out_dict.get('topo', {})       # TopoNet output
+                fused_mask = out_dict['fused_mask']       
+                seg_logits = out_dict['seg_logits']       
+                connect = out_dict['connect']             
+                connect_d1 = out_dict['connect_d1']       
+                aux_seg = out_dict.get('aux_seg', None)   
+                topo_out = out_dict.get('topo', {})       
 
-                # 1. CoANet Loss
                 c_loss, c_loss_dict = self.coanet_loss_fn(
                     seg=seg_logits,
                     connect=connect,
@@ -434,7 +392,6 @@ class Trainer(object):
                     gt_connect_d1=gt_connect_d1
                 )
                 
-                # 2. TopoNet Loss
                 t_loss = torch.tensor(0.0, device=image.device)
                 if 'edge_gt' in topo_out and topo_out['edge_gt'] is not None and 'logits' in topo_out:
                     t_loss = compute_topo_loss(
@@ -445,7 +402,6 @@ class Trainer(object):
                 
                 total_loss = c_loss + self.args.topo_weight * t_loss
 
-            # 🚀 TỐI ƯU AMP: Dùng Scaler cho Backward & Optimizer Step
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)
             grad_norm = compute_grad_norm(self.model)
@@ -464,19 +420,10 @@ class Trainer(object):
                 f'Loss: {train_loss/(i+1):.4f} | CoANet: {train_coanet_loss/(i+1):.4f} | Topo: {train_topo_loss/(i+1):.4f}'
             )
 
-            # 🚀 TỐI ƯU LOGGING: Chỉ log Tensorboard chi tiết theo tần suất log_interval
             if global_step % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss_iter', total_loss.item(), global_step)
                 self.writer.add_scalar('train/lr_iter', current_lr, global_step)
                 self.writer.add_scalar('train/grad_norm_iter', grad_norm, global_step)
-
-                if isinstance(c_loss_dict, dict):
-                    for k, v in c_loss_dict.items():
-                        v_val = v.item() if torch.is_tensor(v) else v
-                        self.writer.add_scalar(f'train/loss_{k}', v_val, global_step)
-
-                if not np.isfinite(total_loss.item()):
-                    print(f"[CẢNH BÁO] total_loss không hợp lệ (NaN/Inf) tại step {global_step}: {total_loss.item()}")
 
                 with torch.no_grad():
                     seg_pos_ratio = positive_ratio(torch.sigmoid(seg_logits) > 0.5)
@@ -484,37 +431,8 @@ class Trainer(object):
                 self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
                 self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
 
-                pairs_valid = topo_out.get('pairs_valid', None)
-                if pairs_valid is not None:
-                    n_valid_pairs = pairs_valid.float().sum().item()
-                    self.writer.add_scalar('train/topo_num_valid_pairs', n_valid_pairs, global_step)
-                    edge_gt = topo_out.get('edge_gt', None)
-                    if edge_gt is not None and n_valid_pairs > 0:
-                        edge_pos_ratio = (edge_gt * pairs_valid.float()).sum().item() / n_valid_pairs
-                        self.writer.add_scalar('train/topo_edge_positive_ratio', edge_pos_ratio, global_step)
-
-                tqdm.write(
-                    f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} "
-                    f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f}"
-                )
-
-        self.writer.add_scalar('train/total_loss_epoch', train_loss / num_img_tr, epoch)
-        self.writer.add_scalar('train/coanet_loss_epoch', train_coanet_loss / num_img_tr, epoch)
-        self.writer.add_scalar('train/topo_loss_epoch', train_topo_loss / num_img_tr, epoch)
-        self.writer.add_scalar('train/lr_epoch', self.optimizer.param_groups[0]['lr'], epoch)
-
         print(f'\n--- Train Epoch {epoch} Results ---')
         print(f'Train Loss Total: {train_loss / num_img_tr:.4f} | CoANet: {train_coanet_loss / num_img_tr:.4f} | Topo: {train_topo_loss / num_img_tr:.4f}')
-
-        if self.args.no_val:
-            is_best = False
-            model_state = self.model.module.state_dict() if self.args.cuda else self.model.state_dict()
-            self.saver.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model_state,
-                'optimizer': self.optimizer.state_dict(),
-                'best_pred': self.best_pred,
-            }, is_best)
 
     def validation(self, epoch):
         self.model.eval()
@@ -540,8 +458,8 @@ class Trainer(object):
                     gt_connect = gt_connect.cuda(non_blocking=True)
                     gt_connect_d1 = gt_connect_d1.cuda(non_blocking=True)
 
-                # 🚀 AMP trong Validation pass
-                with torch.cuda.amp.autocast(enabled=self.args.cuda):
+                # ✅ Đã sửa API AMP tương thích mới
+                with torch.amp.autocast('cuda', enabled=self.args.cuda):
                     out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
                     fused_mask = out_dict['fused_mask']
                     seg_logits = out_dict['seg_logits']
@@ -580,30 +498,19 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                pred = (fused_mask_eval > 0.5).cpu().numpy().astype(np.int64)
-                target_n = gt_mask.cpu().numpy().astype(np.int64)
+                # ✅ ĐÃ SỬA: Ép qua Sigmoid trước khi băm ngưỡng 0.5
+                pred = (torch.sigmoid(fused_mask_eval) > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
+                target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
+                
+                # Cập nhật Evaluator
                 self.evaluator.add_batch(target_n, pred)
 
-                if i % max(1, num_img_val // 10) == 0:
-                    val_pred_pos_ratio = positive_ratio(pred)
-                    val_gt_pos_ratio = positive_ratio(target_n)
-                    self.writer.add_scalar('val/pred_positive_ratio', val_pred_pos_ratio, epoch * num_img_val + i)
-                    self.writer.add_scalar('val/gt_positive_ratio', val_gt_pos_ratio, epoch * num_img_val + i)
-
-                if i % max(1, num_img_val // 5) == 0:
-                    self.summary.visualize_image(
-                        self.writer, self.args.dataset, image, gt_mask, fused_mask_eval, i, split='Val'
-                    )
-
-        # Tính chỉ số Road IoU ở tập Validation
         road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
         Recall = self.evaluator.Pixel_Recall()
         F1 = self.evaluator.Pixel_F1()
 
         self.writer.add_scalar('val/total_loss_epoch', val_loss / num_img_val, epoch)
-        self.writer.add_scalar('val/coanet_loss_epoch', val_coanet_loss / num_img_val, epoch)
-        self.writer.add_scalar('val/topo_loss_epoch', val_topo_loss / num_img_val, epoch)
         self.writer.add_scalar('val/Road_IoU', road_iou, epoch)
         self.writer.add_scalar('val/Precision', Precision, epoch)
         self.writer.add_scalar('val/Recall', Recall, epoch)
@@ -629,77 +536,59 @@ class Trainer(object):
 def main():
     parser = argparse.ArgumentParser(description="PyTorch CoANet + TopoNet Training")
     
-    # Model Hyperparams
-    parser.add_argument('--backbone', type=str, default='resnet', help='backbone name (default: resnet)')
-    parser.add_argument('--out-stride', type=int, default=8, help='network output stride (default: 8)')
+    parser.add_argument('--backbone', type=str, default='resnet')
+    parser.add_argument('--out-stride', type=int, default=8)
     parser.add_argument('--dataset', type=str, default='spacenet', choices=['spacenet', 'DeepGlobe'])
-    parser.add_argument('--workers', type=int, default=8, help='dataloader threads')
-    parser.add_argument('--freeze-bn', action='store_true', default=False, help='freeze BN parameters')
-    parser.add_argument('--data-dir', type=str, default=None, help='path to dataset root')
-    parser.add_argument('--loss-type', type=str, default='ce', help='loss type tag for logging')
-    parser.add_argument('--base-size', type=int, default=1024, help='base image size for preprocessing')
-    parser.add_argument('--crop-size', type=int, default=512, help='crop size for preprocessing')
+    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--freeze-bn', action='store_true', default=False)
+    parser.add_argument('--data-dir', type=str, default=None)
+    parser.add_argument('--loss-type', type=str, default='ce')
+    parser.add_argument('--base-size', type=int, default=1024)
+    parser.add_argument('--crop-size', type=int, default=512)
 
-    # Load Pretrained CoANet Weights
-    parser.add_argument('--coanet-weights', type=str, default=None, help='đường dẫn tới pretrained weights của CoANet')
-    parser.add_argument('--freeze-coanet-epochs', type=int, default=0, help='số epoch khóa CoANet chỉ train TopoHead (Warmup)')
+    parser.add_argument('--coanet-weights', type=str, default=None)
+    parser.add_argument('--freeze-coanet-epochs', type=int, default=0)
 
-    # TopoNet Params
-    parser.add_argument('--max-points', type=int, default=128, help='Số điểm nút tối đa trích xuất từ Skeleton')
-    parser.add_argument('--k-neighbors', type=int, default=5, help='Số lân cận k-NN nối cạnh đồ thị')
-    parser.add_argument('--topo-score-thresh', type=float, default=0.3, help='Ngưỡng lọc cạnh Topology')
-    parser.add_argument('--topo-weight', type=float, default=0.5, help='Trọng số Topology Loss')
+    parser.add_argument('--max-points', type=int, default=128)
+    parser.add_argument('--k-neighbors', type=int, default=5)
+    parser.add_argument('--topo-score-thresh', type=float, default=0.3)
+    parser.add_argument('--topo-weight', type=float, default=0.5)
 
-    # Training Hyperparams
-    parser.add_argument('--epochs', type=int, default=100, help='number of epochs to train')
-    parser.add_argument('--start_epoch', type=int, default=0, help='start epoch')
-    parser.add_argument('--batch-size', type=int, default=8, help='input batch size for training')
-    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--start_epoch', type=int, default=0)
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--lr-scheduler', type=str, default='poly', choices=['poly', 'step', 'cos'])
-    parser.add_argument('--weight-decay', type=float, default=1e-4, help='weight decay')
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
 
-    # CUDA & System
-    parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
-    parser.add_argument('--gpu-ids', type=str, default='0,1,2,3', help='comma-separated gpu ids')
-    parser.add_argument('--seed', type=int, default=42, help='random seed')
-    parser.add_argument('--resume', type=str, default=None, help='checkpoint path to resume')
-    parser.add_argument('--checkname', type=str, default=None, help='set checkpoint name')
-    parser.add_argument('--ft', action='store_true', default=False, help='finetuning mode')
-    parser.add_argument('--eval-interval', type=int, default=1, help='evaluation interval')
-    parser.add_argument('--no-val', action='store_true', default=False, help='skip validation')
-    parser.add_argument('--log-interval', type=int, default=50,
-                        help='số iteration giữa mỗi lần log chi tiết vào tensorboard')
+    parser.add_argument('--no-cuda', action='store_true', default=False)
+    parser.add_argument('--gpu-ids', type=str, default='0,1')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--checkname', type=str, default=None)
+    parser.add_argument('--ft', action='store_true', default=False)
+    parser.add_argument('--eval-interval', type=int, default=1)
+    parser.add_argument('--no-val', action='store_true', default=False)
+    parser.add_argument('--log-interval', type=int, default=50)
 
     args = parser.parse_args()
     if args.data_dir is None:
         args.data_dir = os.environ.get('DATA_DIR')
-    args.loss_type = getattr(args, 'loss_type', 'ce')
-    args.base_size = getattr(args, 'base_size', 1024)
-    args.crop_size = getattr(args, 'crop_size', 512)
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
     if args.cuda:
-        try:
-            args.gpu_ids = [int(s) for s in args.gpu_ids.split(',')]
-        except ValueError:
-            raise ValueError('Argument --gpu_ids phải là danh sách số nguyên phân cách bằng dấu phẩy!')
-            
-        # 🚀 TỐI ƯU CUDNN: Tự chọn kernel Convolution tối ưu nhất
+        args.gpu_ids = [int(s) for s in args.gpu_ids.split(',')]
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
 
     if args.checkname is None:
         args.checkname = f'CoANetTopo-{args.backbone}'
 
-    print(args)
     torch.manual_seed(args.seed)
     if args.cuda:
         torch.cuda.manual_seed(args.seed)
 
     trainer = Trainer(args)
-    print('Bắt đầu Epoch:', trainer.args.start_epoch)
-    print('Tổng số Epochs:', trainer.args.epochs)
-
     for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
         trainer.training(epoch)
         if not trainer.args.no_val and epoch % args.eval_interval == (args.eval_interval - 1):
