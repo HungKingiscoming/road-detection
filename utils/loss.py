@@ -11,6 +11,10 @@ import torch.nn.functional as F
 
 def dice_loss(logits: torch.Tensor, target: torch.Tensor,
               smooth: float = 1.0, multiclass: bool = False) -> torch.Tensor:
+    # Ep contiguous de tranh loi alignment CUDA trong Multi-GPU
+    logits = logits.contiguous()
+    target = target.contiguous()
+
     if multiclass:
         probs = F.softmax(logits, dim=1)
         num_classes = logits.shape[1]
@@ -48,8 +52,14 @@ class BCEDiceLoss(nn.Module):
             self.pos_weight = None
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        target = target.float()
-        pw = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
+        # Ép contiguous() và float() để bảo đảm tính tương thích bộ nhớ trên GPU
+        logits = logits.contiguous().float()
+        target = target.contiguous().float()
+
+        pw = None
+        if self.pos_weight is not None:
+            pw = self.pos_weight.to(device=logits.device, dtype=logits.dtype).contiguous()
+
         bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
         dice = dice_loss(logits, target, smooth=self.smooth, multiclass=False)
         return self.bce_weight * bce + self.dice_weight * dice
@@ -76,7 +86,13 @@ class CEDiceLoss(nn.Module):
             self.class_weights = None
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        w = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        logits = logits.contiguous().float()
+        target = target.contiguous()
+
+        w = None
+        if self.class_weights is not None:
+            w = self.class_weights.to(device=logits.device, dtype=logits.dtype).contiguous()
+
         ce = F.cross_entropy(logits, target.long(), weight=w, ignore_index=self.ignore_index)
         dice = dice_loss(logits, target, smooth=self.smooth, multiclass=True)
         return self.ce_weight * ce + self.dice_weight * dice
@@ -107,14 +123,12 @@ class SegmentationLoss(nn.Module):
 
 
 # ============================================================================
-# 5. Loss cho connect / connect_d1 (multi-label: mỗi kênh 1 hướng kết nối độc lập)
+# 5. Loss cho connect / connect_d1 (multi-label)
 # ============================================================================
 
 class ConnectivityLoss(nn.Module):
     """
-    Dùng cho `connect` và `connect_d1`, shape [B, num_neighbor, H, W]. Mỗi kênh biểu diễn
-    xác suất kết nối theo 1 hướng lân cận, các kênh KHÔNG loại trừ lẫn nhau (multi-label),
-    nên dùng BCE trên toàn bộ kênh (không softmax/CE).
+    Dùng cho `connect` và `connect_d1`, shape [B, num_neighbor, H, W].
     """
 
     def __init__(self, bce_weight: float = 1.0, dice_weight: float = 1.0,
@@ -130,24 +144,23 @@ class ConnectivityLoss(nn.Module):
             self.pos_weight = None
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        target = target.float()
-        pw = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
+        logits = logits.contiguous().float()
+        target = target.contiguous().float()
+
+        pw = None
+        if self.pos_weight is not None:
+            pw = self.pos_weight.to(device=logits.device, dtype=logits.dtype).contiguous()
+
         bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
         dice = dice_loss(logits, target, smooth=self.smooth, multiclass=False)
         return self.bce_weight * bce + self.dice_weight * dice
 
 
 # ============================================================================
-# 6. Loss tổng: khớp thẳng với 4 output của model
+# 6. Loss tổng: khớp với output của model
 # ============================================================================
 
 class TopoLoss(nn.Module):
-    """Compatibility wrapper used by the training script.
-
-    The current codebase already handles topology loss separately in the bridge module,
-    so this lightweight wrapper simply returns zero and keeps the training script importable.
-    """
-
     def __init__(self, pos_weight: Optional[float] = None):
         super().__init__()
         self.pos_weight = pos_weight
@@ -157,20 +170,6 @@ class TopoLoss(nn.Module):
 
 
 class CoANetLoss(nn.Module):
-    """
-    Gộp loss cho toàn bộ output của CoANet.
-
-    Cách dùng:
-        criterion = CoANetLoss(seg_pos_weight=5.0, connect_pos_weight=3.0)
-        seg, connect, connect_d1, aux_seg = model(images, return_aux=True)
-        loss, loss_dict = criterion(seg, connect, connect_d1, aux_seg,
-                                     gt_seg, gt_connect, gt_connect_d1)
-        loss.backward()
-
-    Nếu gọi model không có return_aux (chỉ ra 3 giá trị), truyền aux_seg=None và
-    không cần gt cho nó — loss_aux sẽ tự bị bỏ qua.
-    """
-
     def __init__(self,
                  seg_bce_weight: float = 1.0,
                  seg_dice_weight: float = 1.0,
@@ -182,7 +181,7 @@ class CoANetLoss(nn.Module):
                  seg_loss_weight: float = 1.0,
                  connect_loss_weight: float = 1.0,
                  connect_d1_loss_weight: float = 1.0,
-                 aux_loss_weight: float = 0.4,   # khớp mặc định model.aux_loss_weight trong coanet.py
+                 aux_loss_weight: float = 0.4,
                  smooth: float = 1.0):
         super().__init__()
 
@@ -190,7 +189,6 @@ class CoANetLoss(nn.Module):
             bce_weight=seg_bce_weight, dice_weight=seg_dice_weight,
             pos_weight=seg_pos_weight, class_weights=class_weights, smooth=smooth)
 
-        # aux_seg cùng loại/kênh với seg chính -> dùng cùng cấu hình loss
         self.aux_criterion = SegmentationLoss(
             bce_weight=seg_bce_weight, dice_weight=seg_dice_weight,
             pos_weight=seg_pos_weight, class_weights=class_weights, smooth=smooth)
@@ -216,7 +214,7 @@ class CoANetLoss(nn.Module):
                 gt_connect: torch.Tensor,
                 gt_connect_d1: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        # Căn chỉnh kích thước Ground Truth khớp với từng Output tương ứng
+        # Căn chỉnh kích thước Ground Truth
         gt_seg_matched = self._match_size(gt_seg, seg)
         gt_connect_matched = self._match_size(gt_connect, connect)
         gt_connect_d1_matched = self._match_size(gt_connect_d1, connect_d1)
@@ -247,28 +245,18 @@ class CoANetLoss(nn.Module):
 
     @staticmethod
     def _match_size(gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        """Resize GT về đúng kích thước pred nếu bị lệch (vd GT full-res, pred bị crop khác)."""
+        """Resize GT về đúng kích thước pred nếu bị lệch, bảo đảm tính liên tục bộ nhớ."""
+        gt = gt.contiguous()
+        pred = pred.contiguous()
+
         if gt.shape[-2:] == pred.shape[-2:]:
             return gt
-        if gt.dim() == 3:  # [B,H,W] nhãn lớp (multi-class index) -> resize kiểu nearest
+
+        if gt.dim() == 3:  # [B,H,W] nhãn lớp (multi-class index)
             gt = gt.unsqueeze(1).float()
             gt = F.interpolate(gt, size=pred.shape[-2:], mode='nearest')
-            return gt.squeeze(1).long()
+            return gt.squeeze(1).long().contiguous()
+
         mode = 'nearest' if gt.dtype in (torch.long, torch.int64, torch.bool) else 'bilinear'
         kwargs = {} if mode == 'nearest' else {'align_corners': True}
-        return F.interpolate(gt.float(), size=pred.shape[-2:], mode=mode, **kwargs)
-
-    @staticmethod
-    def _match_size(gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        """Resize GT về đúng kích thước pred nếu bị lệch (vd GT full-res, pred bị crop khác)."""
-        if gt.shape[-2:] == pred.shape[-2:]:
-            return gt
-        if gt.dim() == 3:  # [B,H,W] nhãn lớp (multi-class index) -> resize kiểu nearest
-            gt = gt.unsqueeze(1).float()
-            gt = F.interpolate(gt, size=pred.shape[-2:], mode='nearest')
-            return gt.squeeze(1).long()
-        mode = 'nearest' if gt.dtype in (torch.long, torch.int64, torch.bool) else 'bilinear'
-        kwargs = {} if mode == 'nearest' else {'align_corners': True}
-        return F.interpolate(gt.float(), size=pred.shape[-2:], mode=mode, **kwargs)
-
-
+        return F.interpolate(gt.float(), size=pred.shape[-2:], mode=mode, **kwargs).contiguous()
