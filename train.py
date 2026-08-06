@@ -547,7 +547,7 @@ class Trainer(object):
                     seg_logits = out_dict['seg_logits']
                     connect = out_dict['connect']
                     connect_d1 = out_dict['connect_d1']
-                    topo_out = out_dict.get('topo', {}))
+                    topo_out = out_dict.get('topo', {})
 
                     c_loss, _ = self.coanet_loss_fn(
                         seg=seg_logits,
