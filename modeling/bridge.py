@@ -378,7 +378,8 @@ class CoANetWithTopo(nn.Module):
         seg_prob = torch.sigmoid(seg_logits.detach())
         topo_out = self.topo_head(feat, seg_prob, gt_mask=gt_mask)
 
-        fused_mask, graph_mask = build_fused_mask(seg_logits, topo_out, self.topo_cfg)
+        with torch.no_grad():
+            fused_mask, graph_mask = build_fused_mask(seg_logits, topo_out, self.topo_cfg)
 
         result = {
             'seg_logits': seg_logits,
