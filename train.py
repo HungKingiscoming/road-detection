@@ -249,7 +249,7 @@ class Trainer(object):
         self.optimizer = self.build_optimizer(stage=self.current_stage)
 
         # 🚀 TỐI ƯU AMP: Khởi tạo GradScaler cho FP16
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.args.cuda)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.args.cuda)
 
         # 8. Khởi tạo Evaluator & Scheduler
         self.evaluator = Evaluator(num_class=2)
@@ -359,7 +359,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             # 🚀 TỐI ƯU AMP: Bọc Forward pass trong autocast
-            with torch.cuda.amp.autocast(enabled=self.args.cuda):
+            with torch.amp.autocast('cuda', enabled=self.args.cuda):
                 out_dict = self.model(image, gt_mask=gt_mask, return_aux=True)
 
                 fused_mask = out_dict['fused_mask']       # [B, 1, H, W]
@@ -631,7 +631,8 @@ def main():
             raise ValueError('Argument --gpu_ids phải là danh sách số nguyên phân cách bằng dấu phẩy!')
             
         # 🚀 TỐI ƯU CUDNN: Tự chọn kernel Convolution tối ưu nhất
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
     if args.checkname is None:
         args.checkname = f'CoANetTopo-{args.backbone}'
