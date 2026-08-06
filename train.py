@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from utils.loss import compute_topo_loss
+from modeling.bridge import compute_topo_loss
 from mypath import Path
 from dataloaders import make_data_loader
 from modeling.sync_batchnorm.replicate import patch_replication_callback
