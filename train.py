@@ -70,9 +70,12 @@ class Trainer(object):
             freeze_bn=args.freeze_bn
         )
         model = CoANetWithTopo(
-            coanet=base_coanet,
-            topo_cfg=topo_config,
-            decoder_feature_dim=64
+            backbone=args.backbone,
+            num_classes=1,
+            num_neighbor=9,
+            sync_bn=args.sync_bn,
+            convnext_model_name='convnextv2_tiny.fcmae_ft_in22k_in1k' if 'convnext' in args.backbone else None,
+            pretrained=True
         )
         
         # 4. Cấu hình Optimizer
@@ -82,9 +85,9 @@ class Trainer(object):
         ]
         
         optimizer = torch.optim.AdamW(
-            train_params,
+            model.parameters(),
             lr=args.lr,
-            weight_decay=args.weight_decay
+            weight_decay=0.05
         )
 
         # 5. Khởi tạo Loss Function
@@ -403,7 +406,9 @@ class Trainer(object):
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch CoANet + TopoNet Training")
-    
+    parser.add_argument('--backbone', type=str, default='convnextv2_tiny',
+                    choices=['gcnet', 'convnextv2_tiny', 'convnextv2_nano'],
+                    help='Backbone architecture')
     # Model Hyperparams
     parser.add_argument('--backbone', type=str, default='resnet', help='backbone name (default: resnet)')
     parser.add_argument('--out-stride', type=int, default=8, help='network output stride (default: 8)')
@@ -425,7 +430,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100, help='number of epochs to train')
     parser.add_argument('--start_epoch', type=int, default=0, help='start epoch')
     parser.add_argument('--batch-size', type=int, default=8, help='input batch size for training')
-    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate (Khuyên dùng 1e-4 cho ConvNeXt-V2)')
     parser.add_argument('--lr-scheduler', type=str, default='poly', choices=['poly', 'step', 'cos'])
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='weight decay')
 
