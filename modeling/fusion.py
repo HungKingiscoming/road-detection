@@ -82,8 +82,8 @@ def rasterize_graph_vectorized(
 
                 line_resp = torch.exp(-dist2 / (2.0 * (sigma ** 2))) * sc_c  # [chunk, H, W]
 
-                chunk_max, _ = line_resp.max(dim=0, keepdim=True)  # [1, H, W]
-                graph_mask[b, 0] = torch.maximum(graph_mask[b, 0], chunk_max[0])
+                chunk_max, _ = line_resp.max(dim=0)  # Shape: [H, W]
+                graph_mask[b, 0] = torch.maximum(graph_mask[b, 0], chunk_max)
 
                 # Thu gom rác bộ nhớ ngay trong loop
                 del grid_dir, proj, dist2, line_resp, chunk_max
