@@ -498,8 +498,7 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                # ✅ ĐÃ SỬA: Ép qua Sigmoid trước khi băm ngưỡng 0.5
-                pred = (torch.sigmoid(fused_mask_eval) > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
+                pred = (fused_mask_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
                 
                 # Cập nhật Evaluator
