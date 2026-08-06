@@ -1,11 +1,12 @@
 import argparse
 import os
 import time
+import cv2
 import numpy as np
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from modeling.bridge import compute_topo_loss
@@ -21,12 +22,12 @@ from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
-import cv2
 
 # Khống chế CPU thread contention giữa DataLoader workers
 cv2.setNumThreads(0)
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+
 
 def print_freeze_status(model, epoch: int):
     """In ra trạng thái freeze/unfreeze của các module trong mô hình."""
@@ -230,18 +231,13 @@ class Trainer(object):
         self.topo_loss_fn = TopoLoss(pos_weight=2.0)
         self.model = model
 
-        self.current_stage = 1 if args.freeze_coanet_epochs > 0 else 2
-        self.optimizer = self.build_optimizer(stage=self.current_stage)
+        # Bắt đầu với Stage 0 chưa xác định để kích hoạt check_and_update_stage ngay Epoch đầu tiên
+        self.current_stage = 0 
+        self.optimizer = None
+        self.scheduler = None
 
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.args.cuda)
-
         self.evaluator = Evaluator(num_class=2)
-        self.scheduler = LR_Scheduler(
-            args.lr_scheduler, 
-            args.lr, 
-            args.epochs, 
-            len(self.train_loader)
-        )
 
         if args.cuda:
             self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
@@ -260,8 +256,6 @@ class Trainer(object):
             else:
                 self.model.load_state_dict(checkpoint['state_dict'])
 
-            if not args.ft:
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
             self.best_pred = checkpoint['best_pred']
             print(f"=> Đã load checkpoint '{args.resume}' (Epoch {checkpoint['epoch']})")
 
@@ -318,28 +312,29 @@ class Trainer(object):
             )
 
     def check_and_update_stage(self, epoch: int):
-        stage_changed = False
+        target_stage = 1 if epoch < self.args.freeze_coanet_epochs else 2
+        
+        if self.current_stage != target_stage:
+            self.current_stage = target_stage
+            self.optimizer = self.build_optimizer(stage=target_stage)
+            
+            # ✅ RESET lại Scheduler kết nối trực tiếp với Optimizer mới
+            self.scheduler = LR_Scheduler(
+                self.args.lr_scheduler, 
+                self.args.lr, 
+                self.args.epochs, 
+                len(self.train_loader)
+            )
 
-        if epoch < self.args.freeze_coanet_epochs and self.current_stage != 1:
-            self.current_stage = 1
-            self.optimizer = self.build_optimizer(stage=1)
-            stage_changed = True
+            raw_model = (
+                self.model.module
+                if isinstance(self.model, nn.DataParallel)
+                else self.model
+            )
+            is_frozen = (target_stage == 1)
+            if hasattr(raw_model, 'set_freeze_coanet'):
+                raw_model.set_freeze_coanet(is_frozen)
 
-        elif epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
-            self.current_stage = 2
-            self.optimizer = self.build_optimizer(stage=2)
-            stage_changed = True
-
-        raw_model = (
-            self.model.module
-            if isinstance(self.model, nn.DataParallel)
-            else self.model
-        )
-        is_frozen = epoch < self.args.freeze_coanet_epochs
-        if hasattr(raw_model, 'set_freeze_coanet'):
-            raw_model.set_freeze_coanet(is_frozen)
-
-        if epoch == self.args.start_epoch or stage_changed:
             print_freeze_status(self.model, epoch)
 
     def training(self, epoch):
@@ -351,13 +346,13 @@ class Trainer(object):
 
         self.model.train()
 
-        # Giữ BatchNorm của CoANet ở chế độ eval() khi đang Freeze
+        # ✅ Chỉ chuyển BatchNorm của CoANet sang eval nếu đang ở Stage 1 (Freeze)
         raw_model = (
             self.model.module
             if isinstance(self.model, nn.DataParallel)
             else self.model
         )
-        if getattr(raw_model, 'freeze_coanet', False):
+        if self.current_stage == 1:
             raw_model.coanet.eval()
 
         tbar = tqdm(self.train_loader, desc=f"Train Epoch {epoch}")
@@ -390,7 +385,7 @@ class Trainer(object):
                 aux_seg = out_dict.get('aux_seg', None)   
                 topo_out = out_dict.get('topo', {})       
 
-                c_loss, c_loss_dict = self.coanet_loss_fn(
+                c_loss, _ = self.coanet_loss_fn(
                     seg=seg_logits,
                     connect=connect,
                     connect_d1=connect_d1,
@@ -408,10 +403,19 @@ class Trainer(object):
                         pairs_valid=topo_out['pairs_valid']
                     )
                 
-                total_loss = c_loss + self.args.topo_weight * t_loss
+                # Trong Stage 1, không cộng c_loss vào backward() vì CoANet đang bị freeze
+                if self.current_stage == 1:
+                    total_loss = self.args.topo_weight * t_loss
+                else:
+                    total_loss = c_loss + self.args.topo_weight * t_loss
 
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)
+            
+            # ✅ Clip Gradient để tránh bùng nổ loss ở Stage 2
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad], max_norm=10.0
+            )
             grad_norm = compute_grad_norm(self.model)
             
             self.scaler.step(self.optimizer)
@@ -441,6 +445,9 @@ class Trainer(object):
 
         print(f'\n--- Train Epoch {epoch} Results ---')
         print(f'Train Loss Total: {train_loss / num_img_tr:.4f} | CoANet: {train_coanet_loss / num_img_tr:.4f} | Topo: {train_topo_loss / num_img_tr:.4f}')
+        
+        # Ghi nhận loss tổng quát theo epoch
+        self.writer.add_scalar('train/loss_epoch', train_loss / num_img_tr, epoch)
 
     def validation(self, epoch):
         self.model.eval()
@@ -510,6 +517,7 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
+                # ✅ fused_mask_eval ĐÃ LÀ XÁC SUẤT [0, 1]
                 pred = (fused_mask_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
