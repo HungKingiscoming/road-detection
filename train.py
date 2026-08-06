@@ -295,47 +295,94 @@ class Trainer(object):
             args.start_epoch = 0
 
     def build_optimizer(self, stage: int = 2):
-        raw_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+      raw_model = (
+          self.model.module
+          if isinstance(self.model, nn.DataParallel)
+          else self.model
+      )
 
-        if stage == 1:
-            print(f"🔒 [Stage 1] Đóng băng CoANet. Chỉ tập trung huấn luyện TopoHead trong {self.args.freeze_coanet_epochs} epoch đầu.")
-            for param in raw_model.coanet.parameters():
-                param.requires_grad = False
-            for param in raw_model.topo_head.parameters():
-                param.requires_grad = True
-
-            train_params = filter(lambda p: p.requires_grad, raw_model.parameters())
-            return torch.optim.AdamW(train_params, lr=self.args.lr, weight_decay=self.args.weight_decay)
-
+      if stage == 1:
+        print(
+            f'🔒 [Stage 1] Đóng băng CoANet. Chỉ tập trung huấn luyện TopoHead'
+            f' trong {self.args.freeze_coanet_epochs} epoch đầu.'
+        )
+        if hasattr(raw_model, 'set_freeze_coanet'):
+          raw_model.set_freeze_coanet(True)
         else:
-            print("🔓 [Stage 2] Mở khóa toàn bộ mô hình (Chạy Fine-tune End-to-End với Differential LR).")
-            for param in raw_model.parameters():
-                param.requires_grad = True
+          for param in raw_model.coanet.parameters():
+            param.requires_grad = False
+          for param in raw_model.topo_head.parameters():
+            param.requires_grad = True
 
-            train_params = [
-                {'params': raw_model.coanet.backbone.parameters(), 'lr': self.args.lr * 0.1},
-                {'params': raw_model.coanet.aspp.parameters(), 'lr': self.args.lr * 0.5},
-                {'params': raw_model.coanet.decoder.parameters(), 'lr': self.args.lr * 0.5},
-                {'params': raw_model.coanet.connect.parameters(), 'lr': self.args.lr * 0.5},
-                {'params': raw_model.topo_head.parameters(), 'lr': self.args.lr * 1.0},
-            ]
-            return torch.optim.AdamW(train_params, lr=self.args.lr, weight_decay=self.args.weight_decay)
+        train_params = filter(
+            lambda p: p.requires_grad, raw_model.parameters()
+        )
+        return torch.optim.AdamW(
+            train_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+        )
+
+      else:
+        print(
+            '🔓 [Stage 2] Mở khóa toàn bộ mô hình (Chạy Fine-tune End-to-End'
+            ' với Differential LR).'
+        )
+        if hasattr(raw_model, 'set_freeze_coanet'):
+          raw_model.set_freeze_coanet(False)
+        else:
+          for param in raw_model.parameters():
+            param.requires_grad = True
+
+        train_params = [
+            {
+                'params': raw_model.coanet.backbone.parameters(),
+                'lr': self.args.lr * 0.1,
+            },
+            {
+                'params': raw_model.coanet.aspp.parameters(),
+                'lr': self.args.lr * 0.5,
+            },
+            {
+                'params': raw_model.coanet.decoder.parameters(),
+                'lr': self.args.lr * 0.5,
+            },
+            {
+                'params': raw_model.coanet.connect.parameters(),
+                'lr': self.args.lr * 0.5,
+            },
+            {
+                'params': raw_model.topo_head.parameters(),
+                'lr': self.args.lr * 1.0,
+            },
+        ]
+        return torch.optim.AdamW(
+            train_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+        )
 
     def check_and_update_stage(self, epoch: int):
-        stage_changed = False
-        
-        if epoch < self.args.freeze_coanet_epochs and self.current_stage != 1:
-            self.current_stage = 1
-            self.optimizer = self.build_optimizer(stage=1)
-            stage_changed = True
-            
-        elif epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
-            self.current_stage = 2
-            self.optimizer = self.build_optimizer(stage=2)
-            stage_changed = True
+      stage_changed = False
 
-        if epoch == self.args.start_epoch or stage_changed:
-            print_freeze_status(self.model, epoch)
+      if epoch < self.args.freeze_coanet_epochs and self.current_stage != 1:
+        self.current_stage = 1
+        self.optimizer = self.build_optimizer(stage=1)
+        stage_changed = True
+
+      elif epoch >= self.args.freeze_coanet_epochs and self.current_stage == 1:
+        self.current_stage = 2
+        self.optimizer = self.build_optimizer(stage=2)
+        stage_changed = True
+
+      # 🚀 ĐỒNG BỘ TRẠNG THÁI FREEZE VÀO MODEL WAPPER
+      raw_model = (
+          self.model.module
+          if isinstance(self.model, nn.DataParallel)
+          else self.model
+      )
+      is_frozen = epoch < self.args.freeze_coanet_epochs
+      if hasattr(raw_model, 'set_freeze_coanet'):
+        raw_model.set_freeze_coanet(is_frozen)
+
+      if epoch == self.args.start_epoch or stage_changed:
+        print_freeze_status(self.model, epoch)
 
     def training(self, epoch):
         self.check_and_update_stage(epoch)
@@ -500,7 +547,7 @@ class Trainer(object):
                     seg_logits = out_dict['seg_logits']
                     connect = out_dict['connect']
                     connect_d1 = out_dict['connect_d1']
-                    topo_out = out_dict.get('topo', {})
+                    topo_out = out_dict.get('topo', {}))
 
                     c_loss, _ = self.coanet_loss_fn(
                         seg=seg_logits,
