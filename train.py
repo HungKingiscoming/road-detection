@@ -87,6 +87,9 @@ class Trainer(object):
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
+        # 🟢 ÉP CỨNG SỐ CLASS VỀ 1 CHO BÀI TOÁN BINARY ROAD DETECTION
+        self.nclass = 1
+
         # Khởi tạo mô hình 21 classes để vừa khít weights pretrained
         model = CoANet(num_classes=21,
                         backbone=args.backbone,
