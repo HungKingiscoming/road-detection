@@ -207,7 +207,7 @@ class Trainer(object):
 
         for i, sample in enumerate(tbar):
             image = sample['image']
-            target = sample['label']
+            target = sample.get('gt_mask', sample.get('label', sample.get('mask')))
             con0, con1, con2 = sample['connect0'], sample['connect1'], sample['connect2']
             con_d1_0, con_d1_1, con_d1_2 = sample['connect_d1_0'], sample['connect_d1_1'], sample['connect_d1_2']
 
