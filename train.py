@@ -207,12 +207,35 @@ class Trainer(object):
 
         for i, sample in enumerate(tbar):
             image = sample['image']
-            target = sample.get('gt_mask', sample.get('label', sample.get('mask')))
-            con0, con1, con2 = sample['connect0'], sample['connect1'], sample['connect2']
-            con_d1_0, con_d1_1, con_d1_2 = sample['connect_d1_0'], sample['connect_d1_1'], sample['connect_d1_2']
 
-            connect_label = torch.cat((con0, con1, con2), 1)
-            connect_d1_label = torch.cat((con_d1_0, con_d1_1, con_d1_2), 1)
+            # 1. Lấy GT Segmentation Mask
+            target = sample.get('gt_mask', sample.get('label', sample.get('mask')))
+            
+            # 2. Lấy GT Connect
+            if 'gt_connect' in sample:
+              connect_label = sample['gt_connect']
+            elif 'connect' in sample:
+              connect_label = sample['connect']
+            else:
+              con0, con1, con2 = (
+                  sample['connect0'],
+                  sample['connect1'],
+                  sample['connect2'],
+              )
+              connect_label = torch.cat((con0, con1, con2), 1)
+            
+            # 3. Lấy GT Connect D1
+            if 'gt_connect_d1' in sample:
+              connect_d1_label = sample['gt_connect_d1']
+            elif 'connect_d1' in sample:
+              connect_d1_label = sample['connect_d1']
+            else:
+              con_d1_0, con_d1_1, con_d1_2 = (
+                  sample['connect_d1_0'],
+                  sample['connect_d1_1'],
+                  sample['connect_d1_2'],
+              )
+              connect_d1_label = torch.cat((con_d1_0, con_d1_1, con_d1_2), 1)
 
             if self.args.cuda:
                 image = image.cuda(non_blocking=True)
@@ -295,16 +318,38 @@ class Trainer(object):
 
         with torch.no_grad():
             for i, sample in enumerate(tbar):
-                # Xử lý tương thích nếu sample là List hay Dict
                 val_sample = sample[0] if isinstance(sample, list) else sample
-                
-                image = val_sample['image']
-                target = val_sample.get('gt_mask', val_sample.get('label', val_sample.get('mask')))
-                con0, con1, con2 = val_sample['connect0'], val_sample['connect1'], val_sample['connect2']
-                con_d1_0, con_d1_1, con_d1_2 = val_sample['connect_d1_0'], val_sample['connect_d1_1'], val_sample['connect_d1_2']
 
-                connect_label = torch.cat((con0, con1, con2), 1)
-                connect_d1_label = torch.cat((con_d1_0, con_d1_1, con_d1_2), 1)
+                image = val_sample['image']
+                target = val_sample.get(
+                    'gt_mask', val_sample.get('label', val_sample.get('mask'))
+                )
+                
+                # 1. Lấy GT Connect
+                if 'gt_connect' in val_sample:
+                  connect_label = val_sample['gt_connect']
+                elif 'connect' in val_sample:
+                  connect_label = val_sample['connect']
+                else:
+                  con0, con1, con2 = (
+                      val_sample['connect0'],
+                      val_sample['connect1'],
+                      val_sample['connect2'],
+                  )
+                  connect_label = torch.cat((con0, con1, con2), 1)
+                
+                # 2. Lấy GT Connect D1
+                if 'gt_connect_d1' in val_sample:
+                  connect_d1_label = val_sample['gt_connect_d1']
+                elif 'connect_d1' in val_sample:
+                  connect_d1_label = val_sample['connect_d1']
+                else:
+                  con_d1_0, con_d1_1, con_d1_2 = (
+                      val_sample['connect_d1_0'],
+                      val_sample['connect_d1_1'],
+                      val_sample['connect_d1_2'],
+                  )
+                  connect_d1_label = torch.cat((con_d1_0, con_d1_1, con_d1_2), 1)
 
                 if self.args.cuda:
                     image = image.cuda(non_blocking=True)
