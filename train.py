@@ -88,10 +88,10 @@ class Trainer(object):
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
         # 🟢 ÉP CỨNG SỐ CLASS VỀ 1 CHO BÀI TOÁN BINARY ROAD DETECTION
-        self.nclass = 1
+        self.nclass = 2
 
         # Khởi tạo mô hình 21 classes để vừa khít weights pretrained
-        model = CoANet(num_classes=21,
+        model = CoANet(num_classes= self.nclass = 2,
                         backbone=args.backbone,
                         output_stride=args.out_stride,
                         sync_bn=args.sync_bn,
