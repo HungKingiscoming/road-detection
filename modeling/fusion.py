@@ -1,3 +1,8 @@
+from typing import Optional, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 def rasterize_graph_vectorized(
     graph_points: torch.Tensor,  # [B, N_points, 2]
     pairs: torch.Tensor,  # [B, N_pairs, 2] hoặc [B, N_samples, N_pairs, 2]
