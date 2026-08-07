@@ -382,7 +382,12 @@ def main():
     parser.add_argument('--sync-bn', action='store_true', default=False, help='whether to use sync bn')
     parser.add_argument('--freeze-bn', action='store_true', default=False, help='whether to freeze bn parameters')
     parser.add_argument('--loss-type', type=str, default='con_ce', choices=['ce', 'con_ce', 'focal'], help='loss func type')
-    
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        default=None,
+        help='path to dataset directory (optional)',
+    )
     # Pretrained weights argument
     parser.add_argument('--coanet-weights', type=str, default=None, help='đường dẫn tới file weights (.pth hoặc .pth.tar)')
 
