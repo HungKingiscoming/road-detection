@@ -91,7 +91,7 @@ class Trainer(object):
         self.nclass = 2
 
         # Khởi tạo mô hình 21 classes để vừa khít weights pretrained
-        model = CoANet(num_classes= self.nclass = 2,
+        model = CoANet(num_classes= self.nclass,
                         backbone=args.backbone,
                         output_stride=args.out_stride,
                         sync_bn=args.sync_bn,
