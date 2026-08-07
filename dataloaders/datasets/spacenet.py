@@ -105,64 +105,76 @@ class SpaceNetDataset(Dataset):
     return len(self.prefixes)
 
   def __getitem__(self, idx):
-    prefix = self.prefixes[idx]
+        prefix = self.prefixes[idx]
 
-    # 1. Đường dẫn các file tương ứng
-    rgb_path = f'{prefix}__rgb.png'
-    gt_path = f'{prefix}__gt.png'
-    graph_json_path = f'{prefix}__gt_graph_dense_spacenet.json'
+        # 1. Đường dẫn các file tương ứng
+        rgb_path = f'{prefix}__rgb.png'
+        gt_path = f'{prefix}__gt.png'
+        graph_json_path = f'{prefix}__gt_graph_dense_spacenet.json'
 
-    # 2. Đọc ảnh RGB & GT Mask dưới dạng NumPy Array
-    rgb_img = np.array(Image.open(rgb_path).convert('RGB'))
+        # 2. Đọc ảnh RGB & GT Mask dưới dạng NumPy Array
+        rgb_img = np.array(Image.open(rgb_path).convert('RGB'))
 
-    gt_mask_img = Image.open(gt_path).convert('L')
-    gt_mask = (np.array(gt_mask_img) > 0).astype(np.float32)
+        gt_mask_img = Image.open(gt_path).convert('L')
+        gt_mask = (np.array(gt_mask_img) > 0).astype(np.float32)
 
-    # 3. Áp dụng Data Augmentation (Albumentations)
-    if self.transform is not None:
-      augmented = self.transform(image=rgb_img, mask=gt_mask)
-      rgb_img = augmented['image']
-      gt_mask = augmented['mask']
+        # 3. Áp dụng Data Augmentation (Albumentations)
+        if self.transform is not None:
+            augmented = self.transform(image=rgb_img, mask=gt_mask)
+            rgb_img = augmented['image']
+            gt_mask = augmented['mask']
 
-      # Chuyển đổi về numpy nếu transform trả về Tensor trước khi tính connectivity
-      if isinstance(rgb_img, torch.Tensor):
-        rgb_img = rgb_img.numpy()
-      if isinstance(gt_mask, torch.Tensor):
-        gt_mask = gt_mask.numpy()
+            # Chuyển đổi về numpy nếu transform trả về Tensor trước khi tính connectivity
+            if isinstance(rgb_img, torch.Tensor):
+                rgb_img = rgb_img.numpy()
+            if isinstance(gt_mask, torch.Tensor):
+                gt_mask = gt_mask.numpy()
 
-    # 4. Tính toán Connectivity Maps (d1 & d3) chuẩn thuật toán CoANet gốc
-    gt_connect_d1 = generate_connectivity_gt(gt_mask, dilation=1)  # [9, H, W]
-    gt_connect_d3 = generate_connectivity_gt(gt_mask, dilation=2)  # [9, H, W]
+        # 4. Tính toán Connectivity Maps (d1 & d3) chuẩn thuật toán CoANet gốc
+        gt_connect_d1 = generate_connectivity_gt(gt_mask, dilation=1)  # [9, H, W]
+        gt_connect_d3 = generate_connectivity_gt(gt_mask, dilation=2)  # [9, H, W]
 
-    # 5. Chuyển đổi sang PyTorch Tensor & Normalization
-    rgb_tensor = torch.from_numpy(rgb_img).permute(2, 0, 1).float() / 255.0
-    rgb_tensor = TF.normalize(
-        rgb_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    )
+        # 5. Chuyển đổi sang PyTorch Tensor & Normalization
+        rgb_tensor = torch.from_numpy(rgb_img).permute(2, 0, 1).float() / 255.0
+        rgb_tensor = TF.normalize(
+            rgb_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
 
-    gt_mask_tensor = torch.from_numpy(gt_mask).unsqueeze(0).float()  # [1, H, W]
-    gt_conn_d1_tensor = torch.from_numpy(gt_connect_d1).float()  # [9, H, W]
-    gt_conn_d3_tensor = torch.from_numpy(gt_connect_d3).float()  # [9, H, W]
+        # LƯU Ý: Bỏ unsqueeze(0) để mask giữ nguyên shape [H, W] thay vì [1, H, W].
+        # Vì trong train.py tác giả đã dùng target = torch.unsqueeze(target, 1) rồi.
+        gt_mask_tensor = torch.from_numpy(gt_mask).float() 
+        
+        gt_conn_d1_tensor = torch.from_numpy(gt_connect_d1).float()  # [9, H, W]
+        gt_conn_d3_tensor = torch.from_numpy(gt_connect_d3).float()  # [9, H, W]
 
-    sample = {
-        'image': rgb_tensor,
-        'gt_mask': gt_mask_tensor,
-        'gt_connect_d1': gt_conn_d1_tensor,
-        'gt_connect_d3': gt_conn_d3_tensor,
-        'prefix': os.path.basename(prefix),
-    }
+        # 🟢 ĐỔI TÊN KEYS VÀ CHIA TENSOR ĐỂ KHỚP 100% VỚI TRAIN.PY GỐC
+        sample = {
+            'image': rgb_tensor,
+            'label': gt_mask_tensor,
+            
+            # Chia tensor [9, H, W] thành 3 phần [3, H, W] cho connect_d3 (tương ứng connect0, 1, 2)
+            'connect0': gt_conn_d3_tensor[0:3, :, :],
+            'connect1': gt_conn_d3_tensor[3:6, :, :],
+            'connect2': gt_conn_d3_tensor[6:9, :, :],
+            
+            # Chia tensor [9, H, W] thành 3 phần [3, H, W] cho connect_d1
+            'connect_d1_0': gt_conn_d1_tensor[0:3, :, :],
+            'connect_d1_1': gt_conn_d1_tensor[3:6, :, :],
+            'connect_d1_2': gt_conn_d1_tensor[6:9, :, :],
+            
+            'prefix': os.path.basename(prefix),
+        }
 
-    # 6. Đọc thông tin Graph cấu trúc cho TopoNet (nếu có)
-    if self.load_graph_data and os.path.exists(graph_json_path):
-      try:
-        with open(graph_json_path, 'r') as f:
-          graph_json = json.load(f)
-        sample['graph_json'] = graph_json
-      except Exception:
-        pass
+        # 6. Đọc thông tin Graph cấu trúc cho TopoNet (nếu có)
+        if self.load_graph_data and os.path.exists(graph_json_path):
+            try:
+                with open(graph_json_path, 'r') as f:
+                    graph_json = json.load(f)
+                sample['graph_json'] = graph_json
+            except Exception:
+                pass
 
-    return sample
-
+        return sample
 
 def build_spacenet_dataloaders(
     data_dir: str,
