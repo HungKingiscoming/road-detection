@@ -299,7 +299,7 @@ class Trainer(object):
                 val_sample = sample[0] if isinstance(sample, list) else sample
                 
                 image = val_sample['image']
-                target = val_sample['label']
+                target = val_sample.get('gt_mask', val_sample.get('label', val_sample.get('mask')))
                 con0, con1, con2 = val_sample['connect0'], val_sample['connect1'], val_sample['connect2']
                 con_d1_0, con_d1_1, con_d1_2 = val_sample['connect_d1_0'], val_sample['connect_d1_1'], val_sample['connect_d1_2']
 
