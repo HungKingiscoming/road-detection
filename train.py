@@ -23,11 +23,128 @@ from utils.metrics import Evaluator
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
-# Khống chế CPU thread contention giữa DataLoader workers
-cv2.setNumThreads(0)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+def check_label_inversion_and_channels(trainer):
+  """Kiểm tra xem nhãn Class 0/1 giữa Ground Truth và Output Pretrained CoANet có bị đảo ngược không."""
+  print("\n==================================================")
+  print("🔍 KIỂM TRA ĐẢO NGƯỢC NHÃN (LABEL INVERSION CHECK)")
+  print("==================================================")
+
+  trainer.model.eval()
+
+  # Lấy 1 batch từ Val Loader
+  try:
+    sample = next(iter(trainer.val_loader))
+  except Exception as e:
+    print(f"❌ Không lấy được sample từ val_loader: {e}")
+    return
+
+  image = sample["image"]
+  gt_mask = sample["gt_mask"]
+  gt_mask = (gt_mask > 0.5).float()
+
+  if trainer.args.cuda:
+    image = image.cuda(non_blocking=True)
+    gt_mask = gt_mask.cuda(non_blocking=True)
+
+  with torch.no_grad():
+    out_dict = trainer.model(image, gt_mask=gt_mask, return_aux=True)
+    seg_logits = out_dict["seg_logits"]
+
+  if seg_logits.shape[-2:] != gt_mask.shape[-2:]:
+    seg_logits = F.interpolate(
+        seg_logits,
+        size=gt_mask.shape[-2:],
+        mode="bilinear",
+        align_corners=True,
+    )
+
+  gt_np = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
+  num_channels = seg_logits.shape[1]
+
+  print(f"📌 Shape của seg_logits đầu ra: {tuple(seg_logits.shape)}")
+  print(f"📌 Số kênh (Channels) đầu ra: {num_channels}")
+
+  # ----------------------------------------------------------------------
+  # KỊCH BẢN A: Output 1 Channel (Binary Classification với Sigmoid)
+  # ----------------------------------------------------------------------
+  if num_channels == 1:
+    seg_prob = torch.sigmoid(seg_logits.float()).squeeze(1).cpu().numpy()
+
+    # Cách 1: Chuẩn gốc (Pred > 0.5 là Road)
+    pred_normal = (seg_prob > 0.5).astype(np.int64)
+    iou_normal = calculate_iou(gt_np, pred_normal)
+
+    # Cách 2: Đảo ngược (Pred <= 0.5 là Road)
+    pred_inverted = (seg_prob <= 0.5).astype(np.int64)
+    iou_inverted = calculate_iou(gt_np, pred_inverted)
+
+    print("\n📊 KẾT QUẢ ĐÁNH GIÁ (1 CHANNEL - SIGMOID):")
+    print(f"  • IoU theo quy ước CHUẨN   (Prob > 0.5  = Road) : {iou_normal:.4f}")
+    print(
+        f"  • IoU nếu bị ĐẢO NGƯỢC (Prob <= 0.5 = Road) :"
+        f" {iou_inverted:.4f}"
+    )
+
+    if iou_inverted > iou_normal + 0.2:
+      print(
+        "\n🚨 CẢNH BÁO: PHÁT HIỆN ĐẢO NGƯỢC NHÃN! Ground Truth của bạn quy"
+        " ước Class 1 = Road, nhưng Pretrained Weight lại dự đoán Class 0 ="
+        " Road."
+      )
+    elif iou_normal < 0.2 and iou_inverted < 0.2:
+      print(
+          "\n⚠️ CẢNH BÁO: Cả 2 chiều IoU đều rất thấp. Nguyên nhân nằm ở lệch"
+          " chuẩn Mean/Std Normalization hoặc RGB/BGR."
+      )
+    else:
+      print(
+          "\n✅ Nhãn không bị đảo ngược. Quy ước Sigmoid > 0.5 đang đúng chiều."
+      )
+
+  # ----------------------------------------------------------------------
+  # KỊCH BẢN B: Output 2 Channels (Multi-class với Softmax/Argmax)
+  # ----------------------------------------------------------------------
+  elif num_channels == 2:
+    probs = F.softmax(seg_logits.float(), dim=1).cpu().numpy()
+
+    # Channel 1 = Road
+    pred_ch1 = (probs[:, 1, :, :] > probs[:, 0, :, :]).astype(np.int64)
+    iou_ch1 = calculate_iou(gt_np, pred_ch1)
+
+    # Channel 0 = Road
+    pred_ch0 = (probs[:, 0, :, :] > probs[:, 1, :, :]).astype(np.int64)
+    iou_ch0 = calculate_iou(gt_np, pred_ch0)
+
+    print("\n📊 KẾT QUẢ ĐÁNH GIÁ (2 CHANNELS - ARGMAX/SOFTMAX):")
+    print(
+        f"  • IoU nếu Channel 1 = Road (Quy ước thông thường): {iou_ch1:.4f}"
+    )
+    print(f"  • IoU nếu Channel 0 = Road (Bị đảo Channel)    : {iou_ch0:.4f}")
+
+    if iou_ch0 > iou_ch1 + 0.2:
+      print(
+          "\n🚨 CẢNH BÁO: Pretrained Weight dùng Channel 0 làm Road thay vì"
+          " Channel 1!"
+      )
+    else:
+      print("\n✅ Channel 1 là Road đúng với thiết kế.")
+
+  print("==================================================\n")
+
+
+def calculate_iou(gt, pred):
+  """Hàm phụ trợ tính nhanh IoU cho Class 1."""
+  intersection = np.logical_and(gt == 1, pred == 1).sum()
+  union = np.logical_or(gt == 1, pred == 1).sum()
+  if union == 0:
+    return 0.0
+  return float(intersection / union)
 
 def print_freeze_status(model, epoch: int):
     """In ra trạng thái freeze/unfreeze của các module trong mô hình."""
@@ -754,6 +871,7 @@ def main():
         torch.cuda.manual_seed(args.seed)
 
     trainer = Trainer(args)
+    check_label_inversion_and_channels(trainer)
     for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
         trainer.training(epoch)
         if not trainer.args.no_val and epoch % args.eval_interval == (args.eval_interval - 1):
