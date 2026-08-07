@@ -461,7 +461,11 @@ class Trainer(object):
                     # lệch domain resolution 3m (checkpoint) vs 1m (dataset hiện tại).
                     seg_prob_mean = seg_prob.mean().item()
                     seg_prob_max = seg_prob.max().item()
-                    seg_prob_p99 = torch.quantile(seg_prob.flatten().float(), 0.99).item()
+                    # FIX: torch.quantile() giới hạn cứng ~16 triệu phần tử (thực tế PyTorch
+                    # 2.10 trên GPU còn chặt hơn) -> RuntimeError "input tensor is too large"
+                    # với batch_size lớn. Chuyển sang numpy.percentile trên CPU: không giới
+                    # hạn kích thước, chỉ chạy 1 lần mỗi log_interval nên không ảnh hưởng tốc độ.
+                    seg_prob_p99 = float(np.percentile(seg_prob.detach().float().cpu().numpy(), 99))
 
                 self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
                 self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
