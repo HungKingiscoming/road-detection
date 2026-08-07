@@ -180,7 +180,8 @@ class Trainer(object):
             
             output, out_connect, out_connect_d1 = self.model(image)
             target = torch.unsqueeze(target, 1)
-            
+            if output.shape[1] == 2 and target.shape[1] == 1:
+                target = torch.cat([1.0 - target, target], dim=1)
             loss1 = self.criterion(output, target)
             loss2 = self.criterion_con(out_connect, connect_label)
             loss3 = self.criterion_con(out_connect_d1, connect_d1_label)
