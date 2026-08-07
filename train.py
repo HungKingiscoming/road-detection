@@ -33,13 +33,11 @@ def load_coanet_weights_safely(model: nn.Module, checkpoint_path: str) -> nn.Mod
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
-    # Bóc tách state_dict từ các định dạng lưu trữ checkpoint khác nhau
     if isinstance(checkpoint, dict):
         state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
     else:
         state_dict = checkpoint
 
-    # Chuẩn hóa tên Key (Loại bỏ prefix thừa do DataParallel/Wrapper)
     cleaned_state_dict = {}
     for k, v in state_dict.items():
         name = k
@@ -98,7 +96,6 @@ def load_coanet_weights_safely(model: nn.Module, checkpoint_path: str) -> nn.Mod
 
     model.load_state_dict(filtered_state_dict, strict=False)
     
-    # Kiểm tra giá trị tensor thực tế sau khi nạp
     sample_param = list(model.parameters())[0]
     print(f"\n🧪 Weights Tensor Check (Layer 0): Mean={sample_param.mean().item():.6f} | Std={sample_param.std().item():.6f}")
     print(f"✅ Đã load thành công {len(filtered_state_dict)} weights vào CoANet!")
@@ -107,41 +104,72 @@ def load_coanet_weights_safely(model: nn.Module, checkpoint_path: str) -> nn.Mod
     return model
 
 
+def get_sample_tensors(sample):
+    """Trích xuất linh hoạt image, target, connect_label, connect_d1_label từ sample."""
+    image = sample['image']
+
+    # 1. Target Mask
+    target = sample.get('gt_mask', sample.get('label', sample.get('mask')))
+
+    # 2. Connect Label
+    if 'gt_connect' in sample:
+        connect_label = sample['gt_connect']
+    elif 'connect' in sample:
+        connect_label = sample['connect']
+    elif 'connect0' in sample:
+        connect_label = torch.cat((sample['connect0'], sample['connect1'], sample['connect2']), 1)
+    else:
+        raise KeyError("Không tìm thấy key phù hợp cho Connect trong sample!")
+
+    # 3. Connect D1 Label
+    if 'gt_connect_d1' in sample:
+        connect_d1_label = sample['gt_connect_d1']
+    elif 'connect_d1' in sample:
+        connect_d1_label = sample['connect_d1']
+    elif 'connect_d1_0' in sample:
+        connect_d1_label = torch.cat((sample['connect_d1_0'], sample['connect_d1_1'], sample['connect_d1_2']), 1)
+    else:
+        raise KeyError("Không tìm thấy key phù hợp cho Connect D1 trong sample!")
+
+    return image, target, connect_label, connect_d1_label
+
+
 class Trainer(object):
     def __init__(self, args):
         self.args = args
 
-        # Define Saver
         self.saver = Saver(args)
         self.saver.save_experiment_config()
-        # Define Tensorboard Summary
         self.summary = TensorboardSummary(self.saver.experiment_dir)
         self.writer = self.summary.create_summary()
 
-        # Define Dataloader
         kwargs = {'num_workers': args.workers, 'pin_memory': True}
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
-        # Define Network
+        # 1. Khởi tạo CoANet với num_classes=21 để vừa khớp 100% (802 keys) với Pretrained Weight
         model = CoANet(
-            num_classes=self.nclass,
+            num_classes=21,
             backbone=args.backbone,
             output_stride=args.out_stride,
             sync_bn=args.sync_bn,
             freeze_bn=args.freeze_bn
         )
 
-        # Nạp Pretrained Weights nếu có đường dẫn
+        # 2. Load Pretrained Weights
         if hasattr(args, 'coanet_weights') and args.coanet_weights is not None:
             model = load_coanet_weights_safely(model, args.coanet_weights)
 
-        # Tách tham số cho Optimizer (1x LR cho Backbone, 2x LR cho các phần Head/Decoder)
+        # 3. Điều chỉnh lại Conv2d lớp cuối của seg_branch về self.nclass (ví dụ: 1 class) cho Road Binary
+        if self.nclass != 21:
+            print(f"🔄 Điều chỉnh lớp seg_branch từ 21 classes về {self.nclass} class...")
+            in_channels = model.connect.seg_branch[2].in_channels
+            model.connect.seg_branch[2] = nn.Conv2d(in_channels, self.nclass, kernel_size=1, stride=1)
+
         train_params = [
             {'params': model.get_1x_lr_params(), 'lr': args.lr},
             {'params': model.get_2x_lr_params(), 'lr': args.lr * 2}
         ]
 
-        # Define Optimizer
         optimizer = torch.optim.SGD(
             train_params,
             momentum=args.momentum,
@@ -149,7 +177,6 @@ class Trainer(object):
             nesterov=args.nesterov
         )
 
-        # Define Criterion
         if args.use_balanced_weights:
             classes_weights_path = os.path.join(Path.db_root_dir(args.dataset), args.dataset + '_classes_weights.npy')
             if os.path.isfile(classes_weights_path):
@@ -164,17 +191,14 @@ class Trainer(object):
         self.criterion_con = SegmentationLosses(weight=weight, cuda=args.cuda).build_loss(mode=args.loss_type)
         self.model, self.optimizer = model, optimizer
 
-        # Define Evaluator & Scheduler
         self.evaluator = Evaluator(2)
         self.scheduler = LR_Scheduler(args.lr_scheduler, args.lr, args.epochs, len(self.train_loader))
 
-        # Multi-GPU DataParallel Setup
         if args.cuda:
             self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
             patch_replication_callback(self.model)
             self.model = self.model.cuda()
 
-        # Resuming Checkpoint
         self.best_pred = 0.0
         if args.resume is not None:
             if not os.path.isfile(args.resume):
@@ -206,36 +230,7 @@ class Trainer(object):
         num_img_tr = len(self.train_loader)
 
         for i, sample in enumerate(tbar):
-            image = sample['image']
-
-            # 1. Lấy GT Segmentation Mask
-            target = sample.get('gt_mask', sample.get('label', sample.get('mask')))
-            
-            # 2. Lấy GT Connect
-            if 'gt_connect' in sample:
-              connect_label = sample['gt_connect']
-            elif 'connect' in sample:
-              connect_label = sample['connect']
-            else:
-              con0, con1, con2 = (
-                  sample['connect0'],
-                  sample['connect1'],
-                  sample['connect2'],
-              )
-              connect_label = torch.cat((con0, con1, con2), 1)
-            
-            # 3. Lấy GT Connect D1
-            if 'gt_connect_d1' in sample:
-              connect_d1_label = sample['gt_connect_d1']
-            elif 'connect_d1' in sample:
-              connect_d1_label = sample['connect_d1']
-            else:
-              con_d1_0, con_d1_1, con_d1_2 = (
-                  sample['connect_d1_0'],
-                  sample['connect_d1_1'],
-                  sample['connect_d1_2'],
-              )
-              connect_d1_label = torch.cat((con_d1_0, con_d1_1, con_d1_2), 1)
+            image, target, connect_label, connect_d1_label = get_sample_tensors(sample)
 
             if self.args.cuda:
                 image = image.cuda(non_blocking=True)
@@ -247,7 +242,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             output, out_connect, out_connect_d1 = self.model(image)
-            target = torch.unsqueeze(target, 1)
+            target = torch.unsqueeze(target, 1) if target.dim() == 3 else target
 
             loss1 = self.criterion(output, target)
             loss2 = self.criterion_con(out_connect, connect_label)
@@ -264,8 +259,8 @@ class Trainer(object):
             train_loss += loss.item()
 
             tbar.set_description(
-                f'Loss: {train_loss/(i+1):.3f} | L1(Seg): {train_loss1/(i+1):.4f} | '
-                f'L2(Con): {train_loss2/(i+1):.3f} | L3(ConD1): {train_loss3/(i+1):.3f}'
+                f'Loss: {train_loss/(i+1):.3f} | L1: {train_loss1/(i+1):.4f} | '
+                f'L2: {train_loss2/(i+1):.3f} | L3: {train_loss3/(i+1):.3f}'
             )
             self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
 
@@ -284,11 +279,7 @@ class Trainer(object):
         F1 = self.evaluator.Pixel_F1()
 
         self.writer.add_scalar('train/total_loss_epoch', train_loss / num_img_tr, epoch)
-        self.writer.add_scalar('train/loss1_epoch', train_loss1 / num_img_tr, epoch)
-        self.writer.add_scalar('train/loss2_epoch', train_loss2 / num_img_tr, epoch)
-        self.writer.add_scalar('train/loss3_epoch', train_loss3 / num_img_tr, epoch)
         self.writer.add_scalar('train/mIoU', mIoU, epoch)
-        self.writer.add_scalar('train/Acc', Acc, epoch)
         self.writer.add_scalar('train/IoU', IoU, epoch)
         self.writer.add_scalar('train/Precision', Precision, epoch)
         self.writer.add_scalar('train/Recall', Recall, epoch)
@@ -319,37 +310,7 @@ class Trainer(object):
         with torch.no_grad():
             for i, sample in enumerate(tbar):
                 val_sample = sample[0] if isinstance(sample, list) else sample
-
-                image = val_sample['image']
-                target = val_sample.get(
-                    'gt_mask', val_sample.get('label', val_sample.get('mask'))
-                )
-                
-                # 1. Lấy GT Connect
-                if 'gt_connect' in val_sample:
-                  connect_label = val_sample['gt_connect']
-                elif 'connect' in val_sample:
-                  connect_label = val_sample['connect']
-                else:
-                  con0, con1, con2 = (
-                      val_sample['connect0'],
-                      val_sample['connect1'],
-                      val_sample['connect2'],
-                  )
-                  connect_label = torch.cat((con0, con1, con2), 1)
-                
-                # 2. Lấy GT Connect D1
-                if 'gt_connect_d1' in val_sample:
-                  connect_d1_label = val_sample['gt_connect_d1']
-                elif 'connect_d1' in val_sample:
-                  connect_d1_label = val_sample['connect_d1']
-                else:
-                  con_d1_0, con_d1_1, con_d1_2 = (
-                      val_sample['connect_d1_0'],
-                      val_sample['connect_d1_1'],
-                      val_sample['connect_d1_2'],
-                  )
-                  connect_d1_label = torch.cat((con_d1_0, con_d1_1, con_d1_2), 1)
+                image, target, connect_label, connect_d1_label = get_sample_tensors(val_sample)
 
                 if self.args.cuda:
                     image = image.cuda(non_blocking=True)
@@ -358,7 +319,7 @@ class Trainer(object):
                     connect_d1_label = connect_d1_label.cuda(non_blocking=True)
 
                 output, out_connect, out_connect_d1 = self.model(image)
-                target = torch.unsqueeze(target, 1)
+                target = torch.unsqueeze(target, 1) if target.dim() == 3 else target
 
                 loss1 = self.criterion(output, target)
                 loss2 = self.criterion_con(out_connect, connect_label)
@@ -392,7 +353,6 @@ class Trainer(object):
         F1 = self.evaluator.Pixel_F1()
 
         self.writer.add_scalar('val/total_loss_epoch', test_loss / num_img_val, epoch)
-        self.writer.add_scalar('val/loss1_epoch', test_loss1 / num_img_val, epoch)
         self.writer.add_scalar('val/mIoU', mIoU, epoch)
         self.writer.add_scalar('val/Acc', Acc, epoch)
         self.writer.add_scalar('val/IoU', IoU, epoch)
@@ -421,18 +381,14 @@ def main():
     parser.add_argument('--backbone', type=str, default='resnet', help='backbone name (default: resnet)')
     parser.add_argument('--out-stride', type=int, default=8, help='network output stride (default: 8)')
     parser.add_argument('--dataset', type=str, default='spacenet', choices=['spacenet', 'DeepGlobe'], help='dataset name')
+    parser.add_argument('--data-dir', type=str, default=None, help='path to dataset directory')
     parser.add_argument('--workers', type=int, default=4, metavar='N', help='dataloader threads')
     parser.add_argument('--base-size', type=int, default=512, help='base image size')
     parser.add_argument('--crop-size', type=int, default=512, help='crop image size')
     parser.add_argument('--sync-bn', action='store_true', default=False, help='whether to use sync bn')
     parser.add_argument('--freeze-bn', action='store_true', default=False, help='whether to freeze bn parameters')
     parser.add_argument('--loss-type', type=str, default='con_ce', choices=['ce', 'con_ce', 'focal'], help='loss func type')
-    parser.add_argument(
-        '--data-dir',
-        type=str,
-        default=None,
-        help='path to dataset directory (optional)',
-    )
+    
     # Pretrained weights argument
     parser.add_argument('--coanet-weights', type=str, default=None, help='đường dẫn tới file weights (.pth hoặc .pth.tar)')
 
