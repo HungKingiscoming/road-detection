@@ -484,11 +484,24 @@ class Trainer(object):
                 self.writer.add_scalar('train/avg_skeleton_points_per_sample', avg_points, global_step)
                 self.writer.add_scalar('train/avg_valid_pairs_per_sample', avg_pairs, global_step)
 
+                # --- DEBUG 3: tỉ lệ cạnh DƯƠNG thật (edge_gt) trong số các pairs hợp lệ ---
+                # Nếu tỉ lệ này quá thấp (ví dụ <5%), TopoLoss (BCE) sẽ nhanh chóng bị mạng
+                # "học tủ" bằng cách luôn đoán 0 (không kết nối) -> loss cực nhỏ, gradient
+                # cực nhỏ ngay sau vài step -> khớp hiện tượng grad_norm sụp đổ đang thấy.
+                edge_gt = topo_out.get('edge_gt', None)
+                edge_pos_ratio = -1.0
+                if edge_gt is not None and pairs_valid is not None:
+                    n_valid = pairs_valid.float().sum()
+                    if n_valid.item() > 0:
+                        edge_pos_ratio = (edge_gt.float() * pairs_valid.float()).sum().item() / n_valid.item()
+                self.writer.add_scalar('train/edge_gt_positive_ratio', edge_pos_ratio, global_step)
+
                 tqdm.write(
                     f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} | "
                     f"seg_prob(mean={seg_prob_mean:.4f}, max={seg_prob_max:.4f}, p99={seg_prob_p99:.4f}) | "
                     f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f} | "
-                    f"avg_skeleton_points={avg_points:.2f} avg_valid_pairs={avg_pairs:.2f}"
+                    f"avg_skeleton_points={avg_points:.2f} avg_valid_pairs={avg_pairs:.2f} | "
+                    f"edge_gt_positive_ratio={edge_pos_ratio:.4f}"
                 )
 
         print(f'\n--- Train Epoch {epoch} Results ---')
@@ -517,6 +530,8 @@ class Trainer(object):
         val_seg_prob_count = 0
         val_avg_points_list = []
         val_avg_pairs_list = []
+        val_edge_pos_num = 0.0
+        val_edge_valid_num = 0.0
 
         with torch.no_grad():
             for i, sample in enumerate(tbar):
@@ -598,6 +613,11 @@ class Trainer(object):
                 if pairs_valid is not None:
                     val_avg_pairs_list.append(pairs_valid.float().sum(dim=-1).mean().item())
 
+                edge_gt = topo_out.get('edge_gt', None)
+                if edge_gt is not None and pairs_valid is not None:
+                    val_edge_pos_num += (edge_gt.float() * pairs_valid.float()).sum().item()
+                    val_edge_valid_num += pairs_valid.float().sum().item()
+
                 # --- DEBUG: log ảnh trực quan batch đầu tiên -> nhìn bằng mắt xem
                 # road dự đoán có bị lệch scale/độ rộng so với GT không ---
                 if i == 0:
@@ -640,10 +660,12 @@ class Trainer(object):
         val_seg_prob_mean = val_seg_prob_sum / max(val_seg_prob_count, 1)
         val_avg_points = float(np.mean(val_avg_points_list)) if val_avg_points_list else -1
         val_avg_pairs = float(np.mean(val_avg_pairs_list)) if val_avg_pairs_list else -1
+        val_edge_pos_ratio = val_edge_pos_num / val_edge_valid_num if val_edge_valid_num > 0 else -1.0
         self.writer.add_scalar('val/seg_prob_mean', val_seg_prob_mean, epoch)
         self.writer.add_scalar('val/seg_prob_max', val_seg_prob_max, epoch)
         self.writer.add_scalar('val/avg_skeleton_points_per_sample', val_avg_points, epoch)
         self.writer.add_scalar('val/avg_valid_pairs_per_sample', val_avg_pairs, epoch)
+        self.writer.add_scalar('val/edge_gt_positive_ratio', val_edge_pos_ratio, epoch)
 
         print(f'\n--- Validation Epoch {epoch} Results ---')
         print(f'[FUSED   ] Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
@@ -656,7 +678,8 @@ class Trainer(object):
         )
         print(
             f'[DEBUG   ] seg_prob: mean={val_seg_prob_mean:.4f} max={val_seg_prob_max:.4f} | '
-            f'avg_skeleton_points/sample={val_avg_points:.2f} | avg_valid_pairs/sample={val_avg_pairs:.2f}'
+            f'avg_skeleton_points/sample={val_avg_points:.2f} | avg_valid_pairs/sample={val_avg_pairs:.2f} | '
+            f'edge_gt_positive_ratio={val_edge_pos_ratio:.4f}'
         )
         print_confusion_counts(self.evaluator, 'FUSED   ')
         print_confusion_counts(self.evaluator_seg_only, 'SEG-ONLY')
