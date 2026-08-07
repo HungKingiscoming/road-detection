@@ -22,7 +22,11 @@ from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+cv2.setNumThreads(0)
 
+os.environ["OMP_NUM_THREADS"] = "1"
+
+os.environ["MKL_NUM_THREADS"] = "1"
 
 import numpy as np
 import torch
