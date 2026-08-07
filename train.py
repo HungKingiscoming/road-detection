@@ -185,6 +185,19 @@ def get_road_iou(evaluator: Evaluator) -> float:
     return float(road_iou)
 
 
+def print_confusion_counts(evaluator: Evaluator, tag: str):
+    """Debug: in thẳng TP/FP/FN/TN (lớp road) để nhìn số tuyệt đối thay vì chỉ tỉ lệ."""
+    cm = evaluator.confusion_matrix
+    # cm[i, j] = số pixel có GT lớp i nhưng bị dự đoán lớp j (quy ước phổ biến)
+    TN, FP = cm[0, 0], cm[0, 1]
+    FN, TP = cm[1, 0], cm[1, 1]
+    total = TN + FP + FN + TP
+    print(
+        f"    [{tag}] TP={TP:,} | FP={FP:,} | FN={FN:,} | TN={TN:,} "
+        f"| %pred_positive={100.0*(TP+FP)/max(total,1):.2f}% | %gt_positive={100.0*(TP+FN)/max(total,1):.2f}%"
+    )
+
+
 class Trainer(object):
     def __init__(self, args):
         self.args = args
@@ -438,10 +451,41 @@ class Trainer(object):
                 self.writer.add_scalar('train/grad_norm_iter', grad_norm, global_step)
 
                 with torch.no_grad():
-                    seg_pos_ratio = positive_ratio(torch.sigmoid(seg_logits) > 0.5)
+                    seg_prob = torch.sigmoid(seg_logits.float())
+                    seg_pos_ratio = positive_ratio(seg_prob > 0.5)
                     gt_pos_ratio = positive_ratio(gt_mask > 0.5)
+
+                    # --- DEBUG 1: phân bố xác suất seg_prob ---
+                    # Nếu seg_prob gần như luôn < 0.5 (max cũng chỉ nhỉnh hơn 0.5 chút),
+                    # nghĩa là CoANet gần như không bao giờ "tự tin" -> khớp giả thuyết
+                    # lệch domain resolution 3m (checkpoint) vs 1m (dataset hiện tại).
+                    seg_prob_mean = seg_prob.mean().item()
+                    seg_prob_max = seg_prob.max().item()
+                    seg_prob_p99 = torch.quantile(seg_prob.flatten().float(), 0.99).item()
+
                 self.writer.add_scalar('train/seg_pred_positive_ratio', seg_pos_ratio, global_step)
                 self.writer.add_scalar('train/gt_positive_ratio', gt_pos_ratio, global_step)
+                self.writer.add_scalar('train/seg_prob_mean', seg_prob_mean, global_step)
+                self.writer.add_scalar('train/seg_prob_max', seg_prob_max, global_step)
+                self.writer.add_scalar('train/seg_prob_p99', seg_prob_p99, global_step)
+                self.writer.add_histogram('train/seg_prob_hist', seg_prob.detach().float().cpu(), global_step)
+
+                # --- DEBUG 2: số điểm skeleton & pairs hợp lệ TopoNet thực nhận được ---
+                # Nếu 2 số này ~0 -> graph_mask luôn = 0 -> fused_mask = seg_prob mọi lúc
+                # (giải thích vì sao FUSED trùng khớp SEG-ONLY tuyệt đối).
+                points_valid = topo_out.get('points_valid', None)
+                pairs_valid = topo_out.get('pairs_valid', None)
+                avg_points = points_valid.float().sum(dim=-1).mean().item() if points_valid is not None else -1
+                avg_pairs = pairs_valid.float().sum(dim=-1).mean().item() if pairs_valid is not None else -1
+                self.writer.add_scalar('train/avg_skeleton_points_per_sample', avg_points, global_step)
+                self.writer.add_scalar('train/avg_valid_pairs_per_sample', avg_pairs, global_step)
+
+                tqdm.write(
+                    f"[step {global_step}] lr={current_lr:.6f} grad_norm={grad_norm:.4f} | "
+                    f"seg_prob(mean={seg_prob_mean:.4f}, max={seg_prob_max:.4f}, p99={seg_prob_p99:.4f}) | "
+                    f"seg_pos_ratio={seg_pos_ratio:.4f} gt_pos_ratio={gt_pos_ratio:.4f} | "
+                    f"avg_skeleton_points={avg_points:.2f} avg_valid_pairs={avg_pairs:.2f}"
+                )
 
         print(f'\n--- Train Epoch {epoch} Results ---')
         print(f'Train Loss Total: {train_loss / num_img_tr:.4f} | CoANet: {train_coanet_loss / num_img_tr:.4f} | Topo: {train_topo_loss / num_img_tr:.4f}')
@@ -462,6 +506,13 @@ class Trainer(object):
         val_coanet_loss = 0.0
         val_topo_loss = 0.0
         num_img_val = len(self.val_loader)
+
+        # --- DEBUG: tích lũy để log phân bố seg_prob + số điểm skeleton trên toàn bộ val ---
+        val_seg_prob_sum = 0.0
+        val_seg_prob_max = 0.0
+        val_seg_prob_count = 0
+        val_avg_points_list = []
+        val_avg_pairs_list = []
 
         with torch.no_grad():
             for i, sample in enumerate(tbar):
@@ -484,6 +535,7 @@ class Trainer(object):
                     seg_logits = out_dict['seg_logits']
                     connect = out_dict['connect']
                     connect_d1 = out_dict['connect_d1']
+                    graph_mask = out_dict.get('graph_mask', None)
                     topo_out = out_dict.get('topo', {})
 
                     c_loss, _ = self.coanet_loss_fn(
@@ -517,7 +569,7 @@ class Trainer(object):
                 else:
                     fused_mask_eval = fused_mask
 
-                # ✅ fused_mask_eval ĐÃ LÀ XÁC SUẤT [0, 1]
+                # fused_mask_eval ĐÃ LÀ XÁC SUẤT [0, 1]
                 pred = (fused_mask_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 target_n = gt_mask.squeeze(1).cpu().numpy().astype(np.int64)
                 self.evaluator.add_batch(target_n, pred)
@@ -527,8 +579,37 @@ class Trainer(object):
                     seg_logits_eval = F.interpolate(seg_logits, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
                 else:
                     seg_logits_eval = seg_logits
-                pred_seg = (torch.sigmoid(seg_logits_eval) > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
+                seg_prob_eval = torch.sigmoid(seg_logits_eval.float())
+                pred_seg = (seg_prob_eval > 0.5).squeeze(1).cpu().numpy().astype(np.int64)
                 self.evaluator_seg_only.add_batch(target_n, pred_seg)
+
+                # --- DEBUG: tích lũy thống kê seg_prob + skeleton points ---
+                val_seg_prob_sum += seg_prob_eval.sum().item()
+                val_seg_prob_max = max(val_seg_prob_max, seg_prob_eval.max().item())
+                val_seg_prob_count += seg_prob_eval.numel()
+                points_valid = topo_out.get('points_valid', None)
+                pairs_valid = topo_out.get('pairs_valid', None)
+                if points_valid is not None:
+                    val_avg_points_list.append(points_valid.float().sum(dim=-1).mean().item())
+                if pairs_valid is not None:
+                    val_avg_pairs_list.append(pairs_valid.float().sum(dim=-1).mean().item())
+
+                # --- DEBUG: log ảnh trực quan batch đầu tiên -> nhìn bằng mắt xem
+                # road dự đoán có bị lệch scale/độ rộng so với GT không ---
+                if i == 0:
+                    max_viz = min(4, image.shape[0])
+                    # Ảnh RGB: unnormalize gần đúng để xem được (không cần chính xác tuyệt đối)
+                    rgb_viz = image[:max_viz].detach().float().cpu()
+                    rgb_viz = (rgb_viz - rgb_viz.min()) / (rgb_viz.max() - rgb_viz.min() + 1e-6)
+                    self.writer.add_images('val_debug/rgb', rgb_viz, epoch)
+                    self.writer.add_images('val_debug/gt_mask', gt_mask[:max_viz].cpu(), epoch)
+                    self.writer.add_images('val_debug/seg_prob', seg_prob_eval[:max_viz].cpu(), epoch)
+                    self.writer.add_images('val_debug/fused_mask', fused_mask_eval[:max_viz].cpu(), epoch)
+                    if graph_mask is not None:
+                        gm = graph_mask
+                        if gm.shape[-2:] != gt_mask.shape[-2:]:
+                            gm = F.interpolate(gm, size=gt_mask.shape[-2:], mode='bilinear', align_corners=True)
+                        self.writer.add_images('val_debug/graph_mask', gm[:max_viz].cpu(), epoch)
 
         road_iou = get_road_iou(self.evaluator)
         Precision = self.evaluator.Pixel_Precision()
@@ -551,6 +632,15 @@ class Trainer(object):
         self.writer.add_scalar('val/Recall', Recall, epoch)
         self.writer.add_scalar('val/F1', F1, epoch)
 
+        # --- DEBUG: log thống kê seg_prob + skeleton points của toàn bộ tập val ---
+        val_seg_prob_mean = val_seg_prob_sum / max(val_seg_prob_count, 1)
+        val_avg_points = float(np.mean(val_avg_points_list)) if val_avg_points_list else -1
+        val_avg_pairs = float(np.mean(val_avg_pairs_list)) if val_avg_pairs_list else -1
+        self.writer.add_scalar('val/seg_prob_mean', val_seg_prob_mean, epoch)
+        self.writer.add_scalar('val/seg_prob_max', val_seg_prob_max, epoch)
+        self.writer.add_scalar('val/avg_skeleton_points_per_sample', val_avg_points, epoch)
+        self.writer.add_scalar('val/avg_valid_pairs_per_sample', val_avg_pairs, epoch)
+
         print(f'\n--- Validation Epoch {epoch} Results ---')
         print(f'[FUSED   ] Road IoU: {road_iou:.4f} | Precision: {Precision:.4f} | Recall: {Recall:.4f} | F1: {F1:.4f}')
         print(
@@ -560,6 +650,12 @@ class Trainer(object):
             f'F1: {F1_seg:.4f} '
             f'<-- Chỉ số này phản ánh đúng chất lượng CoANet pretrained'
         )
+        print(
+            f'[DEBUG   ] seg_prob: mean={val_seg_prob_mean:.4f} max={val_seg_prob_max:.4f} | '
+            f'avg_skeleton_points/sample={val_avg_points:.2f} | avg_valid_pairs/sample={val_avg_pairs:.2f}'
+        )
+        print_confusion_counts(self.evaluator, 'FUSED   ')
+        print_confusion_counts(self.evaluator_seg_only, 'SEG-ONLY')
 
         new_pred = road_iou
         if new_pred > self.best_pred:
