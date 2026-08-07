@@ -243,9 +243,20 @@ class TopoGraphHead(nn.Module):
 
 
 def compute_topo_loss(
-    logits: torch.Tensor, edge_gt: torch.Tensor, pairs_valid: torch.Tensor
+    logits: torch.Tensor, edge_gt: torch.Tensor, pairs_valid: torch.Tensor,
+    max_pos_weight: float = 200.0,
 ) -> torch.Tensor:
-  """Tính BCE loss cho nhánh Topo, bỏ qua các padding pairs."""
+  """Tính BCE loss cho nhánh Topo, bỏ qua các padding pairs.
+
+  # [FIX] Dữ liệu thực tế cho thấy tỉ lệ cạnh dương (edge_gt=1) trong số các pairs
+  # hợp lệ cực kỳ thấp (~0.1-0.7%, tức mất cân bằng ~1:1000). BCE không trọng số
+  # khiến mạng học tủ đoán "không kết nối" gần như ngay lập tức -> loss/gradient
+  # sụp xuống gần 0 chỉ sau vài chục step, TopoNet ngừng học có ý nghĩa.
+  # Tính pos_weight ĐỘNG theo từng batch (thay vì hằng số cố định) vì tỉ lệ dao
+  # động mạnh giữa các batch (có batch = 0% cạnh dương). Kẹp bởi max_pos_weight
+  # để tránh trường hợp cực hiếm (n_pos rất nhỏ) làm pos_weight bùng nổ gây mất
+  # ổn định huấn luyện.
+  """
   logits = logits.squeeze(1).squeeze(-1)  # [B, P]
   edge_gt = edge_gt.squeeze(1)  # [B, P]
   pairs_valid = pairs_valid.squeeze(1)  # [B, P]
@@ -254,7 +265,18 @@ def compute_topo_loss(
   if n_valid.item() == 0:
     return logits.sum() * 0.0
 
-  loss = F.binary_cross_entropy_with_logits(logits, edge_gt, reduction='none')
+  n_pos = (edge_gt * pairs_valid.float()).sum()
+  n_neg = n_valid - n_pos
+  if n_pos.item() > 0:
+    pos_weight = (n_neg / n_pos).clamp(max=max_pos_weight)
+  else:
+    # Batch không có cạnh dương nào -> không có gì để "cân bằng", dùng weight=1
+    # (loss ở batch này chủ yếu dạy mạng nhận diện đúng cạnh âm, vẫn hữu ích).
+    pos_weight = torch.tensor(1.0, device=logits.device)
+
+  loss = F.binary_cross_entropy_with_logits(
+      logits, edge_gt, pos_weight=pos_weight, reduction='none'
+  )
   loss = (loss * pairs_valid.float()).sum() / n_valid
   return loss
 
