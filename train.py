@@ -194,10 +194,19 @@ class Trainer(object):
             train_loss3 += lad * 0.4 * loss3.item()
             train_loss += loss.item()
             
-            tbar.set_description('Train loss: %.3f, loss1: %.6f, loss2: %.3f, loss3: %.3f' %
-                                 (train_loss / (i + 1), train_loss1 / (i + 1), train_loss2 / (i + 1), train_loss3 / (i + 1)))
+            current_loss = train_loss / (i + 1)
+            l1 = train_loss1 / (i + 1)
+            l2 = train_loss2 / (i + 1)
+            l3 = train_loss3 / (i + 1)
+            
+            tbar.set_postfix(
+                loss=f"{current_loss:.3f}",
+                l1=f"{l1:.4f}",
+                l2=f"{l2:.3f}",
+                l3=f"{l3:.3f}"
+            )
+            
             self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
-
             pred = output.data.cpu().numpy()
             target_n = target.cpu().numpy()
             pred[pred > 0.1]=1
