@@ -88,10 +88,10 @@ class Trainer(object):
         self.train_loader, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
 
         # 🟢 ÉP CỨNG SỐ CLASS VỀ 1 CHO BÀI TOÁN BINARY ROAD DETECTION
-        self.nclass = 2
+        self.nclass = 1
 
         # Khởi tạo mô hình 21 classes để vừa khít weights pretrained
-        model = CoANet(num_classes= self.nclass,
+        model = CoANet(num_classes= 1,
                         backbone=args.backbone,
                         output_stride=args.out_stride,
                         sync_bn=args.sync_bn,
@@ -180,8 +180,6 @@ class Trainer(object):
             
             output, out_connect, out_connect_d1 = self.model(image)
             target = torch.unsqueeze(target, 1)
-            if output.shape[1] == 2 and target.shape[1] == 1:
-                target = torch.cat([1.0 - target, target], dim=1)
             loss1 = self.criterion(output, target)
             loss2 = self.criterion_con(out_connect, connect_label)
             loss3 = self.criterion_con(out_connect_d1, connect_d1_label)
