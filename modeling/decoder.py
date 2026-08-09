@@ -3,27 +3,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from modeling.sync_batchnorm.batchnorm import SynchronizedBatchNorm2d
+from modeling.dsconv import DSConv2d
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, n_filters, BatchNorm, inp=False):
+    def __init__(self, in_channels, n_filters, BatchNorm, inp=False,
+                 scm_type='strip', dsconv_kernel_size=9,
+                 dsconv_extend_scope=1.0):
         super(DecoderBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
         self.bn1 = BatchNorm(in_channels // 4)
         self.relu1 = nn.ReLU()
         self.inp = inp
 
-        self.deconv1 = nn.Conv2d(
-            in_channels // 4, in_channels // 8, (1, 9), padding=(0, 4)
-        )
-        self.deconv2 = nn.Conv2d(
-            in_channels // 4, in_channels // 8, (9, 1), padding=(4, 0)
-        )
-        self.deconv3 = nn.Conv2d(
-            in_channels // 4, in_channels // 8, (9, 1), padding=(4, 0)
-        )
-        self.deconv4 = nn.Conv2d(
-            in_channels // 4, in_channels // 8, (1, 9), padding=(0, 4)
-        )
+        self.scm_type = scm_type
+        branch_in = in_channels // 4
+        branch_out = in_channels // 8
+        if scm_type == 'strip':
+            self.deconv1 = nn.Conv2d(branch_in, branch_out, (1, 9), padding=(0, 4))
+            self.deconv2 = nn.Conv2d(branch_in, branch_out, (9, 1), padding=(4, 0))
+            self.deconv3 = nn.Conv2d(branch_in, branch_out, (9, 1), padding=(4, 0))
+            self.deconv4 = nn.Conv2d(branch_in, branch_out, (1, 9), padding=(0, 4))
+        elif scm_type == 'dsconv':
+            dsconv_args = dict(
+                in_channels=branch_in,
+                out_channels=branch_out,
+                kernel_size=dsconv_kernel_size,
+                extend_scope=dsconv_extend_scope,
+                if_offset=True,
+            )
+            self.dsconv1 = DSConv2d(morph=0, **dsconv_args)
+            self.dsconv2 = DSConv2d(morph=1, **dsconv_args)
+            self.dsconv3 = DSConv2d(morph=1, **dsconv_args)
+            self.dsconv4 = DSConv2d(morph=0, **dsconv_args)
+        else:
+            raise ValueError("scm_type must be 'strip' or 'dsconv'")
 
         self.bn2 = BatchNorm(in_channels // 4 + in_channels // 4)
         self.relu2 = nn.ReLU()
@@ -33,16 +46,26 @@ class DecoderBlock(nn.Module):
         self.relu3 = nn.ReLU()
 
         self._init_weight()
+        if self.scm_type == 'dsconv':
+            for module in self.modules():
+                if isinstance(module, DSConv2d):
+                    module.reset_offset_parameters()
 
     def forward(self, x, inp = False):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu1(x)
 
-        x1 = self.deconv1(x)
-        x2 = self.deconv2(x)
-        x3 = self.inv_h_transform(self.deconv3(self.h_transform(x)))
-        x4 = self.inv_v_transform(self.deconv4(self.v_transform(x)))
+        if self.scm_type == 'strip':
+            x1 = self.deconv1(x)
+            x2 = self.deconv2(x)
+            x3 = self.inv_h_transform(self.deconv3(self.h_transform(x)))
+            x4 = self.inv_v_transform(self.deconv4(self.v_transform(x)))
+        else:
+            x1 = self.dsconv1(x)
+            x2 = self.dsconv2(x)
+            x3 = self.inv_h_transform(self.dsconv3(self.h_transform(x)))
+            x4 = self.inv_v_transform(self.dsconv4(self.v_transform(x)))
         x = torch.cat((x1, x2, x3, x4), 1)
         if self.inp:
             x = F.interpolate(x, scale_factor=2)
@@ -99,17 +122,24 @@ class DecoderBlock(nn.Module):
         return x.permute(0, 1, 3, 2)
 
 class Decoder(nn.Module):
-    def __init__(self, num_classes, backbone, BatchNorm):
+    def __init__(self, num_classes, backbone, BatchNorm, scm_type='strip',
+                 dsconv_kernel_size=9, dsconv_extend_scope=1.0):
         super(Decoder, self).__init__()
         if backbone == 'resnet':
             in_inplanes = 256
         else:
             raise NotImplementedError
 
-        self.decoder4 = DecoderBlock(in_inplanes, 256, BatchNorm)
-        self.decoder3 = DecoderBlock(512, 128, BatchNorm)
-        self.decoder2 = DecoderBlock(256, 64, BatchNorm, inp=True)
-        self.decoder1 = DecoderBlock(128, 64, BatchNorm, inp=True)
+        block_args = dict(
+            BatchNorm=BatchNorm,
+            scm_type=scm_type,
+            dsconv_kernel_size=dsconv_kernel_size,
+            dsconv_extend_scope=dsconv_extend_scope,
+        )
+        self.decoder4 = DecoderBlock(in_inplanes, 256, **block_args)
+        self.decoder3 = DecoderBlock(512, 128, **block_args)
+        self.decoder2 = DecoderBlock(256, 64, inp=True, **block_args)
+        self.decoder1 = DecoderBlock(128, 64, inp=True, **block_args)
 
         self.conv_e3 = nn.Sequential(nn.Conv2d(1024, 256, 1, bias=False),
                                        BatchNorm(256),
@@ -124,6 +154,11 @@ class Decoder(nn.Module):
                                      nn.ReLU())
 
         self._init_weight()
+        # Decoder._init_weight recursively visits child convolutions, so reset
+        # all newly introduced offsets once more after the complete init pass.
+        for module in self.modules():
+            if isinstance(module, DSConv2d):
+                module.reset_offset_parameters()
 
 
     def forward(self, e1, e2, e3, e4):
@@ -146,5 +181,7 @@ class Decoder(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
-def build_decoder(num_classes, backbone, BatchNorm):
-    return Decoder(num_classes, backbone, BatchNorm)
+def build_decoder(num_classes, backbone, BatchNorm, scm_type='strip',
+                  dsconv_kernel_size=9, dsconv_extend_scope=1.0):
+    return Decoder(num_classes, backbone, BatchNorm, scm_type,
+                   dsconv_kernel_size, dsconv_extend_scope)

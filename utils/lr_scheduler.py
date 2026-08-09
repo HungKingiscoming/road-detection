@@ -61,10 +61,8 @@ class LR_Scheduler(object):
         self._adjust_learning_rate(optimizer, lr)
 
     def _adjust_learning_rate(self, optimizer, lr):
-        if len(optimizer.param_groups) == 1:
-            optimizer.param_groups[0]['lr'] = lr
-        else:
-            # enlarge the lr at the head
-            optimizer.param_groups[0]['lr'] = lr
-            for i in range(1, len(optimizer.param_groups)):
-                optimizer.param_groups[i]['lr'] = lr * 10
+        for index, group in enumerate(optimizer.param_groups):
+            # New transfer-learning groups explicitly declare their multiplier.
+            # Preserve the legacy 1x/10x behaviour for older callers.
+            default_multiplier = 1.0 if index == 0 else 10.0
+            group['lr'] = lr * group.get('lr_mult', default_multiplier)

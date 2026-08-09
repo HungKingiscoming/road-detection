@@ -19,13 +19,18 @@ from utils.metrics import Evaluator
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 def load_coanet_weights_safely(model, checkpoint_path):
-    """Cơ chế nạp weights tự động điều chỉnh shape."""
+    """Load CoANet weights and migrate the old SCM kernels into DSConv.
+
+    At zero offset, a DSConv sampling kernel is equivalent to its source strip
+    convolution. Spatial transposition is needed because sampled points are
+    packed on the dimension that ``sample_conv`` subsequently collapses.
+    """
     print(f"\n==================================================")
     print(f"🔍 BẮT ĐẦU KIỂM TRA & LOAD WEIGHTS TỪ: {checkpoint_path}")
     print(f"==================================================")
     
     if not os.path.isfile(checkpoint_path):
-        return model
+        raise FileNotFoundError(f"Không tìm thấy checkpoint: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
@@ -38,13 +43,104 @@ def load_coanet_weights_safely(model, checkpoint_path):
                 name = name[len(prefix):]
         cleaned_state_dict[name] = v
 
-    model_state_dict = model.state_dict()
-    filtered_state_dict = {k: v for k, v in cleaned_state_dict.items() if k in model_state_dict and v.shape == model_state_dict[k].shape}
+    model_state = model.state_dict()
+    transferred = {}
+    converted = []
 
-    model.load_state_dict(filtered_state_dict, strict=False)
-    print(f"✅ Đã load thành công {len(filtered_state_dict)}/{len(model_state_dict)} weights vào CoANet!")
+    # First retain every tensor whose name and shape did not change.
+    for name, value in cleaned_state_dict.items():
+        if name in model_state and model_state[name].shape == value.shape:
+            transferred[name] = value
+
+    # Then migrate all four strip branches in all four DecoderBlocks.
+    for block in ('decoder1', 'decoder2', 'decoder3', 'decoder4'):
+        for branch in range(1, 5):
+            old_prefix = f'decoder.{block}.deconv{branch}'
+            new_prefix = f'decoder.{block}.dsconv{branch}.sample_conv'
+            old_weight = f'{old_prefix}.weight'
+            new_weight = f'{new_prefix}.weight'
+            if old_weight in cleaned_state_dict and new_weight in model_state:
+                candidate = cleaned_state_dict[old_weight].transpose(-1, -2).contiguous()
+                if candidate.shape != model_state[new_weight].shape:
+                    raise RuntimeError(
+                        f"Không thể chuyển {old_weight}: {tuple(candidate.shape)} "
+                        f"!= {tuple(model_state[new_weight].shape)}"
+                    )
+                transferred[new_weight] = candidate
+                converted.append((old_weight, new_weight))
+
+            old_bias = f'{old_prefix}.bias'
+            new_bias = f'{new_prefix}.bias'
+            if old_bias in cleaned_state_dict and new_bias in model_state:
+                if cleaned_state_dict[old_bias].shape != model_state[new_bias].shape:
+                    raise RuntimeError(f"Không thể chuyển bias {old_bias}")
+                transferred[new_bias] = cleaned_state_dict[old_bias]
+                converted.append((old_bias, new_bias))
+
+    result = model.load_state_dict(transferred, strict=False)
+    allowed_missing = [key for key in result.missing_keys if '.offset_conv.' in key]
+    invalid_missing = [key for key in result.missing_keys if key not in allowed_missing]
+    if invalid_missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint không tương thích: missing={invalid_missing}, "
+            f"unexpected={result.unexpected_keys}"
+        )
+
+    loaded_elements = sum(model_state[name].numel() for name in transferred)
+    total_elements = sum(value.numel() for value in model_state.values())
+    print(f"✅ Đã nạp {len(transferred)} tensors cũ, gồm {len(converted)} tensors SCM→DSConv.")
+    print(f"✅ Tái sử dụng {loaded_elements:,}/{total_elements:,} phần tử "
+          f"({100.0 * loaded_elements / total_elements:.3f}%).")
+    if allowed_missing:
+        print(f"🆕 {len(allowed_missing)} tensors offset mới được giữ ở khởi tạo zero.")
     print(f"==================================================\n")
     return model
+
+
+def build_transfer_param_groups(model, base_lr):
+    """Create persistent discriminative-LR groups for gradual unfreezing."""
+    groups = {
+        'backbone_early': (0.05, []),
+        'backbone_layer3': (0.10, []),
+        'backbone_layer4': (0.20, []),
+        'aspp': (0.50, []),
+        'decoder': (1.00, []),
+        'connect': (1.00, []),
+        'offset': (5.00, []),
+    }
+    for name, parameter in model.named_parameters():
+        if '.offset_conv.' in name:
+            key = 'offset'
+        elif name.startswith('backbone.layer4.'):
+            key = 'backbone_layer4'
+        elif name.startswith('backbone.layer3.'):
+            key = 'backbone_layer3'
+        elif name.startswith('backbone.'):
+            key = 'backbone_early'
+        elif name.startswith('aspp.'):
+            key = 'aspp'
+        elif name.startswith('decoder.'):
+            key = 'decoder'
+        elif name.startswith('connect.'):
+            key = 'connect'
+        else:
+            raise RuntimeError(f"Tham số chưa được phân nhóm: {name}")
+        groups[key][1].append(parameter)
+
+    return [
+        {'params': parameters, 'lr': base_lr * multiplier,
+         'lr_mult': multiplier, 'group_name': name}
+        for name, (multiplier, parameters) in groups.items() if parameters
+    ]
+
+
+def transfer_stage_for_epoch(epoch, milestones):
+    return sum(epoch >= milestone for milestone in milestones)
+
+
+def model_state_dict(model):
+    core_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    return core_model.state_dict()
 
 def get_sample_tensors(sample, split='train'):
     """Giải nén dữ liệu và In ra màn hình các keys đang có nếu bị lỗi."""
@@ -90,25 +186,28 @@ class Trainer(object):
         # 🟢 ÉP CỨNG SỐ CLASS VỀ 1 CHO BÀI TOÁN BINARY ROAD DETECTION
         self.nclass = 1
 
-        # Khởi tạo mô hình 21 classes để vừa khít weights pretrained
+        # Checkpoint SpaceNet gốc dùng một lớp foreground (road).
         model = CoANet(num_classes= 1,
                         backbone=args.backbone,
                         output_stride=args.out_stride,
                         sync_bn=args.sync_bn,
-                        freeze_bn=args.freeze_bn)
+                        freeze_bn=args.freeze_bn,
+                        scm_type=args.scm_type,
+                        dsconv_kernel_size=args.dsconv_kernel_size,
+                        dsconv_extend_scope=args.dsconv_extend_scope,
+                        backbone_pretrained=not bool(args.coanet_weights))
 
         # Load weights
         if hasattr(args, 'coanet_weights') and args.coanet_weights:
             model = load_coanet_weights_safely(model, args.coanet_weights)
 
-        # Trả mô hình về số class thực tế của bạn
-        if self.nclass != 21:
-            print(f"🔄 Điều chỉnh lớp seg_branch từ 21 classes về {self.nclass} class...")
-            in_channels = model.connect.seg_branch[2].in_channels
-            model.connect.seg_branch[2] = nn.Conv2d(in_channels, self.nclass, kernel_size=1, stride=1)
-
-        train_params = [{'params': model.get_1x_lr_params(), 'lr': args.lr},
-                        {'params': model.get_2x_lr_params(), 'lr': args.lr * 2}]
+        use_progressive_transfer = (
+            args.scm_type == 'dsconv'
+            and args.coanet_weights is not None
+            and not args.no_progressive_transfer
+        )
+        model.set_transfer_stage(0 if use_progressive_transfer else 4)
+        train_params = build_transfer_param_groups(model, args.lr)
 
         # Define Optimizer
         optimizer = torch.optim.SGD(train_params, momentum=args.momentum,
@@ -128,6 +227,8 @@ class Trainer(object):
         self.criterion = dice_bce_loss()
         self.criterion_con = SegmentationLosses(weight=weight, cuda=args.cuda).build_loss(mode=args.loss_type)
         self.model, self.optimizer = model, optimizer
+        self.use_progressive_transfer = use_progressive_transfer
+        self.current_transfer_stage = model.transfer_stage
         
         # Define Evaluator
         self.evaluator = Evaluator(2)
@@ -165,6 +266,17 @@ class Trainer(object):
         train_loss3 = 0.0
         train_loss = 0.0
         self.model.train()
+        core_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        next_stage = (
+            transfer_stage_for_epoch(epoch, self.args.unfreeze_epochs)
+            if self.use_progressive_transfer else 4
+        )
+        if next_stage != self.current_transfer_stage:
+            self.current_transfer_stage = next_stage
+            print(f"\n🔓 Chuyển sang transfer-learning stage {next_stage} tại epoch {epoch}")
+        # Calling model.train() re-enables every BN, so stage constraints must
+        # be re-applied at the beginning of each training epoch.
+        core_model.set_transfer_stage(next_stage)
         self.evaluator.reset()
         tbar = tqdm(self.train_loader)
         num_img_tr = len(self.train_loader)
@@ -242,7 +354,7 @@ class Trainer(object):
             is_best = False
             self.saver.save_checkpoint({
                 'epoch': epoch + 1,
-                'state_dict': self.model.module.state_dict(),
+                'state_dict': model_state_dict(self.model),
                 'optimizer': self.optimizer.state_dict(),
                 'best_pred': self.best_pred,
             }, is_best)
@@ -321,7 +433,7 @@ class Trainer(object):
             self.best_pred = new_pred
             self.saver.save_checkpoint({
                 'epoch': epoch + 1,
-                'state_dict': self.model.module.state_dict(),
+                'state_dict': model_state_dict(self.model),
                 'optimizer': self.optimizer.state_dict(),
                 'best_pred': self.best_pred,
             }, is_best)
@@ -335,6 +447,17 @@ def main():
     # 🟢 Đã thêm 2 tham số quan trọng bạn truyền vào qua dòng lệnh
     parser.add_argument('--data-dir', type=str, default=None, help='path to dataset directory')
     parser.add_argument('--coanet-weights', type=str, default=None, help='path to pretrained weights')
+    parser.add_argument('--scm-type', type=str, default='dsconv', choices=['strip', 'dsconv'],
+                        help='SCM implementation; dsconv enables the improved model')
+    parser.add_argument('--dsconv-kernel-size', type=int, default=9,
+                        help='odd Dynamic Snake kernel size; use 9 to transfer SCM weights')
+    parser.add_argument('--dsconv-extend-scope', type=float, default=1.0,
+                        help='maximum scale of accumulated snake offsets')
+    parser.add_argument('--unfreeze-epochs', type=int, nargs=4, default=[5, 15, 30, 45],
+                        metavar=('DECODER', 'LAYER4', 'LAYER3', 'ALL'),
+                        help='epochs that activate transfer stages 1, 2, 3 and 4')
+    parser.add_argument('--no-progressive-transfer', action='store_true',
+                        help='train every layer immediately instead of gradual unfreezing')
     
     parser.add_argument('--workers', type=int, default=16, metavar='N', help='dataloader threads')
     parser.add_argument('--base-size', type=int, default=512, help='base image size')
@@ -344,9 +467,9 @@ def main():
     parser.add_argument('--loss-type', type=str, default='con_ce', choices=['ce', 'con_ce', 'focal'], help='loss func type')
     parser.add_argument('--epochs', type=int, default=150, metavar='N', help='number of epochs to train')
     parser.add_argument('--start_epoch', type=int, default=0, metavar='N', help='start epochs (default:0)')
-    parser.add_argument('--batch-size', type=int, default=16, metavar='N', help='input batch size for training (default: 16)')
+    parser.add_argument('--batch-size', type=int, default=2, metavar='N', help='input batch size for DSConv training (default: 2)')
     parser.add_argument('--use-balanced-weights', action='store_true', default=False, help='whether to use balanced weights (default: False)')
-    parser.add_argument('--lr', type=float, default=0.01, metavar='LR', help='learning rate (default: 0.01)')
+    parser.add_argument('--lr', type=float, default=0.001, metavar='LR', help='decoder learning rate (default: 0.001)')
     parser.add_argument('--lr-scheduler', type=str, default='poly', choices=['poly', 'step', 'cos'], help='lr scheduler mode: (default: poly)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M', help='momentum (default: 0.9)')
     parser.add_argument('--weight-decay', type=float, default=5e-4, metavar='M', help='w-decay (default: 5e-4)')
@@ -361,6 +484,12 @@ def main():
     parser.add_argument('--no-val', action='store_true', default=False, help='skip validation during training')
 
     args = parser.parse_args()
+    if args.dsconv_kernel_size % 2 != 1:
+        parser.error('--dsconv-kernel-size must be odd')
+    if args.coanet_weights and args.scm_type == 'dsconv' and args.dsconv_kernel_size != 9:
+        parser.error('SCM checkpoint transfer requires --dsconv-kernel-size 9')
+    if args.unfreeze_epochs != sorted(args.unfreeze_epochs):
+        parser.error('--unfreeze-epochs must be in non-decreasing order')
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     if args.cuda:
         try:

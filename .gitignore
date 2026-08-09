@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Jupyter / Kaggle
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Training outputs
+run/
+runs/
+checkpoints/
+outputs/
+wandb/
+*.log
+events.out.tfevents.*
+
+# Model artifacts (publish these as a Kaggle Dataset or GitHub Release)
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+*.onnx
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Local datasets and prepared data
+RGB_1.0_meter/
+CoANet_prepared_reference/
+data/
+datasets/
