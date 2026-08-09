@@ -6,7 +6,9 @@ def make_data_loader(args, **kwargs):
         train_loader, val_loader = spacenet.build_spacenet_dataloaders(
             data_dir=args.data_dir,
             batch_size=args.batch_size,
-            num_workers=kwargs.get('num_workers', 4)
+            num_workers=kwargs.get('num_workers', 4),
+            base_size=args.base_size,
+            crop_size=args.crop_size,
         )
         test_loader = None
         num_classes = 2
