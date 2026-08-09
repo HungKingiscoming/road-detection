@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.pth.tar
+*.pt
+
+CoANet_prepared_reference/
+RGB_1.0_meter/
+SpaceNet3_raw/
+run/
+
+.idea/
+.vscode/

@@ -19,7 +19,7 @@ from utils.metrics import Evaluator
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 
 def load_coanet_weights_safely(model, checkpoint_path):
-    """Cơ chế nạp weights tự động điều chỉnh shape."""
+    """Nạp đầy đủ checkpoint CoANet và từ chối checkpoint không tương thích."""
     print(f"\n==================================================")
     print(f"🔍 BẮT ĐẦU KIỂM TRA & LOAD WEIGHTS TỪ: {checkpoint_path}")
     print(f"==================================================")
@@ -38,11 +38,13 @@ def load_coanet_weights_safely(model, checkpoint_path):
                 name = name[len(prefix):]
         cleaned_state_dict[name] = v
 
-    model_state_dict = model.state_dict()
-    filtered_state_dict = {k: v for k, v in cleaned_state_dict.items() if k in model_state_dict and v.shape == model_state_dict[k].shape}
-
-    model.load_state_dict(filtered_state_dict, strict=False)
-    print(f"✅ Đã load thành công {len(filtered_state_dict)}/{len(model_state_dict)} weights vào CoANet!")
+    result = model.load_state_dict(cleaned_state_dict, strict=True)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint không tương thích: missing={result.missing_keys}, "
+            f"unexpected={result.unexpected_keys}"
+        )
+    print(f"✅ Đã load strict toàn bộ {len(cleaned_state_dict)} tensors vào CoANet!")
     print(f"==================================================\n")
     return model
 
@@ -90,7 +92,7 @@ class Trainer(object):
         # 🟢 ÉP CỨNG SỐ CLASS VỀ 1 CHO BÀI TOÁN BINARY ROAD DETECTION
         self.nclass = 1
 
-        # Khởi tạo mô hình 21 classes để vừa khít weights pretrained
+        # Checkpoint SpaceNet gốc dùng một lớp foreground (road).
         model = CoANet(num_classes= 1,
                         backbone=args.backbone,
                         output_stride=args.out_stride,
@@ -100,12 +102,6 @@ class Trainer(object):
         # Load weights
         if hasattr(args, 'coanet_weights') and args.coanet_weights:
             model = load_coanet_weights_safely(model, args.coanet_weights)
-
-        # Trả mô hình về số class thực tế của bạn
-        if self.nclass != 21:
-            print(f"🔄 Điều chỉnh lớp seg_branch từ 21 classes về {self.nclass} class...")
-            in_channels = model.connect.seg_branch[2].in_channels
-            model.connect.seg_branch[2] = nn.Conv2d(in_channels, self.nclass, kernel_size=1, stride=1)
 
         train_params = [{'params': model.get_1x_lr_params(), 'lr': args.lr},
                         {'params': model.get_2x_lr_params(), 'lr': args.lr * 2}]

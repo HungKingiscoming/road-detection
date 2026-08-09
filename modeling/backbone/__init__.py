@@ -1,4 +1,4 @@
-from . import resnet
+from modeling.backbone import resnet
 
 def build_backbone(backbone, output_stride, BatchNorm):
     if backbone == 'resnet':

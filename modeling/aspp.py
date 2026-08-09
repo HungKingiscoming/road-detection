@@ -3,10 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from model.sync_batchnorm.batchnorm import SynchronizedBatchNorm2d
-except ImportError:
-    SynchronizedBatchNorm2d = nn.BatchNorm2d
+from modeling.sync_batchnorm.batchnorm import SynchronizedBatchNorm2d
 
 
 class _ASPPModule(nn.Module):
@@ -28,23 +25,18 @@ class _ASPPModule(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, (SynchronizedBatchNorm2d, nn.BatchNorm2d)):
-                if m.weight is not None:
-                    m.weight.data.fill_(1)
-                if m.bias is not None:
-                    m.bias.data.zero_()
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
 
 
 class ASPP(nn.Module):
-    def __init__(self, backbone, output_stride, BatchNorm, inplanes=None):
+    def __init__(self, backbone, output_stride, BatchNorm):
         super(ASPP, self).__init__()
-
-        # Xác định số channels đầu vào từ Backbone
-        if inplanes is not None:
-            inplanes = inplanes
-        elif backbone == 'gcnet':
-            inplanes = 256  # base_channels (32) * 8 từ Stage 5 của GCNet
-        elif backbone == 'drn':
+        if backbone == 'drn':
             inplanes = 512
         elif backbone == 'mobilenet':
             inplanes = 320
@@ -56,7 +48,7 @@ class ASPP(nn.Module):
         elif output_stride == 8:
             dilations = [1, 12, 24, 36]
         else:
-            raise NotImplementedError(f"output_stride {output_stride} không hỗ trợ!")
+            raise NotImplementedError
 
         self.aspp1 = _ASPPModule(inplanes, 256, 1, padding=0, dilation=dilations[0], BatchNorm=BatchNorm)
         self.aspp2 = _ASPPModule(inplanes, 256, 3, padding=dilations[1], dilation=dilations[1], BatchNorm=BatchNorm)
@@ -69,7 +61,7 @@ class ASPP(nn.Module):
             BatchNorm(256),
             nn.ReLU()
         )
-        self.conv1 = nn.Conv2d(1280, 256, 1, bias=False)  # 256 * 5 nhánh = 1280
+        self.conv1 = nn.Conv2d(1280, 256, 1, bias=False)
         self.bn1 = BatchNorm(256)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
@@ -96,12 +88,13 @@ class ASPP(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, (SynchronizedBatchNorm2d, nn.BatchNorm2d)):
-                if m.weight is not None:
-                    m.weight.data.fill_(1)
-                if m.bias is not None:
-                    m.bias.data.zero_()
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
 
 
-def build_aspp(backbone, output_stride, BatchNorm, inplanes=None):
-    return ASPP(backbone, output_stride, BatchNorm, inplanes=inplanes)
+def build_aspp(backbone, output_stride, BatchNorm):
+    return ASPP(backbone, output_stride, BatchNorm)
