@@ -2,6 +2,8 @@ import glob
 import json
 import os
 import pickle
+import random
+from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps, ImageFilter
 import torch
@@ -69,6 +71,9 @@ class SpaceNetDataset(Dataset):
         transform=None,
         is_train: bool = True,
         load_graph_data: bool = True,
+        split: str | None = None,
+        base_size: int = 512,
+        crop_size: int | None = 512,
     ):
         """Args:
         data_dir: Thư mục chứa các file mẫu (RGB, GT, json)
@@ -80,39 +85,122 @@ class SpaceNetDataset(Dataset):
         self.transform = transform
         self.is_train = is_train
         self.load_graph_data = load_graph_data
+        self.base_size = base_size
+        self.crop_size = crop_size
+        self.samples = []
 
-        # Lấy danh sách các prefix file hợp lệ
-        rgb_files = sorted(glob.glob(os.path.join(data_dir, '*__rgb.png')))
-        self.prefixes = []
+        prepared_root = self._find_prepared_root(Path(data_dir))
+        if split is not None and prepared_root is not None:
+            self._discover_prepared_split(prepared_root, split)
+        else:
+            self._discover_flat_layout(Path(data_dir))
 
-        for f in rgb_files:
-            prefix = f.replace('__rgb.png', '')
-            gt_path = f'{prefix}__gt.png'
-            if os.path.exists(gt_path):
-                self.prefixes.append(prefix)
-
-        if len(self.prefixes) == 0:
+        if not self.samples:
             raise FileNotFoundError(
-                f'Không tìm thấy các cặp file (*__rgb.png, *__gt.png) hợp lệ nào trong {data_dir}'
+                'Không tìm thấy dữ liệu SpaceNet hợp lệ trong '
+                f'{data_dir}. Hỗ trợ: (*__rgb.png, *__gt.png) hoặc '
+                '(train|test)/(images|gt)/*.tif'
             )
 
+        print(
+            f"SpaceNet {split or 'flat'}: {len(self.samples)} cặp ảnh-mask "
+            f"từ {prepared_root or data_dir}"
+        )
+
+    @staticmethod
+    def _find_prepared_root(data_dir: Path):
+        candidates = [data_dir]
+        if data_dir.is_dir():
+            candidates.extend(path for path in data_dir.iterdir() if path.is_dir())
+        for candidate in candidates:
+            if (candidate / 'train' / 'images').is_dir() and (candidate / 'train' / 'gt').is_dir():
+                return candidate
+        return None
+
+    def _discover_prepared_split(self, root: Path, split: str):
+        split_dir = root / split
+        image_dir = split_dir / 'images'
+        gt_dir = split_dir / 'gt'
+        if not image_dir.is_dir() or not gt_dir.is_dir():
+            return
+
+        for image_path in sorted(image_dir.glob('*')):
+            if not image_path.is_file():
+                continue
+            # RGB-PanSharpen_AOI_2_Vegas_img1.tif -> AOI_2_Vegas_img1.tif
+            gt_name = image_path.name
+            if gt_name.startswith('RGB-PanSharpen_'):
+                gt_name = gt_name[len('RGB-PanSharpen_'):]
+            gt_path = gt_dir / gt_name
+            if gt_path.is_file():
+                self.samples.append((image_path, gt_path, None, image_path.stem))
+
+    def _discover_flat_layout(self, data_dir: Path):
+        for image_path in sorted(data_dir.glob('*__rgb.png')):
+            prefix = str(image_path)[:-len('__rgb.png')]
+            gt_path = Path(f'{prefix}__gt.png')
+            if gt_path.is_file():
+                graph_path = Path(f'{prefix}__gt_graph_dense_spacenet.json')
+                self.samples.append((
+                    image_path, gt_path,
+                    graph_path if graph_path.is_file() else None,
+                    image_path.name[:-len('__rgb.png')],
+                ))
+
     def __len__(self):
-        return len(self.prefixes)
+        return len(self.samples)
+
+    def _resize_or_crop(self, image, mask):
+        if self.crop_size is None:
+            return image, mask
+
+        crop_size = self.crop_size
+        if not self.is_train:
+            return (
+                image.resize((crop_size, crop_size), Image.BILINEAR),
+                mask.resize((crop_size, crop_size), Image.NEAREST),
+            )
+
+        short_size = random.randint(int(self.base_size * 0.5), int(self.base_size * 2.0))
+        width, height = image.size
+        if height > width:
+            out_width = short_size
+            out_height = int(height * short_size / width)
+        else:
+            out_height = short_size
+            out_width = int(width * short_size / height)
+        image = image.resize((out_width, out_height), Image.BILINEAR)
+        mask = mask.resize((out_width, out_height), Image.NEAREST)
+
+        pad_width = max(crop_size - out_width, 0)
+        pad_height = max(crop_size - out_height, 0)
+        if pad_width or pad_height:
+            image = ImageOps.expand(image, border=(0, 0, pad_width, pad_height), fill=0)
+            mask = ImageOps.expand(mask, border=(0, 0, pad_width, pad_height), fill=0)
+
+        width, height = image.size
+        left = random.randint(0, width - crop_size)
+        top = random.randint(0, height - crop_size)
+        box = (left, top, left + crop_size, top + crop_size)
+        image = image.crop(box)
+        mask = mask.crop(box)
+        if random.random() < 0.5:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+        return image, mask
 
     def __getitem__(self, idx):
-        prefix = self.prefixes[idx]
-
-        # 1. Đường dẫn các file tương ứng
-        rgb_path = f'{prefix}__rgb.png'
-        gt_path = f'{prefix}__gt.png'
-        graph_json_path = f'{prefix}__gt_graph_dense_spacenet.json'
+        rgb_path, gt_path, graph_json_path, sample_id = self.samples[idx]
 
         # 2. Đọc ảnh RGB & GT dưới dạng PIL Image để tương thích hoàn toàn với custom transforms
         rgb_img = Image.open(rgb_path).convert('RGB')
         gt_mask_img = Image.open(gt_path).convert('L')
+        rgb_img, gt_mask_img = self._resize_or_crop(rgb_img, gt_mask_img)
 
         # 3. Tính toán trước ma trận Connectivity (9 kênh) dạng numpy array từ mask gốc
-        gt_mask_np = (np.array(gt_mask_img) > 0).astype(np.float32)
+        # CoANet reference masks are soft uint8 Gaussian masks. The upstream
+        # normalization binarizes them at 0.5, i.e. at 128 in uint8 space.
+        gt_mask_np = (np.array(gt_mask_img) >= 128).astype(np.float32)
         gt_connect_d1 = generate_connectivity_gt(gt_mask_np, dilation=1)  # [9, H, W]
         gt_connect_d3 = generate_connectivity_gt(gt_mask_np, dilation=2)  # [9, H, W]
 
@@ -138,7 +226,7 @@ class SpaceNetDataset(Dataset):
                 torch.from_numpy(img_np).permute(2, 0, 1).float(),
                 mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             )
-            mask_np = (np.array(sample['label']) > 0).astype(np.float32)
+            mask_np = (np.array(sample['label']) >= 128).astype(np.float32)
             
             sample = {
                 'image': img_tensor,
@@ -152,10 +240,10 @@ class SpaceNetDataset(Dataset):
             }
 
         # Gắn thêm tên định danh file mẫu vào dictionary trả về
-        sample['prefix'] = os.path.basename(prefix)
+        sample['prefix'] = sample_id
 
         # 5. Đọc thông tin Graph cấu trúc cho TopoNet (nếu có)
-        if self.load_graph_data and os.path.exists(graph_json_path):
+        if self.load_graph_data and graph_json_path is not None and graph_json_path.exists():
             try:
                 with open(graph_json_path, 'r') as f:
                     graph_json = json.load(f)
@@ -173,25 +261,40 @@ def build_spacenet_dataloaders(
     train_ratio: float = 0.8,
     transform_train=None,
     transform_val=None,
+    base_size: int = 512,
+    crop_size: int = 512,
 ):
     """Hàm khởi tạo DataLoader cho Train và Validation hỗ trợ custom transform."""
-    train_dataset = SpaceNetDataset(
-        data_dir=data_dir, transform=transform_train, is_train=True, load_graph_data=False
-    )
-    val_dataset = SpaceNetDataset(
-        data_dir=data_dir, transform=transform_val, is_train=False, load_graph_data=False
-    )
-
-    # Chia Dataset theo tỷ lệ train/val cố định seed
-    total_size = len(train_dataset)
-    train_size = int(train_ratio * total_size)
-    val_size = total_size - train_size
-
-    train_subset, val_subset = torch.utils.data.random_split(
-        train_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
+    prepared_root = SpaceNetDataset._find_prepared_root(Path(data_dir))
+    if prepared_root is not None:
+        # The prepared reference dataset already contains the official split.
+        val_split = 'val' if (prepared_root / 'val').is_dir() else 'test'
+        train_subset = SpaceNetDataset(
+            data_dir=data_dir, transform=transform_train, is_train=True,
+            load_graph_data=False, split='train', base_size=base_size,
+            crop_size=crop_size,
+        )
+        val_subset = SpaceNetDataset(
+            data_dir=data_dir, transform=transform_val, is_train=False,
+            load_graph_data=False, split=val_split, base_size=base_size,
+            crop_size=crop_size,
+        )
+    else:
+        train_dataset = SpaceNetDataset(
+            data_dir=data_dir, transform=transform_train, is_train=True,
+            load_graph_data=False, base_size=base_size, crop_size=crop_size,
+        )
+        val_dataset = SpaceNetDataset(
+            data_dir=data_dir, transform=transform_val, is_train=False,
+            load_graph_data=False, base_size=base_size, crop_size=crop_size,
+        )
+        total_size = len(train_dataset)
+        train_size = int(train_ratio * total_size)
+        indices = torch.randperm(
+            total_size, generator=torch.Generator().manual_seed(42)
+        ).tolist()
+        train_subset = torch.utils.data.Subset(train_dataset, indices[:train_size])
+        val_subset = torch.utils.data.Subset(val_dataset, indices[train_size:])
 
     train_loader = DataLoader(
         train_subset,
