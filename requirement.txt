@@ -1,2 +1,0 @@
-# Compatibility alias. The standard Python dependency file is requirements.txt.
--r requirements.txt
