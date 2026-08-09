@@ -38,7 +38,7 @@ events.out.tfevents.*
 *.7z
 
 # Local datasets and prepared data
-RGB_1.0_meter/
-CoANet_prepared_reference/
-data/
-datasets/
+/RGB_1.0_meter/
+/CoANet_prepared_reference/
+/data/
+/datasets/
