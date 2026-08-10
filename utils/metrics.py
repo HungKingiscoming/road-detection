@@ -11,10 +11,13 @@ class Evaluator(object):
 
     def Pixel_Accuracy(self):
         total = self.confusion_matrix.sum()
+
         if total == 0:
             return 0.0
 
-        return np.diag(self.confusion_matrix).sum() / total
+        return float(
+            np.diag(self.confusion_matrix).sum() / total
+        )
 
     def Pixel_Accuracy_Class(self):
         denominator = self.confusion_matrix.sum(axis=1)
@@ -26,7 +29,7 @@ class Evaluator(object):
             where=denominator != 0
         )
 
-        return np.nanmean(acc)
+        return float(np.nanmean(acc))
 
     def Mean_Intersection_over_Union(self):
         intersection = np.diag(self.confusion_matrix)
@@ -44,7 +47,10 @@ class Evaluator(object):
             where=union != 0
         )
 
-        return np.nanmean(iou)
+        if np.all(np.isnan(iou)):
+            return 0.0
+
+        return float(np.nanmean(iou))
 
     def Intersection_over_Union(self):
         # Binary segmentation: class 1 là road
@@ -53,28 +59,43 @@ class Evaluator(object):
         fn = self.confusion_matrix[1, 0]
 
         denominator = tp + fp + fn
-        return float(tp / denominator) if denominator > 0 else 0.0
+
+        return (
+            float(tp / denominator)
+            if denominator > 0
+            else 0.0
+        )
 
     def Pixel_Precision(self):
         tp = self.confusion_matrix[1, 1]
         fp = self.confusion_matrix[0, 1]
 
         denominator = tp + fp
-        return float(tp / denominator) if denominator > 0 else 0.0
+
+        return (
+            float(tp / denominator)
+            if denominator > 0
+            else 0.0
+        )
 
     def Pixel_Recall(self):
         tp = self.confusion_matrix[1, 1]
         fn = self.confusion_matrix[1, 0]
 
         denominator = tp + fn
-        return float(tp / denominator) if denominator > 0 else 0.0
+
+        return (
+            float(tp / denominator)
+            if denominator > 0
+            else 0.0
+        )
 
     def Pixel_F1(self):
-        # Tự tính nên không phụ thuộc Pixel_Precision/Pixel_Recall
         precision = self.Pixel_Precision()
         recall = self.Pixel_Recall()
 
         denominator = precision + recall
+
         return (
             float(2.0 * precision * recall / denominator)
             if denominator > 0
@@ -82,8 +103,8 @@ class Evaluator(object):
         )
 
     def _generate_matrix(self, gt_image, pre_image):
-        gt_image = np.asarray(gt_image).astype(np.int64)
-        pre_image = np.asarray(pre_image).astype(np.int64)
+        gt_image = np.asarray(gt_image, dtype=np.int64)
+        pre_image = np.asarray(pre_image, dtype=np.int64)
 
         mask = (
             (gt_image >= 0)
@@ -102,13 +123,16 @@ class Evaluator(object):
             minlength=self.num_class ** 2
         )
 
-        return count.reshape(self.num_class, self.num_class)
+        return count.reshape(
+            self.num_class,
+            self.num_class
+        )
 
     def add_batch(self, gt_image, pre_image):
         if gt_image.shape != pre_image.shape:
             raise ValueError(
-                f"GT shape {gt_image.shape} khác prediction shape "
-                f"{pre_image.shape}"
+                f"GT shape {gt_image.shape} khác "
+                f"prediction shape {pre_image.shape}"
             )
 
         self.confusion_matrix += self._generate_matrix(
