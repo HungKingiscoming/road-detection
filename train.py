@@ -142,6 +142,137 @@ def model_state_dict(model):
     core_model = model.module if isinstance(model, torch.nn.DataParallel) else model
     return core_model.state_dict()
 
+
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def parameter_count_report(model):
+    """Return trainable/total parameter counts grouped by top-level module."""
+    report = {}
+    for name, parameter in unwrap_model(model).named_parameters():
+        group = name.split('.', 1)[0]
+        values = report.setdefault(group, {'trainable': 0, 'total': 0})
+        values['total'] += parameter.numel()
+        if parameter.requires_grad:
+            values['trainable'] += parameter.numel()
+    return report
+
+
+def log_transfer_state(model, optimizer, epoch, stage):
+    """Print exactly what is trainable and the discriminative LR of each group."""
+    print(f"\n[DEBUG][epoch={epoch}] transfer_stage={stage}")
+    for name, values in parameter_count_report(model).items():
+        print(
+            f"  params/{name}: trainable={values['trainable']:,} "
+            f"total={values['total']:,}"
+        )
+    for group in optimizer.param_groups:
+        trainable = sum(p.numel() for p in group['params'] if p.requires_grad)
+        print(
+            f"  lr/{group.get('group_name', 'unnamed')}: "
+            f"lr={group['lr']:.3e} trainable={trainable:,}"
+        )
+
+
+class OffsetDebugCapture:
+    """Capture lightweight DSConv offset statistics only on selected batches."""
+    def __init__(self, model, enabled):
+        self.enabled = enabled
+        self.handles = []
+        self.values = []
+        if not enabled:
+            return
+        for name, module in unwrap_model(model).named_modules():
+            if name.endswith('offset_conv'):
+                self.handles.append(module.register_forward_hook(self._hook(name)))
+
+    def _hook(self, name):
+        def collect(_module, _inputs, output):
+            offset = torch.tanh(output.detach())
+            self.values.append((
+                name,
+                offset.abs().mean().item(),
+                offset.abs().max().item(),
+                offset.abs().gt(0.95).float().mean().item(),
+            ))
+        return collect
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def summary(self):
+        if not self.values:
+            return None
+        count = len(self.values)
+        return {
+            'modules': count,
+            'mean_abs': sum(value[1] for value in self.values) / count,
+            'max_abs': max(value[2] for value in self.values),
+            'saturated_fraction': sum(value[3] for value in self.values) / count,
+        }
+
+
+def optimizer_gradient_report(optimizer):
+    report = []
+    for group in optimizer.param_groups:
+        grad_squared = 0.0
+        parameter_squared = 0.0
+        tensors_with_grad = 0
+        for parameter in group['params']:
+            if not parameter.requires_grad:
+                continue
+            parameter_squared += parameter.detach().float().norm().item() ** 2
+            if parameter.grad is not None:
+                grad_squared += parameter.grad.detach().float().norm().item() ** 2
+                tensors_with_grad += 1
+        report.append((
+            group.get('group_name', 'unnamed'),
+            grad_squared ** 0.5,
+            parameter_squared ** 0.5,
+            tensors_with_grad,
+        ))
+    return report
+
+
+def log_debug_batch(epoch, iteration, output, target, optimizer, offset_summary,
+                    thresholds):
+    prediction = output.detach()
+    target_detached = target.detach()
+    positive_rates = ', '.join(
+        f"p>={threshold:g}:{prediction.ge(threshold).float().mean().item():.4f}"
+        for threshold in thresholds
+    )
+    print(
+        f"\n[DEBUG][epoch={epoch} iter={iteration}] "
+        f"pred(min/mean/max)={prediction.min().item():.4f}/"
+        f"{prediction.mean().item():.4f}/{prediction.max().item():.4f} "
+        f"target_positive={target_detached.mean().item():.4f} {positive_rates}"
+    )
+    if offset_summary is not None:
+        print(
+            "  offsets: modules={modules} mean_abs={mean_abs:.6f} "
+            "max_abs={max_abs:.6f} saturated={saturated_fraction:.6f}".format(
+                **offset_summary
+            )
+        )
+    for name, grad_norm, parameter_norm, tensor_count in optimizer_gradient_report(optimizer):
+        print(
+            f"  grad/{name}: norm={grad_norm:.3e} param_norm={parameter_norm:.3e} "
+            f"tensors={tensor_count}"
+        )
+    if torch.cuda.is_available():
+        for device in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+            peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            print(
+                f"  cuda:{device}: allocated={allocated:.2f}GiB "
+                f"reserved={reserved:.2f}GiB peak={peak:.2f}GiB"
+            )
+
 def get_sample_tensors(sample, split='train'):
     """Giải nén dữ liệu và In ra màn hình các keys đang có nếu bị lỗi."""
     if split == 'val' and isinstance(sample, list):
@@ -288,9 +419,17 @@ class Trainer(object):
                 image, target, connect_label, connect_d1_label = image.cuda(), target.cuda(), connect_label.cuda(), connect_d1_label.cuda()
                 
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
+            if i == 0 and self.args.debug_log_interval > 0:
+                log_transfer_state(core_model, self.optimizer, epoch, next_stage)
             self.optimizer.zero_grad()
-            
+
+            debug_now = (
+                self.args.debug_log_interval > 0
+                and (i == 0 or (i + 1) % self.args.debug_log_interval == 0)
+            )
+            offset_capture = OffsetDebugCapture(core_model, enabled=debug_now)
             output, out_connect, out_connect_d1 = self.model(image)
+            offset_capture.close()
             target = torch.unsqueeze(target, 1)
             loss1 = self.criterion(output, target)
             loss2 = self.criterion_con(out_connect, connect_label)
@@ -299,6 +438,11 @@ class Trainer(object):
             lad = 0.2
             loss = loss1 + lad*(0.6*loss2 + 0.4*loss3)
             loss.backward()
+            if debug_now:
+                log_debug_batch(
+                    epoch, i + 1, output, target, self.optimizer,
+                    offset_capture.summary(), self.args.debug_thresholds,
+                )
             self.optimizer.step()
             
             train_loss1 += loss1.item()
@@ -321,8 +465,7 @@ class Trainer(object):
             self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
             pred = output.data.cpu().numpy()
             target_n = target.cpu().numpy()
-            pred[pred > 0.1]=1
-            pred[pred < 0.1] = 0
+            pred = (pred >= self.args.eval_threshold).astype(np.uint8)
             self.evaluator.add_batch(target_n, pred)
 
         Acc = self.evaluator.Pixel_Accuracy()
@@ -348,7 +491,7 @@ class Trainer(object):
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
         print("Acc:{}, Acc_class:{}, mIoU:{}, IoU:{}, Precision:{}, Recall:{}, F1:{}"
               .format(Acc, Acc_class, mIoU, IoU, Precision, Recall, F1))
-        print('Loss: %.3f, Loss1: %.6f, Loss2: %.3f, Loss3: %.3f' % (train_loss, train_loss1, train_loss2, train_loss2))
+        print('Loss: %.3f, Loss1: %.6f, Loss2: %.3f, Loss3: %.3f' % (train_loss, train_loss1, train_loss2, train_loss3))
 
         if self.args.no_val:
             is_best = False
@@ -362,6 +505,9 @@ class Trainer(object):
     def validation(self, epoch):
         self.model.eval()
         self.evaluator.reset()
+        threshold_evaluators = {
+            threshold: Evaluator(2) for threshold in self.args.debug_thresholds
+        }
         tbar = tqdm(self.val_loader, desc='\r')
         test_loss1 = 0.0
         test_loss2 = 0.0
@@ -392,11 +538,15 @@ class Trainer(object):
             
             tbar.set_description('Test loss: %.3f, loss1: %.6f, loss2: %.3f, loss3: %.3f' % (test_loss / (i + 1), test_loss1 / (i + 1), test_loss2 / (i + 1), test_loss3 / (i + 1)))
             
-            pred = output.data.cpu().numpy()
+            prediction_probability = output.data.cpu().numpy()
             target_n = target.cpu().numpy()
-            pred[pred > 0.1]=1
-            pred[pred < 0.1] = 0
+            pred = (prediction_probability >= self.args.eval_threshold).astype(np.uint8)
             self.evaluator.add_batch(target_n, pred)
+            for threshold, evaluator in threshold_evaluators.items():
+                evaluator.add_batch(
+                    target_n,
+                    (prediction_probability >= threshold).astype(np.uint8),
+                )
 
             if i % (num_img_tr // 1) == 0:
                 self.summary.visualize_image(self.writer, self.args.dataset, image, target, output, i, split='Val')
@@ -426,6 +576,21 @@ class Trainer(object):
         print("Acc:{}, Acc_class:{}, mIoU:{}, IoU:{}, Precision:{}, Recall:{}, F1:{}"
               .format(Acc, Acc_class, mIoU, IoU, Precision, Recall, F1))
         print('Loss: %.3f, Loss1: %.3f, Loss2: %.3f, Loss3: %.3f' % (test_loss, test_loss1, test_loss2, test_loss3))
+        if threshold_evaluators:
+            print('Validation threshold sweep:')
+            for threshold, evaluator in threshold_evaluators.items():
+                threshold_iou = evaluator.Intersection_over_Union()
+                threshold_f1 = evaluator.Pixel_F1()
+                threshold_precision = evaluator.Pixel_Precision()
+                threshold_recall = evaluator.Pixel_Recall()
+                print(
+                    f"  threshold={threshold:.2f} IoU={threshold_iou:.6f} "
+                    f"F1={threshold_f1:.6f} Precision={threshold_precision:.6f} "
+                    f"Recall={threshold_recall:.6f}"
+                )
+                self.writer.add_scalar(
+                    f'val_threshold/IoU_{threshold:.2f}', threshold_iou, epoch
+                )
 
         new_pred = IoU
         if new_pred > self.best_pred:
@@ -482,6 +647,13 @@ def main():
     parser.add_argument('--ft', action='store_true', default=False, help='finetuning on a different dataset')
     parser.add_argument('--eval-interval', type=int, default=1, help='evaluuation interval (default: 1)')
     parser.add_argument('--no-val', action='store_true', default=False, help='skip validation during training')
+    parser.add_argument('--eval-threshold', type=float, default=0.1,
+                        help='probability threshold used for primary IoU/F1 and best checkpoint')
+    parser.add_argument('--debug-log-interval', type=int, default=50,
+                        help='print gradients, offsets, predictions and VRAM every N batches; 0 disables')
+    parser.add_argument('--debug-thresholds', type=float, nargs='+',
+                        default=[0.1, 0.2, 0.3, 0.4, 0.5],
+                        help='thresholds included in batch diagnostics and validation sweep')
 
     args = parser.parse_args()
     if args.dsconv_kernel_size % 2 != 1:
@@ -490,6 +662,12 @@ def main():
         parser.error('SCM checkpoint transfer requires --dsconv-kernel-size 9')
     if args.unfreeze_epochs != sorted(args.unfreeze_epochs):
         parser.error('--unfreeze-epochs must be in non-decreasing order')
+    if not 0.0 <= args.eval_threshold <= 1.0:
+        parser.error('--eval-threshold must be between 0 and 1')
+    if args.debug_log_interval < 0:
+        parser.error('--debug-log-interval cannot be negative')
+    if any(threshold < 0.0 or threshold > 1.0 for threshold in args.debug_thresholds):
+        parser.error('--debug-thresholds values must be between 0 and 1')
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     if args.cuda:
         try:
