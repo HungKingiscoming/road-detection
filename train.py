@@ -1395,7 +1395,6 @@ def main():
                       GCNetHead(**cfg["head"], num_classes=args.num_classes,
                                 ignore_index=args.ignore_index)).to(device)
     model.apply(init_weights)
-    check_model_health(model)
 
     transfer_ratio = None
     if args.pretrained_weights:
