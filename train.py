@@ -23,12 +23,95 @@ except Exception:
 
 SEP = "=" * 70
 
-from model.head.segmentation_head import GCNetHead
-from model.model_utils import init_weights, check_model_health
+from modelling.decoder.segmentation_head import GCNetHead
+
 
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 
+def replace_bn_with_gn(module, num_groups=32):
+    """
+    Recursively replaces all BatchNorm2d layers with GroupNorm.
+    
+    This is CRITICAL for training with batch_size < 16.
+    BatchNorm becomes unreliable when batch size is small.
+    GroupNorm works perfectly even with batch_size=1.
+    
+    Args:
+        module: PyTorch module (model)
+        num_groups: Number of groups for GroupNorm (default 32)
+    
+    Returns:
+        Module with GroupNorm instead of BatchNorm
+    
+    Example:
+        >>> model = replace_bn_with_gn(model)
+        >>> print(model)  # Should not have BatchNorm2d anymore
+    """
+    # If the module itself is BatchNorm, replace it
+    if isinstance(module, nn.BatchNorm2d):
+        num_channels = module.num_features
+        
+        # Ensure num_groups divides num_channels evenly
+        current_groups = num_groups
+        while num_channels % current_groups != 0:
+            current_groups //= 2
+        
+        # Create GroupNorm with same number of channels
+        return nn.GroupNorm(current_groups, num_channels)
+    
+    # Otherwise, recursively iterate over children
+    for name, child in module.named_children():
+        module.add_module(name, replace_bn_with_gn(child, num_groups))
+    
+    return module
+
+
+
+def init_weights(module):
+    """
+    Apply robust Kaiming (He) initialization for training from scratch.
+    
+    This is CRITICAL for from-scratch training without pretrained weights.
+    Default initialization is too weak. Kaiming init jumpstarts learning.
+    
+    Args:
+        module: PyTorch module (usually apply with model.apply(init_weights))
+    
+    Example:
+        >>> model.apply(init_weights)
+        >>> # Now model has proper Kaiming initialization
+    """
+    if isinstance(module, (nn.Conv2d, nn.Linear)):
+        # Kaiming Normal (He Init) for ReLU/GeLU networks
+        # Fan-out mode: good for conv layers
+        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+        
+        # Initialize bias to 0
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+    
+    elif isinstance(module, (nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm)):
+        # Normalization layers: weight=1.0, bias=0.0
+        nn.init.constant_(module.weight, 1)
+        nn.init.constant_(module.bias, 0)
+
+
+def count_parameters(model):
+    """
+    Count total trainable parameters in the model.
+    
+    Args:
+        model: PyTorch module
+    
+    Returns:
+        int: Number of trainable parameters
+    
+    Example:
+        >>> total = count_parameters(model)
+        >>> print(f"Model has {total:,} parameters")
+    """
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def _sample_key(path):
     """Normalize common image/mask suffixes so files can be paired safely."""
@@ -1319,7 +1402,6 @@ def main():
                       GCNetHead(**cfg["head"], num_classes=args.num_classes,
                                 ignore_index=args.ignore_index)).to(device)
     model.apply(init_weights)
-    check_model_health(model)
 
     transfer_ratio = None
     if args.pretrained_weights:
