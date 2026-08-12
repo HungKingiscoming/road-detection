@@ -1274,7 +1274,7 @@ def main():
 
     # Import backbone
     if args.model_variant == 'coming':
-        from model.backbone import CoMingNet as Backbone
+        from modeling.backbone import CoMingNet as Backbone
 
     cfg = ModelConfig.get_config(
         variant=args.model_variant,
