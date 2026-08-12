@@ -112,22 +112,55 @@ def count_parameters(model):
         >>> print(f"Model has {total:,} parameters")
     """
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
 def _sample_key(path):
-    """Normalize common image/mask suffixes so files can be paired safely."""
-    key = path.stem.lower()
-    suffixes = ('_image', '_images', '_img', '_sat', '_mask', '_masks',
-                '_gt', '_label', '_labels')
+    """
+    Chuẩn hóa tên ảnh và mask SpaceNet.
+
+    Ví dụ:
+        RGB-PanSharpen_AOI_2_Vegas_img10.png
+        AOI_2_Vegas_img10.png
+
+    Cùng được chuyển thành:
+        aoi_2_vegas_img10
+    """
+    key = path.stem.lower().strip()
+
+    prefixes = (
+        "rgb-pansharpen_",
+        "rgb_pansharpen_",
+        "rgb-pan-sharpen_",
+        "mul-pansharpen_",
+        "mul_pansharpen_",
+        "pansharpen_",
+    )
+
+    for prefix in prefixes:
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+
+    suffixes = (
+        "_image",
+        "_images",
+        "_sat",
+        "_mask",
+        "_masks",
+        "_gt",
+        "_label",
+        "_labels",
+    )
+
     changed = True
     while changed:
         changed = False
+
         for suffix in suffixes:
             if key.endswith(suffix):
                 key = key[:-len(suffix)]
                 changed = True
                 break
-    return key
 
+    return key
 
 def _index_files(folder):
     folder = Path(folder)
