@@ -5,8 +5,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
+env/
 
 # Jupyter / Kaggle
 .ipynb_checkpoints/
@@ -20,6 +23,7 @@ venv/
 # Training outputs
 run/
 runs/
+logs/
 checkpoints/
 outputs/
 wandb/

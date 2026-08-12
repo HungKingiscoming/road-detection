@@ -1,187 +1,301 @@
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from modeling.sync_batchnorm.batchnorm import SynchronizedBatchNorm2d
-from modeling.dsconv import DSConv2d
 
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, n_filters, BatchNorm, inp=False,
-                 scm_type='strip', dsconv_kernel_size=9,
-                 dsconv_extend_scope=1.0):
-        super(DecoderBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
-        self.bn1 = BatchNorm(in_channels // 4)
-        self.relu1 = nn.ReLU()
-        self.inp = inp
+from torch import Tensor
+from typing import Dict, List, Optional, Tuple, Union
 
-        self.scm_type = scm_type
-        branch_in = in_channels // 4
-        branch_out = in_channels // 8
-        if scm_type == 'strip':
-            self.deconv1 = nn.Conv2d(branch_in, branch_out, (1, 9), padding=(0, 4))
-            self.deconv2 = nn.Conv2d(branch_in, branch_out, (9, 1), padding=(4, 0))
-            self.deconv3 = nn.Conv2d(branch_in, branch_out, (9, 1), padding=(4, 0))
-            self.deconv4 = nn.Conv2d(branch_in, branch_out, (1, 9), padding=(0, 4))
-        elif scm_type == 'dsconv':
-            dsconv_args = dict(
-                in_channels=branch_in,
-                out_channels=branch_out,
-                kernel_size=dsconv_kernel_size,
-                extend_scope=dsconv_extend_scope,
-                if_offset=True,
-            )
-            self.dsconv1 = DSConv2d(morph=0, **dsconv_args)
-            self.dsconv2 = DSConv2d(morph=1, **dsconv_args)
-            self.dsconv3 = DSConv2d(morph=1, **dsconv_args)
-            self.dsconv4 = DSConv2d(morph=0, **dsconv_args)
-        else:
-            raise ValueError("scm_type must be 'strip' or 'dsconv'")
+from components.components import (
+    BaseModule,
+    ConvModule,
+    build_norm_layer,
+    build_activation_layer,
+    resize,
+    OptConfigType,
+    SampleList,
+)
 
-        self.bn2 = BatchNorm(in_channels // 4 + in_channels // 4)
-        self.relu2 = nn.ReLU()
-        self.conv3 = nn.Conv2d(
-            in_channels // 4 + in_channels // 4, n_filters, 1)
-        self.bn3 = BatchNorm(n_filters)
-        self.relu3 = nn.ReLU()
 
-        self._init_weight()
-        if self.scm_type == 'dsconv':
-            for module in self.modules():
-                if isinstance(module, DSConv2d):
-                    module.reset_offset_parameters()
+# =============================================================================
+# Accuracy helper
+# =============================================================================
 
-    def forward(self, x, inp = False):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu1(x)
+def accuracy(pred: Tensor,
+             target: Tensor,
+             ignore_index: int = 255) -> Tensor:
+    """Tính pixel accuracy, bỏ qua các pixel có nhãn = ignore_index."""
+    pred_label = pred.argmax(dim=1)
+    mask       = target != ignore_index
+    correct    = (pred_label[mask] == target[mask]).sum().float()
+    total      = mask.sum().float().clamp(min=1)
+    return correct / total * 100.0
 
-        if self.scm_type == 'strip':
-            x1 = self.deconv1(x)
-            x2 = self.deconv2(x)
-            x3 = self.inv_h_transform(self.deconv3(self.h_transform(x)))
-            x4 = self.inv_v_transform(self.deconv4(self.v_transform(x)))
-        else:
-            x1 = self.dsconv1(x)
-            x2 = self.dsconv2(x)
-            x3 = self.inv_h_transform(self.dsconv3(self.h_transform(x)))
-            x4 = self.inv_v_transform(self.dsconv4(self.v_transform(x)))
-        x = torch.cat((x1, x2, x3, x4), 1)
-        if self.inp:
-            x = F.interpolate(x, scale_factor=2)
-        x = self.bn2(x)
-        x = self.relu2(x)
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = self.relu3(x)
-        return x
 
-    def _init_weight(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, nn.ConvTranspose2d):
-                torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, SynchronizedBatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+# =============================================================================
+# Cross-entropy loss wrapper
+# =============================================================================
 
-    def h_transform(self, x):
-        shape = x.size()
-        x = torch.nn.functional.pad(x, (0, shape[-1]))
-        x = x.reshape(shape[0], shape[1], -1)[..., :-shape[-1]]
-        x = x.reshape(shape[0], shape[1], shape[2], 2*shape[3]-1)
-        return x
+class CrossEntropyLoss(nn.Module):
+    def __init__(self,
+                 ignore_index: int = 255,
+                 loss_weight: float = 1.0):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.loss_weight  = loss_weight
 
-    def inv_h_transform(self, x):
-        shape = x.size()
-        x = x.reshape(shape[0], shape[1], -1).contiguous()
-        x = torch.nn.functional.pad(x, (0, shape[-2]))
-        x = x.reshape(shape[0], shape[1], shape[-2], 2*shape[-2])
-        x = x[..., 0: shape[-2]]
-        return x
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        return self.loss_weight * F.cross_entropy(
+            pred, target, ignore_index=self.ignore_index)
 
-    def v_transform(self, x):
-        x = x.permute(0, 1, 3, 2)
-        shape = x.size()
-        x = torch.nn.functional.pad(x, (0, shape[-1]))
-        x = x.reshape(shape[0], shape[1], -1)[..., :-shape[-1]]
-        x = x.reshape(shape[0], shape[1], shape[2], 2*shape[3]-1)
-        return x.permute(0, 1, 3, 2)
 
-    def inv_v_transform(self, x):
-        x = x.permute(0, 1, 3, 2)
-        shape = x.size()
-        x = x.reshape(shape[0], shape[1], -1)
-        x = torch.nn.functional.pad(x, (0, shape[-2]))
-        x = x.reshape(shape[0], shape[1], shape[-2], 2*shape[-2])
-        x = x[..., 0: shape[-2]]
-        return x.permute(0, 1, 3, 2)
+# =============================================================================
+# OHEM Cross-entropy loss
+# =============================================================================
 
-class Decoder(nn.Module):
-    def __init__(self, num_classes, backbone, BatchNorm, scm_type='strip',
-                 dsconv_kernel_size=9, dsconv_extend_scope=1.0):
-        super(Decoder, self).__init__()
-        if backbone == 'resnet':
-            in_inplanes = 256
-        else:
-            raise NotImplementedError
+class OHEMCrossEntropyLoss(nn.Module):
 
-        block_args = dict(
-            BatchNorm=BatchNorm,
-            scm_type=scm_type,
-            dsconv_kernel_size=dsconv_kernel_size,
-            dsconv_extend_scope=dsconv_extend_scope,
+    def __init__(self,
+                 ignore_index: int = 255,
+                 loss_weight: float = 1.0,
+                 thresh: float = 1.5,
+                 min_kept: int = 100_000):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.loss_weight  = loss_weight
+        self.thresh       = thresh
+        self.min_kept     = min_kept
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        losses = F.cross_entropy(
+            pred, target,
+            ignore_index=self.ignore_index,
+            reduction='none'
+        ).view(-1)
+
+        valid_mask = target.view(-1) != self.ignore_index
+        losses     = losses[valid_mask]
+
+        if losses.numel() == 0:
+            return pred.sum() * 0.0
+
+        losses_sorted, _ = losses.sort(descending=True)
+
+        n_above_thresh = (losses_sorted > self.thresh).sum().item()
+        n_keep         = int(max(n_above_thresh, self.min_kept))
+        n_keep         = min(n_keep, losses_sorted.numel())
+
+        return self.loss_weight * losses_sorted[:n_keep].mean()
+
+
+# =============================================================================
+# Fog Consistency Loss
+# =============================================================================
+
+class FogConsistencyLoss(nn.Module):
+    def __init__(self,
+                 temperature: float = 4.0,
+                 loss_weight: float = 0.1):
+        super().__init__()
+        self.T           = temperature
+        self.loss_weight = loss_weight
+
+    def forward(self,
+                logit_light: Tensor,
+                logit_heavy: Tensor) -> Tensor:
+        assert logit_light.shape == logit_heavy.shape, (
+            f"FogConsistencyLoss: shape mismatch "
+            f"{logit_light.shape} vs {logit_heavy.shape}"
         )
-        self.decoder4 = DecoderBlock(in_inplanes, 256, **block_args)
-        self.decoder3 = DecoderBlock(512, 128, **block_args)
-        self.decoder2 = DecoderBlock(256, 64, inp=True, **block_args)
-        self.decoder1 = DecoderBlock(128, 64, inp=True, **block_args)
 
-        self.conv_e3 = nn.Sequential(nn.Conv2d(1024, 256, 1, bias=False),
-                                       BatchNorm(256),
-                                       nn.ReLU())
+        # Q = heavy fog distribution (student, được tối ưu)
+        # P = light fog distribution (teacher, target)
+        # Minimize KL(P || Q) = sum P * log(P/Q)
+        log_q = F.log_softmax(logit_heavy / self.T, dim=1)   # log Q (student)
+        p     = F.softmax(logit_light  / self.T, dim=1)       # P     (teacher)
 
-        self.conv_e2 = nn.Sequential(nn.Conv2d(512, 128, 1, bias=False),
-                                     BatchNorm(128),
-                                     nn.ReLU())
+        kl = F.kl_div(log_q, p, reduction='batchmean') * (self.T ** 2)
 
-        self.conv_e1 = nn.Sequential(nn.Conv2d(256, 64, 1, bias=False),
-                                     BatchNorm(64),
-                                     nn.ReLU())
-
-        self._init_weight()
-        # Decoder._init_weight recursively visits child convolutions, so reset
-        # all newly introduced offsets once more after the complete init pass.
-        for module in self.modules():
-            if isinstance(module, DSConv2d):
-                module.reset_offset_parameters()
+        return self.loss_weight * kl
 
 
-    def forward(self, e1, e2, e3, e4):
-        d4 = torch.cat((self.decoder4(e4), self.conv_e3(e3)), dim=1)
-        d3 = torch.cat((self.decoder3(d4), self.conv_e2(e2)), dim=1)
-        d2 = torch.cat((self.decoder2(d3), self.conv_e1(e1)), dim=1)
-        d1 = self.decoder1(d2)
-        x = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=True)
+# =============================================================================
+# GCNetHead
+# =============================================================================
 
-        return x
+class GCNetHead(BaseModule):
+    def __init__(self,
+                 in_channels: int,
+                 channels: int,
+                 num_classes: int,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 align_corners: bool = False,
+                 ignore_index: int = 255,
+                 loss_weight_aux: float = 0.4,
+                 dropout_ratio: float = 0.1,
+                 # FIX: thresh default 1.5 (từ 0.7) — xem OHEMCrossEntropyLoss
+                 ohem_thresh: float = 1.5,
+                 ohem_min_kept: int = 100_000,
+                 fog_consistency_weight: float = 0.1,
+                 fog_temperature: float = 4.0,
+                 init_cfg: OptConfigType = None):
+        super().__init__(init_cfg)
 
-    def _init_weight(self):
+        self.in_channels         = in_channels
+        self.channels            = channels
+        self.num_classes         = num_classes
+        self.norm_cfg            = norm_cfg
+        self.act_cfg             = act_cfg
+        self.align_corners       = align_corners
+        self.ignore_index        = ignore_index
+        self.loss_weight_aux     = loss_weight_aux
+
+        # ---- Main head (c6) ---------------------------------------------- #
+        self.head = self._make_base_head(in_channels, channels)
+
+        # ---- Auxiliary head (c4) ----------------------------------------- #
+        # in_channels // 2: c4_feat là channels*2 = in_channels // 2
+        self.aux_head_c4    = self._make_base_head(in_channels // 2, channels)
+        self.aux_cls_seg_c4 = nn.Conv2d(channels, num_classes, kernel_size=1)
+
+        # ---- Final classifiers ------------------------------------------- #
+        self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
+        self.cls_seg  = nn.Conv2d(channels, num_classes, kernel_size=1)
+
+        # ---- Loss functions ---------------------------------------------- #
+        self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
+                                         loss_weight=loss_weight_aux)
+
+        self.loss_c6 = OHEMCrossEntropyLoss(
+            ignore_index=ignore_index,
+            loss_weight=1.0,
+            thresh=ohem_thresh,
+            min_kept=ohem_min_kept,
+        )
+
+        self.fog_consistency_weight = fog_consistency_weight
+        if fog_consistency_weight > 0.0:
+            self.loss_fog = FogConsistencyLoss(
+                temperature=fog_temperature,
+                loss_weight=fog_consistency_weight,
+            )
+        else:
+            self.loss_fog = None
+
+        self.init_weights()
+
+    # ---------------------------------------------------------------------- #
+    # Weight init                                                              #
+    # ---------------------------------------------------------------------- #
+
+    def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, SynchronizedBatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-def build_decoder(num_classes, backbone, BatchNorm, scm_type='strip',
-                  dsconv_kernel_size=9, dsconv_extend_scope=1.0):
-    return Decoder(num_classes, backbone, BatchNorm, scm_type,
-                   dsconv_kernel_size, dsconv_extend_scope)
+    # ---------------------------------------------------------------------- #
+    # Forward                                                                  #
+    # ---------------------------------------------------------------------- #
+
+    def forward(self,
+                inputs: Union[Tensor, Tuple[Tensor, Tensor]]
+                ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        if self.training:
+            assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, (
+                f"GCNetHead training mode expects (c4_feat, c6_feat) tuple, "
+                f"got {type(inputs)}. "
+                f"Kiểm tra backbone.forward() có return_aux=True không."
+            )
+            c4_feat, c6_feat = inputs
+
+            c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
+            c6_logit = self.cls_seg(self.dropout(self.head(c6_feat)))
+
+            return c4_logit, c6_logit
+
+        else:
+            # Inference: inputs có thể là tuple (nếu backbone.return_aux=True)
+            # hoặc Tensor đơn — handle cả hai
+            if isinstance(inputs, (tuple, list)):
+                # Lấy c6_feat (index 1), bỏ c4_feat
+                c6_feat = inputs[1]
+            else:
+                c6_feat = inputs
+            return self.cls_seg(self.dropout(self.head(c6_feat)))
+
+    # ---------------------------------------------------------------------- #
+    # Loss                                                                     #
+    # ---------------------------------------------------------------------- #
+
+    def loss(self,
+             seg_logits: Tuple[Tensor, Tensor],
+             seg_label: Tensor) -> Dict[str, Tensor]:
+        c4_logit, c6_logit = seg_logits
+
+        # FIX: normalize seg_label shape → luôn (B, H, W)
+        if seg_label.dim() == 4:
+            seg_label = seg_label.squeeze(1)
+
+        # FIX: dùng shape[-2:] thay vì shape[1:]
+        target_size = seg_label.shape[-2:]
+
+        c4_logit = resize(c4_logit, size=target_size,
+                          mode='bilinear', align_corners=self.align_corners)
+        c6_logit = resize(c6_logit, size=target_size,
+                          mode='bilinear', align_corners=self.align_corners)
+
+        losses = {
+            'loss_c4': self.loss_c4(c4_logit, seg_label),
+            'loss_c6': self.loss_c6(c6_logit, seg_label),
+            'acc_seg': accuracy(c6_logit, seg_label,
+                                ignore_index=self.ignore_index),
+        }
+        return losses
+
+    def compute_fog_consistency(self,
+                                 logit_light: Tensor,
+                                 logit_heavy: Tensor) -> Optional[Tensor]:
+        if self.loss_fog is None:
+            return None
+        return self.loss_fog(logit_light, logit_heavy)
+
+    # ---------------------------------------------------------------------- #
+    # Helper                                                                   #
+    # ---------------------------------------------------------------------- #
+
+    def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
+        return nn.Sequential(
+            build_norm_layer(self.norm_cfg, in_channels)[1],   # [0] BN standalone
+            build_activation_layer(self.act_cfg),              # [1] ReLU
+            ConvModule(                                        # [2] Conv→BN→ReLU
+                in_channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg,
+                order=('conv', 'norm', 'act'),
+            ),
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Inference helper                                                         #
+    # ---------------------------------------------------------------------- #
+
+    def predict(self,
+                inputs: Union[Tensor, Tuple[Tensor, Tensor]],
+                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
+        self.eval()
+        with torch.no_grad():
+            logit = self.forward(inputs)
+            if img_size is not None:
+                logit = resize(logit, size=img_size,
+                               mode='bilinear', align_corners=self.align_corners)
+        return logit
