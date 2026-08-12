@@ -10,6 +10,8 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
 
 warnings.filterwarnings('ignore')
 
@@ -22,8 +24,144 @@ except Exception:
 SEP = "=" * 70
 
 from model.head.segmentation_head import GCNetHead
-from data.custom import create_dataloaders
 from model.model_utils import init_weights, check_model_health
+
+
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+
+
+def _sample_key(path):
+    """Normalize common image/mask suffixes so files can be paired safely."""
+    key = path.stem.lower()
+    suffixes = ('_image', '_images', '_img', '_sat', '_mask', '_masks',
+                '_gt', '_label', '_labels')
+    changed = True
+    while changed:
+        changed = False
+        for suffix in suffixes:
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+                changed = True
+                break
+    return key
+
+
+def _index_files(folder):
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {folder}")
+    files = sorted(p for p in folder.rglob('*') if p.suffix.lower() in IMAGE_EXTENSIONS)
+    if not files:
+        raise RuntimeError(f"No supported image files found in: {folder}")
+    index = {}
+    for path in files:
+        key = _sample_key(path)
+        if key in index:
+            raise RuntimeError(f"Duplicate sample key '{key}': {index[key]} and {path}")
+        index[key] = path
+    return index
+
+
+def build_image_mask_pairs(image_dir, mask_dir):
+    images, masks = _index_files(image_dir), _index_files(mask_dir)
+    common = sorted(images.keys() & masks.keys())
+    missing_masks = sorted(images.keys() - masks.keys())
+    missing_images = sorted(masks.keys() - images.keys())
+    if missing_masks or missing_images:
+        raise RuntimeError(
+            f"Image/mask pairing failed: {len(missing_masks)} images have no mask and "
+            f"{len(missing_images)} masks have no image. "
+            f"Examples: missing masks={missing_masks[:5]}, missing images={missing_images[:5]}"
+        )
+    if len(common) < 2:
+        raise RuntimeError("At least two paired samples are required for train/validation split.")
+    return [(images[key], masks[key]) for key in common]
+
+
+class RoadFolderDataset(Dataset):
+    def __init__(self, pairs, img_size, num_classes=2, augment=False):
+        self.pairs = list(pairs)
+        self.img_size = tuple(img_size)  # (height, width)
+        self.num_classes = num_classes
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def _read_mask(self, path):
+        mask = np.asarray(Image.open(path))
+        if mask.ndim == 3:
+            mask = mask.max(axis=2)
+        if self.num_classes == 2:
+            mask = (mask > 0).astype(np.uint8)
+        elif mask.max() >= self.num_classes:
+            raise ValueError(
+                f"Mask {path} contains label {int(mask.max())}, but num_classes={self.num_classes}."
+            )
+        return mask
+
+    def __getitem__(self, index):
+        image_path, mask_path = self.pairs[index]
+        image = Image.open(image_path).convert('RGB')
+        mask = Image.fromarray(self._read_mask(mask_path))
+        height, width = self.img_size
+        image = image.resize((width, height), Image.Resampling.BILINEAR)
+        mask = mask.resize((width, height), Image.Resampling.NEAREST)
+
+        image = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1) / 255.0
+        mask = torch.from_numpy(np.asarray(mask, dtype=np.int64).copy())
+
+        if self.augment:
+            if torch.rand(()) < 0.5:
+                image, mask = image.flip(-1), mask.flip(-1)
+            if torch.rand(()) < 0.5:
+                image, mask = image.flip(-2), mask.flip(-2)
+
+        mean = image.new_tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
+        std = image.new_tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
+        return (image - mean) / std, mask.long()
+
+
+def _compute_class_weights(pairs, num_classes):
+    counts = np.zeros(num_classes, dtype=np.float64)
+    for _, mask_path in tqdm(pairs, desc="Computing class weights"):
+        mask = np.asarray(Image.open(mask_path))
+        if mask.ndim == 3:
+            mask = mask.max(axis=2)
+        if num_classes == 2:
+            mask = (mask > 0).astype(np.int64)
+        valid = (mask >= 0) & (mask < num_classes)
+        counts += np.bincount(mask[valid].astype(np.int64), minlength=num_classes)
+    weights = counts.sum() / np.maximum(counts, 1.0)
+    weights /= weights.mean()
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def create_folder_dataloaders(image_dir, mask_dir, val_ratio, seed, batch_size,
+                              num_workers, img_size, num_classes,
+                              compute_class_weights=False):
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be between 0 and 1.")
+    pairs = build_image_mask_pairs(image_dir, mask_dir)
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(pairs), generator=generator).tolist()
+    val_count = max(1, min(len(pairs) - 1, round(len(pairs) * val_ratio)))
+    val_pairs = [pairs[i] for i in order[:val_count]]
+    train_pairs = [pairs[i] for i in order[val_count:]]
+
+    train_set = RoadFolderDataset(train_pairs, img_size, num_classes, augment=True)
+    val_set = RoadFolderDataset(val_pairs, img_size, num_classes, augment=False)
+    loader_args = dict(num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                       persistent_workers=num_workers > 0)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              drop_last=len(train_set) > batch_size, **loader_args)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
+                            drop_last=False, **loader_args)
+    weights = _compute_class_weights(train_pairs, num_classes) if compute_class_weights else None
+    print(f"Dataset: {len(pairs)} pairs | train={len(train_set)} | val={len(val_set)} "
+          f"| split_seed={seed}")
+    print(f"Example pair: {pairs[0][0].name} <-> {pairs[0][1].name}")
+    return train_loader, val_loader, weights
 
 
 # ============================================================
@@ -1054,10 +1192,15 @@ def main():
     parser.add_argument("--alpha_lr_factor",    type=float, default=0.1)
     parser.add_argument("--stem_lr_factor",     type=float, default=0.01)
     # Data
-    parser.add_argument("--train_txt",          required=True)
-    parser.add_argument("--val_txt",            required=True)
-    parser.add_argument("--dataset_type",       default="foggy", choices=["normal","foggy"])
-    parser.add_argument("--num_classes",        type=int, default=19)
+    parser.add_argument("--image_dir", type=str, default=(
+        "/kaggle/input/datasets/giangtunhng/space-net-segmentation/"
+        "CoANet_prepared_reference/train/images"))
+    parser.add_argument("--mask_dir", type=str, default=(
+        "/kaggle/input/datasets/giangtunhng/space-net-segmentation/"
+        "CoANet_prepared_reference/train/gt"))
+    parser.add_argument("--val_ratio", type=float, default=0.2,
+                        help="Deterministic validation fraction split from the paired folders")
+    parser.add_argument("--num_classes",        type=int, default=2)
     parser.add_argument("--ignore_index",       type=int, default=255)
     parser.add_argument("--use_class_weights",  action="store_true")
     parser.add_argument("--class_weights_file", type=str, default=None)
@@ -1155,12 +1298,12 @@ def main():
     )
 
     # DataLoaders
-    train_loader, val_loader, class_weights = create_dataloaders(
-        train_txt=args.train_txt, val_txt=args.val_txt,
+    train_loader, val_loader, class_weights = create_folder_dataloaders(
+        image_dir=args.image_dir, mask_dir=args.mask_dir,
+        val_ratio=args.val_ratio, seed=args.seed,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        img_size=(args.img_h, args.img_w), pin_memory=True,
-        compute_class_weights=args.use_class_weights,
-        dataset_type=args.dataset_type)
+        img_size=(args.img_h, args.img_w), num_classes=args.num_classes,
+        compute_class_weights=args.use_class_weights)
 
     if getattr(args, "class_weights_file", None):
         cw_path = Path(args.class_weights_file)
