@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
-from collections import defaultdict
+from collections import defaultdict, deque
 import math, gc, json, warnings
 import numpy as np
 from tqdm import tqdm
@@ -294,6 +294,7 @@ class DiagnosticLogger:
         print(f"\n{'─'*70}\n  EPOCH {epoch+1:>3} SUMMARY\n{'─'*70}")
         metrics = [
             ('val/miou',         'Val mIoU',        '.4f'),
+            ('val/miou_smooth',  'Val mIoU (smooth)','.4f'),
             ('val/accuracy',     'Val Accuracy',    '.4f'),
             ('val/loss',         'Val Loss',        '.4f'),
             ('train/ohem',       'Train OHEM',      '.4f'),
@@ -567,17 +568,85 @@ def build_optimizer(model, args):
         opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
         print("Optimizer: AdamW")
 
+    print(f"\n{SEP}\nOPTIMIZER PARAMETER GROUPS\n{SEP}")
     for g in groups:
         print(f"  '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
+    # [FIX] Safety warning: if backbone/stem LR is not actually reduced relative
+    # to head LR, training from scratch is prone to the large epoch-to-epoch
+    # mIoU oscillation seen in earlier runs (e.g. 0.62 -> 0.53 in one epoch).
+    head_lr = next((g['lr'] for g in groups if g['name'] == 'head'), args.lr)
+    for g in groups:
+        if g['name'] in ('backbone', 'stem') and g['lr'] >= 0.9 * head_lr:
+            print(f"  ⚠️  WARNING: '{g['name']}' LR ({g['lr']:.2e}) is not meaningfully "
+                  f"lower than head LR ({head_lr:.2e}). This is a common cause of "
+                  f"unstable/oscillating validation mIoU when training the backbone "
+                  f"from scratch. Consider --backbone_lr_factor < 1.0 and "
+                  f"--stem_lr_factor << 1.0.")
+    print(f"{SEP}\n")
     return opt
+
+
+class WarmupWrapper:
+    """Linear LR warmup applied before handing control to the base scheduler.
+
+    [FIX] Training from scratch with lr=3e-4 applied immediately to the whole
+    backbone is a common source of the large early-epoch gradient spikes and
+    mIoU oscillation seen in the logs (e.g. max grad 1.86 -> 0.54 -> 0.78 in
+    the first few epochs, mIoU dropping from 0.50 to 0.37 at epoch 4). A short
+    linear warmup smooths this out.
+    """
+
+    def __init__(self, optimizer, base_scheduler, warmup_epochs, warmup_start_factor=0.1):
+        self.optimizer = optimizer
+        self.base_scheduler = base_scheduler
+        self.warmup_epochs = max(0, warmup_epochs)
+        self.warmup_start_factor = warmup_start_factor
+        self.target_lrs = [g['lr'] for g in optimizer.param_groups]
+        self._epoch = 0
+        if self.warmup_epochs > 0:
+            self._set_lrs(self.warmup_start_factor)
+
+    def _set_lrs(self, factor):
+        for g, target in zip(self.optimizer.param_groups, self.target_lrs):
+            g['lr'] = target * factor
+
+    def step(self):
+        self._epoch += 1
+        if self._epoch <= self.warmup_epochs:
+            factor = self.warmup_start_factor + (1.0 - self.warmup_start_factor) * (
+                self._epoch / max(1, self.warmup_epochs)
+            )
+            self._set_lrs(factor)
+        else:
+            if self.base_scheduler is not None:
+                self.base_scheduler.step()
+
+    def state_dict(self):
+        return {
+            'epoch': self._epoch,
+            'base': self.base_scheduler.state_dict() if self.base_scheduler else None,
+        }
+
+    def load_state_dict(self, state):
+        if not state:
+            return
+        self._epoch = state.get('epoch', 0)
+        if self.base_scheduler is not None and state.get('base'):
+            try:
+                self.base_scheduler.load_state_dict(state['base'])
+            except Exception as e:
+                print(f"Warmup base scheduler not loaded: {e}")
 
 
 def build_scheduler(optimizer, args, train_loader, start_epoch=0):
     use_cosine = (args.freeze_backbone and args.unfreeze_schedule) or args.scheduler == 'cosine'
+    warmup_epochs = getattr(args, 'warmup_epochs', 0)
+    remaining_epochs = max(1, args.epochs - start_epoch - warmup_epochs)
+
     if use_cosine:
         sch = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs-start_epoch, eta_min=1e-6)
-        print("CosineAnnealingLR")
+            optimizer, T_max=remaining_epochs, eta_min=1e-6)
+        print(f"CosineAnnealingLR (T_max={remaining_epochs})")
     elif args.scheduler == 'onecycle':
         steps   = len(train_loader) * (args.epochs - start_epoch)
         max_lrs = [g['initial_lr'] for g in optimizer.param_groups]
@@ -596,6 +665,11 @@ def build_scheduler(optimizer, args, train_loader, start_epoch=0):
         sch = optim.lr_scheduler.LambdaLR(
             optimizer, lr_lambda=lambda e: (1 - e/args.epochs)**0.9)
         print("Polynomial LR")
+
+    if warmup_epochs > 0 and args.scheduler != 'onecycle':
+        print(f"Linear LR warmup: {warmup_epochs} epoch(s)")
+        return WarmupWrapper(optimizer, sch, warmup_epochs,
+                             warmup_start_factor=getattr(args, 'warmup_start_factor', 0.1))
     return sch
 
 
@@ -613,6 +687,15 @@ class OHEMLoss(nn.Module):
         self.thresh        = thresh
         self.class_weights = class_weights
         self.last_hard_ratio = 0.0
+        # [FIX] keep_ratio=1.0 silently disables OHEM entirely (no pixel is
+        # ever filtered out), which is what the previous run actually did
+        # despite intending to mine hard examples. Warn loudly so this is
+        # never silently misconfigured again.
+        if self.thresh is None and self.keep_ratio >= 0.95:
+            print(f"  ⚠️  WARNING: OHEMLoss.keep_ratio={self.keep_ratio} keeps ~100% of "
+                  f"pixels — this disables hard-example mining and behaves like plain "
+                  f"weighted CE. Use a lower keep_ratio (e.g. 0.3-0.5) or set "
+                  f"--ohem_thresh to actually mine hard pixels.")
 
     def forward(self, logits, labels):
         w = self.class_weights.to(logits.device) if self.class_weights is not None else None
@@ -671,6 +754,47 @@ class DiceLoss(nn.Module):
                 dtype=loss.dtype,
                 non_blocking=True,
             )
+            loss = loss * weights.unsqueeze(0)
+        present = tf.sum(2) > 0
+        return (loss * present.float()).sum(1).div(present.float().sum(1).clamp(1)).mean()
+
+
+class TverskyLoss(nn.Module):
+    """Tversky loss: generalizes Dice with independent FP/FN weights.
+
+    [NEW] For a thin, minority class like 'road' (~10-15% of pixels), plain
+    Dice/CE weight false positives and false negatives equally. Raising
+    `beta` (false-negative weight) relative to `alpha` (false-positive
+    weight) explicitly biases the loss towards recall, which is usually
+    what's missing when a road class plateaus around IoU~0.3 while the
+    background class is already >0.9.
+    """
+
+    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5, ignore_index=255,
+                 class_weights=None):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.register_buffer('class_weights', class_weights)
+
+    def forward(self, logits, targets):
+        logits = logits.float()
+        B, C, H, W = logits.shape
+        valid = targets != self.ignore_index
+        tgt_oh = F.one_hot(targets.clamp(0, C - 1), C).permute(0, 3, 1, 2).float() * valid.unsqueeze(1)
+        probs = F.softmax(logits, dim=1) * valid.unsqueeze(1)
+        pf, tf = probs.reshape(B, C, -1), tgt_oh.reshape(B, C, -1)
+
+        tp = (pf * tf).sum(2)
+        fp = (pf * (1 - tf)).sum(2)
+        fn = ((1 - pf) * tf).sum(2)
+
+        tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        loss = 1.0 - tversky
+        if self.class_weights is not None:
+            weights = self.class_weights.to(device=loss.device, dtype=loss.dtype, non_blocking=True)
             loss = loss * weights.unsqueeze(0)
         present = tf.sum(2) > 0
         return (loss * present.float()).sum(1).div(present.float().sum(1).clamp(1)).mean()
@@ -974,9 +1098,18 @@ class Trainer:
         self.device      = device
         self.args        = args
         self.best_miou   = 0.0
+        self.best_metric_value = 0.0
         self.start_epoch = 0
         self.global_step = 0
         self.diag        = diag
+
+        # [NEW] Smoothed / alternative best-checkpoint tracking.
+        # A single noisy epoch (val mIoU jumps of +/-0.08-0.15 are common in
+        # the previous run) can look like "the best model" while actually
+        # being a lucky/unlucky validation pass. Averaging over a small
+        # window makes checkpoint selection more robust.
+        self.miou_window = deque(maxlen=max(1, getattr(args, 'best_metric_window', 1)))
+        self.best_metric_class = getattr(args, 'best_metric_class', None)
 
         lcfg = args.loss_config
         self.ce_weight    = lcfg['ce_weight']
@@ -992,11 +1125,25 @@ class Trainer:
             thresh=getattr(args,'ohem_thresh',None),
             class_weights=class_weights)
 
-        self.dice = DiceLoss(
-            smooth=lcfg['dice_smooth'],
-            ignore_index=args.ignore_index,
-            class_weights=class_weights,
-        ).to(device)
+        loss_type = getattr(args, 'loss_type', 'dice')
+        if loss_type == 'tversky':
+            self.dice = TverskyLoss(
+                alpha=getattr(args, 'tversky_alpha', 0.3),
+                beta=getattr(args, 'tversky_beta', 0.7),
+                smooth=lcfg['dice_smooth'],
+                ignore_index=args.ignore_index,
+                class_weights=class_weights,
+            ).to(device)
+            print(f"Region loss: Tversky(alpha={getattr(args,'tversky_alpha',0.3)}, "
+                  f"beta={getattr(args,'tversky_beta',0.7)}) — biased towards recall")
+        else:
+            self.dice = DiceLoss(
+                smooth=lcfg['dice_smooth'],
+                ignore_index=args.ignore_index,
+                class_weights=class_weights,
+            ).to(device)
+            print("Region loss: Dice")
+
         _ls = getattr(args, 'label_smoothing', 0.0)
         self.ce = nn.CrossEntropyLoss(weight=cw, ignore_index=args.ignore_index,
                                       label_smoothing=_ls)
@@ -1025,14 +1172,14 @@ class Trainer:
         print(f"Effective batch:       {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision:       {self.args.use_amp}")
         print(f"Gradient clipping:     {self.args.grad_clip}")
-        print(f"Loss: CE({self.ce_weight}) + Dice({self.dice_weight})")
+        print(f"Loss: CE({self.ce_weight}) + Region({self.dice_weight})")
         print(f"{SEP}\n")
 
     def set_loss_phase(self, phase):
         if phase == self.loss_phase: return
         self.dice_weight = 0.0 if phase == 'ce_only' else self.base_loss_cfg['dice_weight']
         self.loss_phase  = phase
-        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight})")
+        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Region={self.dice_weight})")
 
     def train_epoch(self, loader, epoch):
         self.model.train()
@@ -1050,6 +1197,13 @@ class Trainer:
 
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = hard_ratio_acc = 0.0
+        # [FIX] `mg` used to only be defined inside the
+        # `if (batch_idx+1) % accumulation_steps == 0:` block below, but was
+        # referenced unconditionally in `pbar.set_postfix` every iteration.
+        # With accumulation_steps > 1 this raises a NameError on the very
+        # first batch. Initialize it up-front so the progress bar always has
+        # a valid (possibly stale, until the next optimizer step) value.
+        mg = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
@@ -1181,6 +1335,27 @@ class Trainer:
             self.diag.log(epoch, 'val/accuracy', result['accuracy'])
         return result
 
+    def compute_checkpoint_metric(self, val_metrics, epoch):
+        """[NEW] Decide what value drives 'is this the best checkpoint?'.
+
+        Two knobs, both optional and backward-compatible (default behaviour
+        is identical to before: raw val mIoU, single epoch):
+          --best_metric_window N : average the metric over the last N epochs
+                                    before comparing to the running best.
+          --best_metric_class I  : use per_class_iou[I] (e.g. the road class)
+                                    instead of mean IoU.
+        """
+        if self.best_metric_class is not None:
+            raw = float(val_metrics['per_class_iou'][self.best_metric_class])
+        else:
+            raw = val_metrics['miou']
+
+        self.miou_window.append(raw)
+        smoothed = float(np.mean(self.miou_window))
+        if self.diag:
+            self.diag.log(epoch, 'val/miou_smooth', smoothed)
+        return smoothed
+
     def save_checkpoint(self, epoch, metrics, is_best=False):
         ckpt = {
             'epoch': epoch, 'model': self.model.state_dict(),
@@ -1282,6 +1457,12 @@ def main():
     parser.add_argument("--dwsa_lr_factor",     type=float, default=0.5)
     parser.add_argument("--alpha_lr_factor",    type=float, default=0.1)
     parser.add_argument("--stem_lr_factor",     type=float, default=0.01)
+    # [NEW] LR warmup — mitigates the large early-epoch gradient spikes /
+    # mIoU oscillation seen when training the backbone from scratch.
+    parser.add_argument("--warmup_epochs",      type=int,   default=3,
+                        help="Linear LR warmup epochs before the main scheduler kicks in. 0 disables.")
+    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
+                        help="LR multiplier at the very start of warmup (fraction of target LR).")
     # Data
     parser.add_argument("--image_dir", type=str, default=(
         "/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/"
@@ -1309,6 +1490,15 @@ def main():
                         choices=["onecycle","poly","cosine","cosine_wr"])
     parser.add_argument("--cosine_wr_t0",       type=int,   default=10)
     # Loss
+    parser.add_argument("--loss_type",          type=str,   default="dice",
+                        choices=["dice", "tversky"],
+                        help="Region loss paired with OHEM/CE. 'tversky' lets you "
+                             "bias towards recall via --tversky_alpha/--tversky_beta, "
+                             "useful for thin minority classes like 'road'.")
+    parser.add_argument("--tversky_alpha",      type=float, default=0.3,
+                        help="False-positive weight for Tversky loss.")
+    parser.add_argument("--tversky_beta",       type=float, default=0.7,
+                        help="False-negative weight for Tversky loss (raise to favor recall).")
     parser.add_argument("--aux_weight",         type=float, default=0.4)
     parser.add_argument("--aux_decay_exp",      type=float, default=0.9)
     parser.add_argument("--dice_weight",        type=float, default=None)
@@ -1324,6 +1514,15 @@ def main():
     parser.add_argument("--reset_bn_stats",     action="store_true")
     parser.add_argument("--bn_warmup_epochs",   type=int,   default=3)
     parser.add_argument("--bn_warmup_momentum", type=float, default=0.3)
+    # [NEW] Checkpoint-selection robustness
+    parser.add_argument("--best_metric_window", type=int,   default=1,
+                        help="Average val metric over the last N epochs before "
+                             "deciding a new best checkpoint. 1 = old behaviour "
+                             "(single noisy epoch can trigger a save).")
+    parser.add_argument("--best_metric_class",  type=int,   default=None,
+                        help="If set, use per_class_iou[this_index] (e.g. the road "
+                             "class index) instead of mean IoU to select the best "
+                             "checkpoint.")
     # Misc
     parser.add_argument("--use_amp",            action="store_true", default=True)
     parser.add_argument("--num_workers",        type=int,   default=4)
@@ -1363,9 +1562,23 @@ def main():
         print(f"K1: BN Reset (warmup={args.bn_warmup_epochs} ep, mom={args.bn_warmup_momentum})")
     print(f"{SEP}\n")
 
-    # Import backbone
+    # Import backbone.
+    # [FIX] The original code only handled `model_variant == 'coming'` and
+    # left `Backbone` undefined for every other choice, which would raise a
+    # confusing `NameError` deep inside `Segmentor(Backbone(...), ...)`
+    # instead of a clear, actionable error at startup.
     if args.model_variant == 'coming':
         from modeling.backbone import CoMingNet as Backbone
+    else:
+        try:
+            from modeling.backbone import GCNet as Backbone
+        except ImportError as e:
+            raise ImportError(
+                f"--model_variant='{args.model_variant}' requires a GCNet-style "
+                f"backbone class (e.g. `GCNet`) in modeling/backbone.py, which "
+                f"could not be imported ({e}). Either add that class, or pass "
+                f"--model_variant coming to use CoMingNet."
+            ) from e
 
     cfg = ModelConfig.get_config(
         variant=args.model_variant,
@@ -1381,6 +1594,18 @@ def main():
         if args.num_classes == 2
         else [f'class_{index}' for index in range(args.num_classes)]
     )
+
+    if args.best_metric_class is not None and not (0 <= args.best_metric_class < args.num_classes):
+        raise ValueError(
+            f"--best_metric_class={args.best_metric_class} is out of range for "
+            f"num_classes={args.num_classes}."
+        )
+
+    # [FIX] `--class_weights_file` was silently ignored unless
+    # `--use_class_weights` was *also* passed, because Trainer only received
+    # weights when `args.use_class_weights` was true. Track the two sources
+    # separately and enable weighting if either is provided.
+    weights_requested = args.use_class_weights or bool(args.class_weights_file)
 
     # DataLoaders
     train_loader, val_loader, class_weights = create_folder_dataloaders(
@@ -1398,6 +1623,7 @@ def main():
                   f"(min={class_weights.min():.3f}, max={class_weights.max():.3f})")
         else:
             print(f"WARNING: {cw_path} not found"); class_weights = None
+            weights_requested = args.use_class_weights and class_weights is not None
 
     # Build model
     model = Segmentor(Backbone(**cfg["backbone"]),
@@ -1437,7 +1663,7 @@ def main():
     diag    = DiagnosticLogger(save_dir=save_path, class_names=class_names)
     trainer = Trainer(model=model, optimizer=optimizer, scheduler=scheduler,
                       device=device, args=args,
-                      class_weights=class_weights if args.use_class_weights else None,
+                      class_weights=class_weights if weights_requested else None,
                       diag=diag)
 
     if args.dice_weight is not None:
@@ -1542,10 +1768,23 @@ def main():
 
         diag.print_epoch_summary(epoch)
 
-        is_best = val_metrics['miou'] > trainer.best_miou
+        # [FIX] Checkpoint selection now optionally uses a smoothed metric
+        # and/or a specific class's IoU (e.g. road) instead of a single raw
+        # mIoU value, which was prone to picking an unlucky/lucky epoch —
+        # the earlier run's "best" epoch (33) beat epoch 20 by only 0.0017,
+        # well within normal epoch-to-epoch noise.
+        checkpoint_metric = trainer.compute_checkpoint_metric(val_metrics, epoch)
+        is_best = checkpoint_metric > trainer.best_metric_value
         if is_best:
+            trainer.best_metric_value = checkpoint_metric
             trainer.best_miou = val_metrics['miou']
-            print(f"  ★ NEW BEST mIoU: {trainer.best_miou:.4f}")
+            metric_name = (
+                f"{class_names[args.best_metric_class]} IoU"
+                if args.best_metric_class is not None else "mIoU"
+            )
+            window_note = f" (avg of last {len(trainer.miou_window)})" if args.best_metric_window > 1 else ""
+            print(f"  ★ NEW BEST {metric_name}{window_note}: {checkpoint_metric:.4f} "
+                  f"(raw epoch mIoU: {val_metrics['miou']:.4f})")
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
 
     diag.print_full_history()
