@@ -1140,7 +1140,6 @@ class Trainer:
                 'dice': f'{dice_loss.item():.4f}',
                 'lr':   f'{self.optimizer.param_groups[0]["lr"]:.2e}',
                 'hard%':f'{self.ohem.last_hard_ratio:.2f}',
-                'mg':   f'{mg:.2f}',
             })
             if batch_idx % 200 == 0: torch.cuda.empty_cache()
 
