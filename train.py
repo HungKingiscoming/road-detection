@@ -23,7 +23,7 @@ except Exception:
 
 SEP = "=" * 70
 
-from modeling.decoder.segmentation_head import GCNetHead
+from modeling.decoder import GCNetHead
 
 
 
