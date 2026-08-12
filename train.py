@@ -1274,13 +1274,7 @@ def main():
 
     # Import backbone
     if args.model_variant == 'coming':
-        from model.backbone.comingnet import CoMingNet as Backbone
-    elif args.model_variant == 'fan_dwsa':
-        from model.backbone.model import GCNet as Backbone
-    elif args.model_variant == 'fan_only':
-        from model.backbone.fan import GCNet as Backbone
-    else:
-        from model.backbone.dwsa import GCNet as Backbone
+        from model.backbone import CoMingNet as Backbone
 
     cfg = ModelConfig.get_config(
         variant=args.model_variant,
