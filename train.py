@@ -23,8 +23,8 @@ except Exception:
 
 SEP = "=" * 70
 
-from model.head.segmentation_head import GCNetHead
-from model.model_utils import init_weights, check_model_health
+from modeling.decoder import GCNetHead
+
 
 
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
