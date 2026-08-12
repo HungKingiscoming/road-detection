@@ -664,7 +664,14 @@ class DiceLoss(nn.Module):
         dice    = (2*inter + self.smooth) / (pf.sum(2) + tf.sum(2) + self.smooth)
         loss    = 1.0 - dice
         if self.class_weights is not None:
-            loss = loss * self.class_weights.float().unsqueeze(0)
+            # DiceLoss is not part of the segmentation model, so its registered
+            # buffer may still be on CPU while logits/loss are on CUDA.
+            weights = self.class_weights.to(
+                device=loss.device,
+                dtype=loss.dtype,
+                non_blocking=True,
+            )
+            loss = loss * weights.unsqueeze(0)
         present = tf.sum(2) > 0
         return (loss * present.float()).sum(1).div(present.float().sum(1).clamp(1)).mean()
 
@@ -985,9 +992,11 @@ class Trainer:
             thresh=getattr(args,'ohem_thresh',None),
             class_weights=class_weights)
 
-        self.dice = DiceLoss(smooth=lcfg['dice_smooth'],
-                             ignore_index=args.ignore_index,
-                             class_weights=class_weights)
+        self.dice = DiceLoss(
+            smooth=lcfg['dice_smooth'],
+            ignore_index=args.ignore_index,
+            class_weights=class_weights,
+        ).to(device)
         _ls = getattr(args, 'label_smoothing', 0.0)
         self.ce = nn.CrossEntropyLoss(weight=cw, ignore_index=args.ignore_index,
                                       label_smoothing=_ls)
