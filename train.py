@@ -1149,8 +1149,19 @@ class Trainer:
         # per-class counts as class_weights to counter road being the
         # minority class, without a separate hard-mining mechanism.
         pos_weight = None
+
         if class_weights is not None and len(class_weights) == 2:
-            pos_weight = (class_weights[1] / class_weights[0]).item()
+            raw_pos_weight = (
+                class_weights[1] / class_weights[0]
+            ).item()
+        
+            # Dùng căn bậc hai để tránh road class bị khuếch đại quá mạnh
+            pos_weight = min(math.sqrt(raw_pos_weight), 5.0)
+        
+            print(
+                f"Class imbalance: raw_pos_weight={raw_pos_weight:.4f}, "
+                f"used_pos_weight={pos_weight:.4f}"
+            )
         self.criterion = BCEDiceLoss(
             dice_weight=self.dice_weight,
             smooth=lcfg['dice_smooth'],
@@ -1245,15 +1256,37 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                mg = check_gradients(self.model, threshold=10.0)
+            
+                # Trả về total gradient norm trước clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=self.args.grad_clip,
+                    error_if_nonfinite=False,
+                )
+            
+                mg = float(grad_norm.detach().cpu())
+            
+                # Không cập nhật weight nếu gradient là NaN hoặc Inf
+                if not torch.isfinite(grad_norm):
+                    print(
+                        f"\n⚠️ Non-finite gradient at batch {batch_idx}. "
+                        "Skipping optimizer step."
+                    )
+            
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scaler.update()
+                    mg = 0.0
+                    continue
+            
                 max_grad_epoch = max(max_grad_epoch, mg)
-                if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+            
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
+            
                 self.global_step += 1
-                if self.scheduler and self.args.scheduler == 'onecycle':
+            
+                if self.scheduler and self.args.scheduler == "onecycle":
                     self.scheduler.step()
 
             total_loss += loss.item() * self.args.accumulation_steps
@@ -1533,7 +1566,11 @@ def main():
                              "class index) instead of mean IoU to select the best "
                              "checkpoint.")
     # Misc
-    parser.add_argument("--use_amp",            action="store_true", default=True)
+    parser.add_argument(
+        "--use_amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--num_workers",        type=int,   default=4)
     parser.add_argument("--save_dir",           default="./checkpoints")
     parser.add_argument("--resume",             type=str,   default=None)
@@ -1651,7 +1688,23 @@ def main():
                       GCNetHead(**cfg["head"], num_classes=args.num_classes,
                                 ignore_index=args.ignore_index)).to(device)
     model.apply(init_weights)
-
+    if args.model_variant == "coming":
+        try:
+            from modeling.backbone import CoMingBlock
+        except ImportError:
+            from backbone import CoMingBlock
+    
+        num_zero_initialized = 0
+    
+        for module in model.modules():
+            if isinstance(module, CoMingBlock):
+                module.zero_init_residual()
+                num_zero_initialized += 1
+    
+        print(
+            f"Zero-initialized residual branches: "
+            f"{num_zero_initialized} CoMingBlocks"
+        )
     transfer_ratio = None
     if args.pretrained_weights:
         transfer_ratio = load_pretrained_weights(
