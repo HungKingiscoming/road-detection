@@ -161,11 +161,33 @@ def build_image_mask_pairs(image_dir, mask_dir):
 
 
 class RoadFolderDataset(Dataset):
-    def __init__(self, pairs, img_size, num_classes=2, augment=False):
+    """Road segmentation dataset.
+
+    [FIX] Resizing a square source tile (Massachusetts Roads tiles are
+    1500x1500) to a non-square target (e.g. img_h=512, img_w=1024, as used
+    in one run) stretches every road by a *different* factor horizontally
+    vs. vertically. For a class defined almost entirely by shape (width,
+    curvature, connectivity) that distortion actively hurts learning —
+    worse than plain downsampling. When `crop_size` is given, we instead
+    resize so the short side matches `crop_size` (aspect-ratio preserving)
+    and crop a square patch, so road geometry is never stretched.
+
+    [NEW] `road_oversample_tries`: plain random cropping on this dataset
+    would draw mostly pure-background patches, since roads are a thin,
+    sparse minority class. When training, we sample up to
+    `road_oversample_tries` candidate crop locations and keep the one with
+    the most road pixels, biasing training batches towards patches that
+    actually contain road to learn from.
+    """
+
+    def __init__(self, pairs, img_size, num_classes=2, augment=False,
+                 crop_size=None, road_oversample_tries=0):
         self.pairs = list(pairs)
-        self.img_size = tuple(img_size)  # (height, width)
+        self.img_size = tuple(img_size)  # (height, width), used only if crop_size is None
         self.num_classes = num_classes
         self.augment = augment
+        self.crop_size = crop_size
+        self.road_oversample_tries = road_oversample_tries if augment else 0
 
     def __len__(self):
         return len(self.pairs)
@@ -182,13 +204,50 @@ class RoadFolderDataset(Dataset):
             )
         return mask
 
+    def _resize_short_side(self, image, mask, target):
+        w, h = image.size
+        scale = target / min(w, h)
+        new_w, new_h = max(target, round(w * scale)), max(target, round(h * scale))
+        image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        mask = mask.resize((new_w, new_h), Image.Resampling.NEAREST)
+        return image, mask
+
+    def _crop(self, image, mask, x, y, size):
+        box = (x, y, x + size, y + size)
+        return image.crop(box), mask.crop(box)
+
+    def _road_aware_random_crop(self, image, mask, size):
+        w, h = image.size
+        max_x, max_y = max(0, w - size), max(0, h - size)
+        best = None
+        for _ in range(max(1, self.road_oversample_tries)):
+            x = int(torch.randint(0, max_x + 1, (1,)).item())
+            y = int(torch.randint(0, max_y + 1, (1,)).item())
+            road_px = int((np.asarray(mask)[y:y + size, x:x + size] > 0).sum())
+            if best is None or road_px > best[0]:
+                best = (road_px, x, y)
+            if road_px > 0:
+                break
+        _, x, y = best
+        return self._crop(image, mask, x, y, size)
+
     def __getitem__(self, index):
         image_path, mask_path = self.pairs[index]
         image = Image.open(image_path).convert('RGB')
         mask = Image.fromarray(self._read_mask(mask_path))
-        height, width = self.img_size
-        image = image.resize((width, height), Image.Resampling.BILINEAR)
-        mask = mask.resize((width, height), Image.Resampling.NEAREST)
+
+        if self.crop_size:
+            image, mask = self._resize_short_side(image, mask, self.crop_size)
+            if self.augment:
+                image, mask = self._road_aware_random_crop(image, mask, self.crop_size)
+            else:
+                w, h = image.size
+                x, y = (w - self.crop_size) // 2, (h - self.crop_size) // 2
+                image, mask = self._crop(image, mask, x, y, self.crop_size)
+        else:
+            height, width = self.img_size
+            image = image.resize((width, height), Image.Resampling.BILINEAR)
+            mask = mask.resize((width, height), Image.Resampling.NEAREST)
 
         image = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1) / 255.0
         mask = torch.from_numpy(np.asarray(mask, dtype=np.int64).copy())
@@ -198,6 +257,13 @@ class RoadFolderDataset(Dataset):
                 image, mask = image.flip(-1), mask.flip(-1)
             if torch.rand(()) < 0.5:
                 image, mask = image.flip(-2), mask.flip(-2)
+            # [NEW] 90-degree rotations: roads run in every direction in
+            # aerial imagery and this augmentation is "free" (no
+            # interpolation blur/artifacts unlike arbitrary-angle rotation).
+            k = int(torch.randint(0, 4, (1,)).item())
+            if k > 0:
+                image = torch.rot90(image, k, dims=(-2, -1))
+                mask = torch.rot90(mask, k, dims=(-2, -1))
 
         mean = image.new_tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
         std = image.new_tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
@@ -221,7 +287,8 @@ def _compute_class_weights(pairs, num_classes):
 
 def create_folder_dataloaders(image_dir, mask_dir, val_ratio, seed, batch_size,
                               num_workers, img_size, num_classes,
-                              compute_class_weights=False):
+                              compute_class_weights=False,
+                              crop_size=None, road_oversample_tries=4):
     if not 0.0 < val_ratio < 1.0:
         raise ValueError("val_ratio must be between 0 and 1.")
     pairs = build_image_mask_pairs(image_dir, mask_dir)
@@ -231,8 +298,21 @@ def create_folder_dataloaders(image_dir, mask_dir, val_ratio, seed, batch_size,
     val_pairs = [pairs[i] for i in order[:val_count]]
     train_pairs = [pairs[i] for i in order[val_count:]]
 
-    train_set = RoadFolderDataset(train_pairs, img_size, num_classes, augment=True)
-    val_set = RoadFolderDataset(val_pairs, img_size, num_classes, augment=False)
+    # [FIX] Warn loudly about aspect-ratio-distorting resize, which silently
+    # stretches road width/curvature and is easy to miss (it trained
+    # "successfully", just worse — no error, no crash).
+    if not crop_size and img_size[0] != img_size[1]:
+        print(f"  ⚠️  WARNING: img_size={img_size} is non-square while source "
+              f"tiles are square. Resizing directly to a non-square target "
+              f"stretches roads by different factors horizontally vs. "
+              f"vertically, distorting the exact shape info the model needs "
+              f"for a thin, curved class like 'road'. Prefer --crop_size "
+              f"(aspect-preserving square crop) or a square img_h/img_w.")
+
+    train_set = RoadFolderDataset(train_pairs, img_size, num_classes, augment=True,
+                                  crop_size=crop_size, road_oversample_tries=road_oversample_tries)
+    val_set = RoadFolderDataset(val_pairs, img_size, num_classes, augment=False,
+                                crop_size=crop_size)
     loader_args = dict(num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                        persistent_workers=num_workers > 0)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
@@ -297,7 +377,7 @@ class DiagnosticLogger:
             ('val/miou_smooth',  'Val mIoU (smooth)','.4f'),
             ('val/accuracy',     'Val Accuracy',    '.4f'),
             ('val/loss',         'Val Loss',        '.4f'),
-            ('train/ohem',       'Train OHEM',      '.4f'),
+            ('train/bce',        'Train BCE',       '.4f'),
             ('train/dice',       'Train Dice',      '.4f'),
             ('train/max_grad',   'Max Gradient',    '.3f'),
             ('dwsa/gamma4',      'DWSA gamma4',     '.4f'),
@@ -305,7 +385,6 @@ class DiagnosticLogger:
             ('dwsa/gamma6',      'DWSA gamma6',     '.4f'),
             ('fan/alpha1_mean',  'FAN alpha1',      '.4f'),
             ('fan/alpha2_mean',  'FAN alpha2',      '.4f'),
-            ('train/hard_ratio', 'OHEM hard ratio', '.3f'),
         ]
         print(f"  {'Metric':<24}  {'Value':>10}  {'Trend':>12}")
         print(f"  {'─'*24}  {'─'*10}  {'─'*12}")
@@ -333,7 +412,7 @@ class DiagnosticLogger:
                 last10 = [v for _, v in miou_hist[-10:]]
                 spread = max(last10) - min(last10)
                 print(f"  Last-10 spread: {spread:.4f} {'← PLATEAU' if spread<0.003 else ''}")
-        print(f"\n  Epoch │ mIoU   │ OHEM   │ Dice   │ gamma4 │ gamma5 │ hard%")
+        print(f"\n  Epoch │ mIoU   │ BCE    │ Dice   │ gamma4 │ gamma5")
         print(f"  {'─'*65}")
         n = max((len(v) for v in self.history.values()), default=0)
         best_miou = max((v for _, v in self.history.get('val/miou', [(0,0)])), default=0)
@@ -343,9 +422,9 @@ class DiagnosticLogger:
                 return h[i][1] if i < len(h) else float('nan')
             miou = _g('val/miou')
             mark = ' ← BEST' if not math.isnan(miou) and miou == best_miou else ''
-            print(f"  {i+1:>5} │ {miou:.4f} │ {_g('train/ohem'):.4f} │ "
+            print(f"  {i+1:>5} │ {miou:.4f} │ {_g('train/bce'):.4f} │ "
                   f"{_g('train/dice'):.4f} │ {_g('dwsa/gamma4'):.4f} │ "
-                  f"{_g('dwsa/gamma5'):.4f} │ {_g('train/hard_ratio'):.3f}{mark}")
+                  f"{_g('dwsa/gamma5'):.4f}{mark}")
         print(f"{'='*70}\n")
 
     def close(self): self._f.close()
@@ -571,17 +650,38 @@ def build_optimizer(model, args):
     print(f"\n{SEP}\nOPTIMIZER PARAMETER GROUPS\n{SEP}")
     for g in groups:
         print(f"  '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
-    # [FIX] Safety warning: if backbone/stem LR is not actually reduced relative
-    # to head LR, training from scratch is prone to the large epoch-to-epoch
-    # mIoU oscillation seen in earlier runs (e.g. 0.62 -> 0.53 in one epoch).
+
+    # [FIX] The right advice here depends on whether the backbone starts
+    # from pretrained weights or from scratch — a fixed rule of thumb was
+    # wrong for one of those two cases and gave bad guidance in an earlier
+    # run. Discounting backbone/stem LR (small --*_lr_factor) is the right
+    # move when finetuning a *pretrained* backbone (protects good features
+    # from being overwritten by a freshly-initialized head). It is the
+    # *wrong* move when training everything from scratch (as CoMingNet is
+    # here, with no --pretrained_weights): the backbone then needs to learn
+    # its features at a comparable rate to the head, or it lags badly and
+    # caps achievable IoU (observed: --backbone_lr_factor 0.1 --stem_lr_factor
+    # 0.01 from scratch capped road IoU well below a from-scratch run with
+    # equal LR across groups).
+    is_finetune = bool(getattr(args, 'pretrained_weights', None))
     head_lr = next((g['lr'] for g in groups if g['name'] == 'head'), args.lr)
     for g in groups:
-        if g['name'] in ('backbone', 'stem') and g['lr'] >= 0.9 * head_lr:
+        if g['name'] not in ('backbone', 'stem'):
+            continue
+        ratio = g['lr'] / head_lr if head_lr else 1.0
+        if is_finetune and ratio >= 0.9:
             print(f"  ⚠️  WARNING: '{g['name']}' LR ({g['lr']:.2e}) is not meaningfully "
-                  f"lower than head LR ({head_lr:.2e}). This is a common cause of "
-                  f"unstable/oscillating validation mIoU when training the backbone "
-                  f"from scratch. Consider --backbone_lr_factor < 1.0 and "
-                  f"--stem_lr_factor << 1.0.")
+                  f"lower than head LR ({head_lr:.2e}) while finetuning pretrained "
+                  f"weights (--pretrained_weights set). This risks overwriting good "
+                  f"pretrained features with noisy head gradients early on. Consider "
+                  f"--{g['name']}_lr_factor < 1.0.")
+        elif not is_finetune and ratio <= 0.05:
+            print(f"  ⚠️  WARNING: '{g['name']}' LR ({g['lr']:.2e}) is {ratio:.3f}x the "
+                  f"head LR while training from scratch (no --pretrained_weights). A "
+                  f"randomly-initialized backbone needs to learn features at a "
+                  f"comparable rate to the head, or it becomes a bottleneck that caps "
+                  f"achievable IoU. Consider raising --{g['name']}_lr_factor towards "
+                  f"0.5-1.0 for from-scratch training.")
     print(f"{SEP}\n")
     return opt
 
@@ -677,127 +777,55 @@ def build_scheduler(optimizer, args, train_loader, start_epoch=0):
 # LOSS FUNCTIONS
 # ============================================================
 
-class OHEMLoss(nn.Module):
-    def __init__(self, ignore_index=255, keep_ratio=0.3,
-                 min_kept=100000, thresh=None, class_weights=None):
-        super().__init__()
-        self.ignore_index  = ignore_index
-        self.keep_ratio    = keep_ratio
-        self.min_kept      = min_kept
-        self.thresh        = thresh
-        self.class_weights = class_weights
-        self.last_hard_ratio = 0.0
-        # [FIX] keep_ratio=1.0 silently disables OHEM entirely (no pixel is
-        # ever filtered out), which is what the previous run actually did
-        # despite intending to mine hard examples. Warn loudly so this is
-        # never silently misconfigured again.
-        if self.thresh is None and self.keep_ratio >= 0.95:
-            print(f"  ⚠️  WARNING: OHEMLoss.keep_ratio={self.keep_ratio} keeps ~100% of "
-                  f"pixels — this disables hard-example mining and behaves like plain "
-                  f"weighted CE. Use a lower keep_ratio (e.g. 0.3-0.5) or set "
-                  f"--ohem_thresh to actually mine hard pixels.")
+class BCEDiceLoss(nn.Module):
+    """Binary Cross-Entropy + Dice — simple, standard combo for binary
+    (background/road) segmentation. No hard-example mining, no
+    Tversky/clDice knobs: two terms, easy to reason about while the model
+    architecture itself is being iterated on.
 
-    def forward(self, logits, labels):
-        w = self.class_weights.to(logits.device) if self.class_weights is not None else None
-        loss_px = F.cross_entropy(logits.float(), labels,
-                                  weight=w.float() if w is not None else None,
-                                  ignore_index=self.ignore_index,
-                                  reduction='none').view(-1)
-        valid = labels.view(-1) != self.ignore_index
-        loss_px = loss_px[valid]
-        n = loss_px.numel()
-        if n == 0:
-            self.last_hard_ratio = 0.0
-            return logits.sum() * 0
+    Works directly on the model's 2-channel logits (road_logit =
+    logits[:,1] - logits[:,0] is exactly the binary logit a 2-class softmax
+    implies, so this is a drop-in replacement for CE on a 2-class head).
 
-        if self.thresh is not None:
-            with torch.no_grad():
-                probs     = torch.softmax(logits.detach().float(), dim=1).max(1)[0].view(-1)[valid]
-                hard_mask = probs < self.thresh
-                if hard_mask.sum() < self.min_kept:
-                    _, idx = torch.topk(probs, min(self.min_kept, n), largest=False)
-                    hard_mask = torch.zeros(n, dtype=torch.bool, device=logits.device)
-                    hard_mask[idx] = True
-            self.last_hard_ratio = hard_mask.float().mean().item()
-            loss_px = loss_px[hard_mask]
-        else:
-            n_keep = min(max(int(self.keep_ratio * n), min(self.min_kept, n)), n)
-            self.last_hard_ratio = n_keep / n
-            if n_keep < n:
-                thr     = torch.sort(loss_px, descending=True)[0][n_keep-1].detach()
-                loss_px = loss_px[loss_px >= thr]
-        return loss_px.mean()
-
-
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, ignore_index=255, class_weights=None):
-        super().__init__()
-        self.smooth       = smooth
-        self.ignore_index = ignore_index
-        self.register_buffer('class_weights', class_weights)
-
-    def forward(self, logits, targets):
-        logits = logits.float()
-        B, C, H, W = logits.shape
-        valid   = targets != self.ignore_index
-        tgt_oh  = F.one_hot(targets.clamp(0,C-1), C).permute(0,3,1,2).float() * valid.unsqueeze(1)
-        probs   = F.softmax(logits, dim=1) * valid.unsqueeze(1)
-        pf, tf  = probs.reshape(B,C,-1), tgt_oh.reshape(B,C,-1)
-        inter   = (pf * tf).sum(2)
-        dice    = (2*inter + self.smooth) / (pf.sum(2) + tf.sum(2) + self.smooth)
-        loss    = 1.0 - dice
-        if self.class_weights is not None:
-            # DiceLoss is not part of the segmentation model, so its registered
-            # buffer may still be on CPU while logits/loss are on CUDA.
-            weights = self.class_weights.to(
-                device=loss.device,
-                dtype=loss.dtype,
-                non_blocking=True,
-            )
-            loss = loss * weights.unsqueeze(0)
-        present = tf.sum(2) > 0
-        return (loss * present.float()).sum(1).div(present.float().sum(1).clamp(1)).mean()
-
-
-class TverskyLoss(nn.Module):
-    """Tversky loss: generalizes Dice with independent FP/FN weights.
-
-    [NEW] For a thin, minority class like 'road' (~10-15% of pixels), plain
-    Dice/CE weight false positives and false negatives equally. Raising
-    `beta` (false-negative weight) relative to `alpha` (false-positive
-    weight) explicitly biases the loss towards recall, which is usually
-    what's missing when a road class plateaus around IoU~0.3 while the
-    background class is already >0.9.
+    `pos_weight` (optional) up-weights the positive/road class in the BCE
+    term — pass `neg_count / pos_count` to counter class imbalance, e.g.
+    derived from the same per-class counts used elsewhere for class_weights.
     """
 
-    def __init__(self, alpha=0.3, beta=0.7, smooth=1e-5, ignore_index=255,
-                 class_weights=None):
+    def __init__(self, dice_weight=0.5, smooth=1e-5, ignore_index=255,
+                 pos_weight=None, road_class=1):
         super().__init__()
-        self.alpha = alpha
-        self.beta = beta
+        self.dice_weight = dice_weight
         self.smooth = smooth
         self.ignore_index = ignore_index
-        self.register_buffer('class_weights', class_weights)
+        self.road_class = road_class
+        pw = torch.tensor(float(pos_weight)) if pos_weight is not None else None
+        self.register_buffer('pos_weight', pw)
 
     def forward(self, logits, targets):
         logits = logits.float()
-        B, C, H, W = logits.shape
-        valid = targets != self.ignore_index
-        tgt_oh = F.one_hot(targets.clamp(0, C - 1), C).permute(0, 3, 1, 2).float() * valid.unsqueeze(1)
-        probs = F.softmax(logits, dim=1) * valid.unsqueeze(1)
-        pf, tf = probs.reshape(B, C, -1), tgt_oh.reshape(B, C, -1)
+        valid = (targets != self.ignore_index).float()
+        target_bin = (targets == self.road_class).float()
 
-        tp = (pf * tf).sum(2)
-        fp = (pf * (1 - tf)).sum(2)
-        fn = ((1 - pf) * tf).sum(2)
+        road_logit = logits[:, self.road_class] - logits[:, 1 - self.road_class]
 
-        tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        loss = 1.0 - tversky
-        if self.class_weights is not None:
-            weights = self.class_weights.to(device=loss.device, dtype=loss.dtype, non_blocking=True)
-            loss = loss * weights.unsqueeze(0)
-        present = tf.sum(2) > 0
-        return (loss * present.float()).sum(1).div(present.float().sum(1).clamp(1)).mean()
+        pos_weight = self.pos_weight.to(device=logits.device, dtype=logits.dtype) \
+            if self.pos_weight is not None else None
+        bce_px = F.binary_cross_entropy_with_logits(
+            road_logit, target_bin, pos_weight=pos_weight, reduction='none')
+        bce = (bce_px * valid).sum() / valid.sum().clamp(min=1)
+
+        prob = torch.sigmoid(road_logit) * valid
+        tgt = target_bin * valid
+        inter = (prob * tgt).sum(dim=(1, 2))
+        denom = prob.sum(dim=(1, 2)) + tgt.sum(dim=(1, 2))
+        dice = (2 * inter + self.smooth) / (denom + self.smooth)
+        dice_loss = 1.0 - dice.mean()
+
+        total = bce + self.dice_weight * dice_loss
+        return total, bce.detach(), dice_loss.detach()
+
+
 
 
 # ============================================================
@@ -1040,7 +1068,6 @@ class ModelConfig:
                     "act_cfg": dict(type='ReLU', inplace=True),
                 },
                 "loss": {
-                    "ce_weight": 1.0,
                     "dice_weight": 0.5,
                     "dice_smooth": 1e-5,
                 },
@@ -1064,7 +1091,7 @@ class ModelConfig:
                 "norm_cfg": dict(type='BN', requires_grad=True),
                 "act_cfg":  dict(type='ReLU', inplace=True),
             },
-            "loss": {"ce_weight": 1.0, "dice_weight": 0.5, "dice_smooth": 1e-5},
+            "loss": {"dice_weight": 0.5, "dice_smooth": 1e-5},
         }
 
 
@@ -1112,41 +1139,27 @@ class Trainer:
         self.best_metric_class = getattr(args, 'best_metric_class', None)
 
         lcfg = args.loss_config
-        self.ce_weight    = lcfg['ce_weight']
         self.dice_weight  = lcfg['dice_weight']
         self.base_loss_cfg = lcfg
         self.loss_phase   = 'full'
 
-        cw = class_weights.to(device) if class_weights is not None else None
-        self.ohem = OHEMLoss(
+        # [SIMPLIFIED] Single BCE + Dice loss, no OHEM/Tversky/clDice —
+        # fewer moving parts while the model architecture is being
+        # iterated on. pos_weight (neg/pos pixel ratio) reuses the same
+        # per-class counts as class_weights to counter road being the
+        # minority class, without a separate hard-mining mechanism.
+        pos_weight = None
+        if class_weights is not None and len(class_weights) == 2:
+            pos_weight = (class_weights[1] / class_weights[0]).item()
+        self.criterion = BCEDiceLoss(
+            dice_weight=self.dice_weight,
+            smooth=lcfg['dice_smooth'],
             ignore_index=args.ignore_index,
-            keep_ratio=getattr(args,'ohem_keep_ratio',0.3),
-            min_kept=getattr(args,'ohem_min_kept',100000),
-            thresh=getattr(args,'ohem_thresh',None),
-            class_weights=class_weights)
-
-        loss_type = getattr(args, 'loss_type', 'dice')
-        if loss_type == 'tversky':
-            self.dice = TverskyLoss(
-                alpha=getattr(args, 'tversky_alpha', 0.3),
-                beta=getattr(args, 'tversky_beta', 0.7),
-                smooth=lcfg['dice_smooth'],
-                ignore_index=args.ignore_index,
-                class_weights=class_weights,
-            ).to(device)
-            print(f"Region loss: Tversky(alpha={getattr(args,'tversky_alpha',0.3)}, "
-                  f"beta={getattr(args,'tversky_beta',0.7)}) — biased towards recall")
-        else:
-            self.dice = DiceLoss(
-                smooth=lcfg['dice_smooth'],
-                ignore_index=args.ignore_index,
-                class_weights=class_weights,
-            ).to(device)
-            print("Region loss: Dice")
-
-        _ls = getattr(args, 'label_smoothing', 0.0)
-        self.ce = nn.CrossEntropyLoss(weight=cw, ignore_index=args.ignore_index,
-                                      label_smoothing=_ls)
+            pos_weight=pos_weight,
+            road_class=getattr(args, 'road_class', 1),
+        ).to(device)
+        print(f"Loss: BCE + Dice({self.dice_weight})"
+              + (f", pos_weight={pos_weight:.3f}" if pos_weight is not None else ""))
 
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
@@ -1154,12 +1167,6 @@ class Trainer:
         self.writer   = _make_writer(self.save_dir / "tensorboard")
         self._save_config()
         self._print_config()
-
-        ohem_mode = (f"threshold-based (thresh={getattr(args,'ohem_thresh',None)})"
-                     if getattr(args,'ohem_thresh',None)
-                     else f"ratio-based (keep_ratio={getattr(args,'ohem_keep_ratio',0.3)})")
-        print(f"OHEM: {ohem_mode}")
-        if _ls > 0: print(f"Label smoothing: {_ls}")
 
     def _save_config(self):
         with open(self.save_dir / "config.json", "w") as f:
@@ -1172,14 +1179,15 @@ class Trainer:
         print(f"Effective batch:       {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision:       {self.args.use_amp}")
         print(f"Gradient clipping:     {self.args.grad_clip}")
-        print(f"Loss: CE({self.ce_weight}) + Region({self.dice_weight})")
+        print(f"Loss: BCE + Dice({self.dice_weight})")
         print(f"{SEP}\n")
 
     def set_loss_phase(self, phase):
         if phase == self.loss_phase: return
         self.dice_weight = 0.0 if phase == 'ce_only' else self.base_loss_cfg['dice_weight']
+        self.criterion.dice_weight = self.dice_weight
         self.loss_phase  = phase
-        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Region={self.dice_weight})")
+        print(f"Loss phase → {phase}  (BCE + Dice={self.dice_weight})")
 
     def train_epoch(self, loader, epoch):
         self.model.train()
@@ -1195,8 +1203,8 @@ class Trainer:
         if getattr(self.args, "freeze_stem_conv", False):
             freeze_stem_only(self.model, self.args.model_variant, verbose=False)
 
-        total_loss = total_ohem = total_dice = 0.0
-        max_grad_epoch = hard_ratio_acc = 0.0
+        total_loss = total_bce = total_dice = 0.0
+        max_grad_epoch = 0.0
         # [FIX] `mg` used to only be defined inside the
         # `if (batch_idx+1) % accumulation_steps == 0:` block below, but was
         # referenced unconditionally in `pbar.set_postfix` every iteration.
@@ -1219,23 +1227,13 @@ class Trainer:
                 c6_full = F.interpolate(c6_logit, size=target_size,
                                         mode='bilinear', align_corners=False)
 
-                ohem_loss = self.ohem(c6_full, masks)
-
-                if self.dice_weight > 0:
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=c6_logit.shape[-2:], mode='nearest'
-                    ).squeeze(1).long()
-                    dice_loss = self.dice(c6_logit, masks_small)
-                else:
-                    dice_loss = torch.tensor(0.0, device=self.device)
-
-                task_loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
+                task_loss, bce_loss, dice_loss = self.criterion(c6_full, masks)
 
                 if self.args.aux_weight > 0:
                     aux_decay = getattr(self.args, 'aux_decay_exp', 0.9)
                     aux_w     = self.args.aux_weight * (1 - epoch / self.args.epochs) ** aux_decay
-                    task_loss = task_loss + aux_w * self.ohem(c4_full, masks)
+                    aux_loss, _, _ = self.criterion(c4_full, masks)
+                    task_loss = task_loss + aux_w * aux_loss
 
                 loss = task_loss / self.args.accumulation_steps
 
@@ -1258,32 +1256,28 @@ class Trainer:
                 if self.scheduler and self.args.scheduler == 'onecycle':
                     self.scheduler.step()
 
-            total_loss  += loss.item() * self.args.accumulation_steps
-            total_ohem  += ohem_loss.item()
-            total_dice  += dice_loss.item()
-            hard_ratio_acc += self.ohem.last_hard_ratio
+            total_loss += loss.item() * self.args.accumulation_steps
+            total_bce  += bce_loss.item()
+            total_dice += dice_loss.item()
 
             pbar.set_postfix({
                 'loss': f'{loss.item()*self.args.accumulation_steps:.4f}',
-                'ohem': f'{ohem_loss.item():.4f}',
+                'bce':  f'{bce_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
                 'lr':   f'{self.optimizer.param_groups[0]["lr"]:.2e}',
-                'hard%':f'{self.ohem.last_hard_ratio:.2f}',
                 'mg':   f'{mg:.2f}',
             })
             if batch_idx % 200 == 0: torch.cuda.empty_cache()
 
         n = len(loader)
-        avg_hr = hard_ratio_acc / n
-        print(f"\nEpoch {epoch+1} — Max grad: {max_grad_epoch:.2f}  |  Hard%: {avg_hr:.3f}")
+        print(f"\nEpoch {epoch+1} — Max grad: {max_grad_epoch:.2f}")
         print(f"  LR head={self.optimizer.param_groups[0]['lr']:.2e}")
 
         torch.cuda.empty_cache()
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
 
-        result = {'loss': total_loss/n, 'ohem': total_ohem/n,
-                  'dice': total_dice/n, 'hard_ratio': avg_hr}
+        result = {'loss': total_loss/n, 'bce': total_bce/n, 'dice': total_dice/n}
         if self.diag:
             self.diag.log_dict(epoch, result, prefix='train/')
             self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
@@ -1307,7 +1301,7 @@ class Trainer:
                 logits = self.model(imgs)
                 logits = F.interpolate(logits, size=masks.shape[-2:],
                                        mode='bilinear', align_corners=False)
-                loss   = self.ce(logits, masks)
+                loss, _, _ = self.criterion(logits, masks)
 
             total_loss += loss.item()
             pred   = logits.argmax(1).cpu().numpy()
@@ -1453,10 +1447,22 @@ def main():
     parser.add_argument("--freeze_stem_conv",   action="store_true")
     parser.add_argument("--freeze_spp_bn",      action="store_true")
     # LR factors
-    parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
+    # [FIX] Previous defaults (0.1 / 0.01) assumed a *pretrained* backbone
+    # being finetuned. CoMingNet here trains from scratch by default (no
+    # --pretrained_weights), where discounting backbone/stem LR this hard
+    # starves the backbone and caps achievable road IoU (confirmed: a
+    # from-scratch run using these old defaults topped out at road IoU
+    # 0.23 vs. ~0.30 with equal LR across groups). New defaults keep
+    # backbone/stem close to the head LR; explicitly lower them via these
+    # flags only when passing --pretrained_weights.
+    parser.add_argument("--backbone_lr_factor", type=float, default=1.0,
+                        help="Backbone LR = lr * this. Use ~0.1 only when finetuning "
+                             "--pretrained_weights; keep near 1.0 for from-scratch training.")
     parser.add_argument("--dwsa_lr_factor",     type=float, default=0.5)
     parser.add_argument("--alpha_lr_factor",    type=float, default=0.1)
-    parser.add_argument("--stem_lr_factor",     type=float, default=0.01)
+    parser.add_argument("--stem_lr_factor",     type=float, default=1.0,
+                        help="Stem LR = lr * this. Use ~0.01 only when finetuning "
+                             "--pretrained_weights; keep near 1.0 for from-scratch training.")
     # [NEW] LR warmup — mitigates the large early-epoch gradient spikes /
     # mIoU oscillation seen when training the backbone from scratch.
     parser.add_argument("--warmup_epochs",      type=int,   default=3,
@@ -1490,26 +1496,29 @@ def main():
                         choices=["onecycle","poly","cosine","cosine_wr"])
     parser.add_argument("--cosine_wr_t0",       type=int,   default=10)
     # Loss
-    parser.add_argument("--loss_type",          type=str,   default="dice",
-                        choices=["dice", "tversky"],
-                        help="Region loss paired with OHEM/CE. 'tversky' lets you "
-                             "bias towards recall via --tversky_alpha/--tversky_beta, "
-                             "useful for thin minority classes like 'road'.")
-    parser.add_argument("--tversky_alpha",      type=float, default=0.3,
-                        help="False-positive weight for Tversky loss.")
-    parser.add_argument("--tversky_beta",       type=float, default=0.7,
-                        help="False-negative weight for Tversky loss (raise to favor recall).")
+    # [SIMPLIFIED] BCE + Dice only — OHEM/Tversky/clDice removed to keep the
+    # loss surface simple while the model architecture is being iterated on.
     parser.add_argument("--aux_weight",         type=float, default=0.4)
     parser.add_argument("--aux_decay_exp",      type=float, default=0.9)
-    parser.add_argument("--dice_weight",        type=float, default=None)
-    parser.add_argument("--ce_weight",          type=float, default=None)
+    parser.add_argument("--dice_weight",        type=float, default=0.5,
+                        help="Weight of the Dice term added to BCE.")
     parser.add_argument("--label_smoothing",    type=float, default=0.0)
-    parser.add_argument("--ohem_keep_ratio",    type=float, default=0.3)
-    parser.add_argument("--ohem_min_kept",      type=int,   default=100000)
-    parser.add_argument("--ohem_thresh",        type=float, default=None)
     # Resolution
     parser.add_argument("--img_h",              type=int,   default=512)
-    parser.add_argument("--img_w",              type=int,   default=1024)
+    parser.add_argument("--img_w",              type=int,   default=512,
+                        help="[FIX] Was 1024. Source tiles are square (e.g. 1500x1500); "
+                             "a non-square img_h/img_w stretches roads by different "
+                             "factors horizontally vs. vertically. Prefer --crop_size "
+                             "instead of relying on img_h/img_w resize.")
+    # [NEW] Aspect-preserving square crop, recommended over plain resize.
+    parser.add_argument("--crop_size",          type=int,   default=None,
+                        help="If set, train/val on an aspect-ratio-preserving square crop "
+                             "of this size instead of resizing to --img_h/--img_w (which "
+                             "distorts road geometry on non-square targets). Recommended.")
+    parser.add_argument("--road_oversample_tries", type=int, default=4,
+                        help="During training with --crop_size, sample this many candidate "
+                             "crop locations and keep the one with the most road pixels, "
+                             "since plain random crops are mostly pure background.")
     # BN warmup (K1)
     parser.add_argument("--reset_bn_stats",     action="store_true")
     parser.add_argument("--bn_warmup_epochs",   type=int,   default=3)
@@ -1601,6 +1610,17 @@ def main():
             f"num_classes={args.num_classes}."
         )
 
+    # [NEW] BCEDiceLoss operates on a binary road/background logit derived
+    # from the model's 2-channel output — it does not generalize to >2
+    # classes, so fail fast with a clear message rather than a confusing
+    # shape error deep inside the loss.
+    if args.num_classes != 2:
+        raise ValueError(
+            f"--num_classes={args.num_classes}, but the simplified BCE+Dice loss "
+            f"only supports binary segmentation (num_classes=2, e.g. "
+            f"['background','road'])."
+        )
+
     # [FIX] `--class_weights_file` was silently ignored unless
     # `--use_class_weights` was *also* passed, because Trainer only received
     # weights when `args.use_class_weights` was true. Track the two sources
@@ -1613,7 +1633,8 @@ def main():
         val_ratio=args.val_ratio, seed=args.seed,
         batch_size=args.batch_size, num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w), num_classes=args.num_classes,
-        compute_class_weights=args.use_class_weights)
+        compute_class_weights=args.use_class_weights,
+        crop_size=args.crop_size, road_oversample_tries=args.road_oversample_tries)
 
     if getattr(args, "class_weights_file", None):
         cw_path = Path(args.class_weights_file)
@@ -1668,9 +1689,8 @@ def main():
 
     if args.dice_weight is not None:
         trainer.dice_weight = args.dice_weight
+        trainer.criterion.dice_weight = args.dice_weight
         trainer.base_loss_cfg["dice_weight"] = args.dice_weight
-    if args.ce_weight is not None:
-        trainer.ce_weight = args.ce_weight
 
     if args.resume:
         trainer.load_checkpoint(
@@ -1758,9 +1778,8 @@ def main():
 
         print(f"\n{SEP}\nEpoch {epoch+1}/{args.epochs}\n{SEP}")
         print(f"Train — Loss: {train_metrics['loss']:.4f} | "
-              f"OHEM: {train_metrics['ohem']:.4f} | "
-              f"Dice: {train_metrics['dice']:.4f} | "
-              f"Hard%: {train_metrics['hard_ratio']:.3f}")
+              f"BCE: {train_metrics['bce']:.4f} | "
+              f"Dice: {train_metrics['dice']:.4f}")
         print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
               f"mIoU: {val_metrics['miou']:.4f}  | "
               f"Acc: {val_metrics['accuracy']:.4f}")
