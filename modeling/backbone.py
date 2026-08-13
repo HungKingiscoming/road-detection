@@ -8,6 +8,7 @@ Backbone output is a feature dictionary consumed by ``coming_decoder.py``.
 """
 
 from __future__ import annotations
+
 import math
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -98,6 +99,7 @@ class CoMingBlock(nn.Module):
         self.deploy = deploy
         self.num_spatial_branches = 5
         self.branch_scale = 1.0 / math.sqrt(self.num_spatial_branches)
+
         if deploy:
             self.reparam_spatial = nn.Conv2d(
                 channels, channels, kernel_size, padding=self.padding,
@@ -138,15 +140,10 @@ class CoMingBlock(nn.Module):
                 + self.branch_horizontal(x)
                 + self.branch_vertical(x)
                 + self.branch_dilated(x)
-            )
-    
-            # Ngăn activation tăng mạnh khi cộng năm nhánh
-            spatial = spatial * self.branch_scale
-    
+            ) * self.branch_scale
         spatial = self.spatial_act(spatial)
-        out = self.ffn(spatial)
-    
-        return x + out
+        return x + self.ffn(spatial)
+
     def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
         if self.deploy:
             return self.reparam_spatial.weight, self.reparam_spatial.bias
@@ -162,17 +159,15 @@ class CoMingBlock(nn.Module):
                 kernel, branch.conv.dilation, self.kernel_size)
             kernel_sum = kernel if kernel_sum is None else kernel_sum + kernel
             bias_sum = bias if bias_sum is None else bias_sum + bias
-        kernel_sum = kernel_sum * self.branch_scale
-        bias_sum = bias_sum * self.branch_scale
-        
-        return kernel_sum, bias_sum
+        return kernel_sum * self.branch_scale, bias_sum * self.branch_scale
+
     def zero_init_residual(self) -> None:
-        """Khởi tạo residual branch gần identity để train ổn định."""
+        """Start the FFN residual branch at zero (block initially identity)."""
         last_bn = self.ffn[-1]
-    
         if isinstance(last_bn, nn.BatchNorm2d):
             nn.init.zeros_(last_bn.weight)
             nn.init.zeros_(last_bn.bias)
+
     def switch_to_deploy(self) -> None:
         if self.deploy:
             return
