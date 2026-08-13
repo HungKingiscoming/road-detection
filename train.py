@@ -205,11 +205,27 @@ class RoadFolderDataset(Dataset):
         return mask
 
     def _resize_short_side(self, image, mask, target):
+        """Giữ nguyên ảnh nếu đã đủ lớn; chỉ upscale ảnh nhỏ hơn crop."""
         w, h = image.size
-        scale = target / min(w, h)
-        new_w, new_h = max(target, round(w * scale)), max(target, round(h * scale))
-        image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-        mask = mask.resize((new_w, new_h), Image.Resampling.NEAREST)
+    
+        if w >= target and h >= target:
+            return image, mask
+    
+        scale = max(target / w, target / h)
+    
+        new_w = max(target, round(w * scale))
+        new_h = max(target, round(h * scale))
+    
+        image = image.resize(
+            (new_w, new_h),
+            Image.Resampling.BILINEAR,
+        )
+    
+        mask = mask.resize(
+            (new_w, new_h),
+            Image.Resampling.NEAREST,
+        )
+    
         return image, mask
 
     def _crop(self, image, mask, x, y, size):
@@ -218,16 +234,22 @@ class RoadFolderDataset(Dataset):
 
     def _road_aware_random_crop(self, image, mask, size):
         w, h = image.size
-        max_x, max_y = max(0, w - size), max(0, h - size)
+        max_x = max(0, w - size)
+        max_y = max(0, h - size)
+    
+        mask_array = np.asarray(mask)
         best = None
+    
         for _ in range(max(1, self.road_oversample_tries)):
             x = int(torch.randint(0, max_x + 1, (1,)).item())
             y = int(torch.randint(0, max_y + 1, (1,)).item())
-            road_px = int((np.asarray(mask)[y:y + size, x:x + size] > 0).sum())
+    
+            patch = mask_array[y:y + size, x:x + size]
+            road_px = int((patch > 0).sum())
+    
             if best is None or road_px > best[0]:
                 best = (road_px, x, y)
-            if road_px > 0:
-                break
+    
         _, x, y = best
         return self._crop(image, mask, x, y, size)
 
