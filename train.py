@@ -181,13 +181,17 @@ class RoadFolderDataset(Dataset):
     """
 
     def __init__(self, pairs, img_size, num_classes=2, augment=False,
-                 crop_size=None, road_oversample_tries=0):
+             crop_size=None, road_oversample_tries=0,
+             full_image=False):
         self.pairs = list(pairs)
-        self.img_size = tuple(img_size)  # (height, width), used only if crop_size is None
+        self.img_size = tuple(img_size)
         self.num_classes = num_classes
         self.augment = augment
         self.crop_size = crop_size
-        self.road_oversample_tries = road_oversample_tries if augment else 0
+        self.road_oversample_tries = (
+            road_oversample_tries if augment else 0
+        )
+        self.full_image = full_image
 
     def __len__(self):
         return len(self.pairs)
@@ -258,18 +262,38 @@ class RoadFolderDataset(Dataset):
         image = Image.open(image_path).convert('RGB')
         mask = Image.fromarray(self._read_mask(mask_path))
 
-        if self.crop_size:
-            image, mask = self._resize_short_side(image, mask, self.crop_size)
+        if self.full_image:
+            pass
+        
+        # Training crop từ ảnh gốc
+        elif self.crop_size:
+            image, mask = self._resize_short_side(
+                image, mask, self.crop_size
+            )
+        
             if self.augment:
-                image, mask = self._road_aware_random_crop(image, mask, self.crop_size)
+                image, mask = self._road_aware_random_crop(
+                    image, mask, self.crop_size
+                )
             else:
                 w, h = image.size
-                x, y = (w - self.crop_size) // 2, (h - self.crop_size) // 2
-                image, mask = self._crop(image, mask, x, y, self.crop_size)
+                x = (w - self.crop_size) // 2
+                y = (h - self.crop_size) // 2
+                image, mask = self._crop(
+                    image, mask, x, y, self.crop_size
+                )
+        
+        # Chỉ resize khi không sử dụng crop_size
         else:
             height, width = self.img_size
-            image = image.resize((width, height), Image.Resampling.BILINEAR)
-            mask = mask.resize((width, height), Image.Resampling.NEAREST)
+            image = image.resize(
+                (width, height),
+                Image.Resampling.BILINEAR
+            )
+            mask = mask.resize(
+                (width, height),
+                Image.Resampling.NEAREST
+            )
 
         image = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1) / 255.0
         mask = torch.from_numpy(np.asarray(mask, dtype=np.int64).copy())
@@ -333,14 +357,28 @@ def create_folder_dataloaders(image_dir, mask_dir, val_ratio, seed, batch_size,
 
     train_set = RoadFolderDataset(train_pairs, img_size, num_classes, augment=True,
                                   crop_size=crop_size, road_oversample_tries=road_oversample_tries)
-    val_set = RoadFolderDataset(val_pairs, img_size, num_classes, augment=False,
-                                crop_size=crop_size)
+    # Validation giữ nguyên ảnh 1500x1500.
+    # Việc chia tile được thực hiện trong Trainer.validate().
+    val_set = RoadFolderDataset(
+        val_pairs,
+        img_size,
+        num_classes,
+        augment=False,
+        crop_size=None,
+        road_oversample_tries=0,
+        full_image=True,
+    )
     loader_args = dict(num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                        persistent_workers=num_workers > 0)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
                               drop_last=len(train_set) > batch_size, **loader_args)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            drop_last=False, **loader_args)
+    val_loader = DataLoader(
+        val_set,
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+        **loader_args
+    )
     weights = _compute_class_weights(train_pairs, num_classes) if compute_class_weights else None
     print(f"Dataset: {len(pairs)} pairs | train={len(train_set)} | val={len(val_set)} "
           f"| split_seed={seed}")
@@ -1337,51 +1375,296 @@ class Trainer:
             self.diag.log_dict(epoch, result, prefix='train/')
             self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
         return result
+    @staticmethod
+def _sliding_positions(length, tile_size, stride):
+    """Sinh vị trí tile và bảo đảm phủ kín mép ảnh."""
+    if length <= tile_size:
+        return [0]
 
+    positions = list(
+        range(0, length - tile_size + 1, stride)
+    )
+
+    last_position = length - tile_size
+
+    if positions[-1] != last_position:
+        positions.append(last_position)
+
+    return positions
+
+
+@torch.no_grad()
+def sliding_window_inference(
+    self,
+    image,
+    tile_size=512,
+    overlap=128,
+    tile_batch_size=4,
+):
+    """
+    image: [1, C, H, W]
+
+    Chia ảnh thành các tile có overlap, dự đoán rồi ghép logits
+    bằng weighted averaging.
+    """
+    if image.shape[0] != 1:
+        raise ValueError(
+            "Sliding-window validation requires val batch_size=1."
+        )
+
+    _, _, height, width = image.shape
+
+    stride = tile_size - overlap
+    if stride <= 0:
+        raise ValueError("overlap must be smaller than tile_size.")
+
+    # Trường hợp ảnh nhỏ hơn tile_size
+    pad_h = max(0, tile_size - height)
+    pad_w = max(0, tile_size - width)
+
+    if pad_h > 0 or pad_w > 0:
+        image_padded = F.pad(
+            image,
+            (0, pad_w, 0, pad_h),
+            mode="reflect",
+        )
+    else:
+        image_padded = image
+
+    padded_h, padded_w = image_padded.shape[-2:]
+
+    y_positions = self._sliding_positions(
+        padded_h, tile_size, stride
+    )
+    x_positions = self._sliding_positions(
+        padded_w, tile_size, stride
+    )
+
+    # Cosine weight giảm seam tại biên giữa các patch
+    window_1d = torch.hann_window(
+        tile_size,
+        periodic=False,
+        device=image.device,
+        dtype=torch.float32,
+    ).clamp_min(0.05)
+
+    weight = (
+        window_1d[:, None] * window_1d[None, :]
+    ).view(1, 1, tile_size, tile_size)
+
+    logits_sum = torch.zeros(
+        (1, self.args.num_classes, padded_h, padded_w),
+        device=image.device,
+        dtype=torch.float32,
+    )
+
+    weight_sum = torch.zeros(
+        (1, 1, padded_h, padded_w),
+        device=image.device,
+        dtype=torch.float32,
+    )
+
+    patches = []
+    coordinates = []
+
+    def process_batch():
+        if not patches:
+            return
+
+        patch_batch = torch.cat(patches, dim=0)
+
+        with autocast(
+            device_type="cuda",
+            enabled=self.args.use_amp,
+        ):
+            patch_logits = self.model(patch_batch)
+
+            # Phòng trường hợp decoder trả nhiều output
+            if isinstance(patch_logits, (tuple, list)):
+                patch_logits = patch_logits[-1]
+
+            if isinstance(patch_logits, dict):
+                patch_logits = patch_logits.get(
+                    "out",
+                    patch_logits.get("main")
+                )
+
+            patch_logits = F.interpolate(
+                patch_logits,
+                size=(tile_size, tile_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        patch_logits = patch_logits.float()
+
+        for index, (y, x) in enumerate(coordinates):
+            logits_sum[
+                :,
+                :,
+                y:y + tile_size,
+                x:x + tile_size
+            ] += patch_logits[index:index + 1] * weight
+
+            weight_sum[
+                :,
+                :,
+                y:y + tile_size,
+                x:x + tile_size
+            ] += weight
+
+        patches.clear()
+        coordinates.clear()
+
+    for y in y_positions:
+        for x in x_positions:
+            patch = image_padded[
+                :,
+                :,
+                y:y + tile_size,
+                x:x + tile_size
+            ]
+
+            patches.append(patch)
+            coordinates.append((y, x))
+
+            if len(patches) >= tile_batch_size:
+                process_batch()
+
+    process_batch()
+
+    logits = logits_sum / weight_sum.clamp_min(1e-6)
+
+    # Cắt bỏ phần padding
+    return logits[:, :, :height, :width]
+    
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
+    
         total_loss = 0.0
-        C  = self.args.num_classes
-        cm = np.zeros((C, C), dtype=np.int64)
-        pbar = tqdm(loader, desc="Validation")
-
-        for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs  = imgs.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True).long()
+        num_samples = 0
+    
+        num_classes = self.args.num_classes
+        cm = np.zeros(
+            (num_classes, num_classes),
+            dtype=np.int64
+        )
+    
+        tile_size = (
+            self.args.crop_size
+            if self.args.crop_size is not None
+            else self.args.img_h
+        )
+    
+        overlap = getattr(self.args, "val_overlap", 128)
+        tile_batch_size = getattr(
+            self.args,
+            "val_tile_batch_size",
+            4
+        )
+    
+        pbar = tqdm(loader, desc="Full-image validation")
+    
+        for imgs, masks in pbar:
+            imgs = imgs.to(
+                self.device,
+                non_blocking=True
+            )
+            masks = masks.to(
+                self.device,
+                non_blocking=True
+            ).long()
+    
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
-            with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)
-                logits = F.interpolate(logits, size=masks.shape[-2:],
-                                       mode='bilinear', align_corners=False)
-                loss, _, _ = self.criterion(logits, masks)
-
-            total_loss += loss.item()
-            pred   = logits.argmax(1).cpu().numpy()
+    
+            logits = self.sliding_window_inference(
+                imgs,
+                tile_size=tile_size,
+                overlap=overlap,
+                tile_batch_size=tile_batch_size,
+            )
+    
+            loss, _, _ = self.criterion(logits, masks)
+    
+            batch_size = imgs.shape[0]
+            total_loss += loss.item() * batch_size
+            num_samples += batch_size
+    
+            pred = logits.argmax(dim=1).cpu().numpy()
             target = masks.cpu().numpy()
-            valid  = (target >= 0) & (target < C)
-            lbl    = C * target[valid].astype(int) + pred[valid]
-            cm    += np.bincount(lbl, minlength=C * C).reshape(C, C)
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            if batch_idx % 20 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
-
-        inter = np.diag(cm)
-        union = cm.sum(1) + cm.sum(0) - inter
-        iou   = inter / (union + 1e-10)
+    
+            valid = (
+                (target >= 0)
+                & (target < num_classes)
+                & (target != self.args.ignore_index)
+            )
+    
+            labels = (
+                num_classes * target[valid].astype(np.int64)
+                + pred[valid].astype(np.int64)
+            )
+    
+            cm += np.bincount(
+                labels,
+                minlength=num_classes ** 2
+            ).reshape(num_classes, num_classes)
+    
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}"
+            })
+    
+        intersection = np.diag(cm).astype(np.float64)
+    
+        union = (
+            cm.sum(axis=1)
+            + cm.sum(axis=0)
+            - intersection
+        )
+    
+        iou = np.divide(
+            intersection,
+            union,
+            out=np.zeros_like(intersection),
+            where=union > 0,
+        )
+    
         result = {
-            'loss'         : total_loss / len(loader),
-            'miou'         : float(np.nanmean(iou)),
-            'accuracy'     : float(inter.sum() / (cm.sum() + 1e-10)),
-            'per_class_iou': iou,
+            "loss": total_loss / max(num_samples, 1),
+            "miou": float(np.mean(iou)),
+            "accuracy": float(
+                intersection.sum()
+                / max(cm.sum(), 1)
+            ),
+            "per_class_iou": iou,
+            "confusion_matrix": cm,
         }
+    
         if self.diag:
-            self.diag.log(epoch, 'val/miou',     result['miou'])
-            self.diag.log(epoch, 'val/loss',     result['loss'])
-            self.diag.log(epoch, 'val/accuracy', result['accuracy'])
+            self.diag.log(
+                epoch,
+                "val/miou",
+                result["miou"]
+            )
+            self.diag.log(
+                epoch,
+                "val/loss",
+                result["loss"]
+            )
+            self.diag.log(
+                epoch,
+                "val/accuracy",
+                result["accuracy"]
+            )
+    
+            for class_index, class_iou in enumerate(iou):
+                self.diag.log(
+                    epoch,
+                    f"val/iou_class_{class_index}",
+                    class_iou
+                )
+    
         return result
 
     def compute_checkpoint_metric(self, val_metrics, epoch):
@@ -1497,6 +1780,19 @@ def main():
     parser.add_argument("--global_blocks", type=_parse_stage_blocks, default=(2,3,2),
                         help="CoMingNet global blocks, e.g. 2,3,2")
     # Backbone freeze/unfreeze
+    parser.add_argument(
+        "--val_overlap",
+        type=int,
+        default=128,
+        help="Overlap giữa các validation tile."
+    )
+    
+    parser.add_argument(
+        "--val_tile_batch_size",
+        type=int,
+        default=4,
+        help="Số tile validation chạy đồng thời trên GPU."
+    )
     parser.add_argument("--freeze_backbone",    action="store_true")
     parser.add_argument("--unfreeze_schedule",  type=str, default="")
     parser.add_argument("--freeze_stem_conv",   action="store_true")
