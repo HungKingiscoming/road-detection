@@ -1376,168 +1376,168 @@ class Trainer:
             self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
         return result
     @staticmethod
-def _sliding_positions(length, tile_size, stride):
-    """Sinh vị trí tile và bảo đảm phủ kín mép ảnh."""
-    if length <= tile_size:
-        return [0]
-
-    positions = list(
-        range(0, length - tile_size + 1, stride)
-    )
-
-    last_position = length - tile_size
-
-    if positions[-1] != last_position:
-        positions.append(last_position)
-
-    return positions
-
-
-@torch.no_grad()
-def sliding_window_inference(
-    self,
-    image,
-    tile_size=512,
-    overlap=128,
-    tile_batch_size=4,
-):
-    """
-    image: [1, C, H, W]
-
-    Chia ảnh thành các tile có overlap, dự đoán rồi ghép logits
-    bằng weighted averaging.
-    """
-    if image.shape[0] != 1:
-        raise ValueError(
-            "Sliding-window validation requires val batch_size=1."
-        )
-
-    _, _, height, width = image.shape
-
-    stride = tile_size - overlap
-    if stride <= 0:
-        raise ValueError("overlap must be smaller than tile_size.")
-
-    # Trường hợp ảnh nhỏ hơn tile_size
-    pad_h = max(0, tile_size - height)
-    pad_w = max(0, tile_size - width)
-
-    if pad_h > 0 or pad_w > 0:
-        image_padded = F.pad(
-            image,
-            (0, pad_w, 0, pad_h),
-            mode="reflect",
-        )
-    else:
-        image_padded = image
-
-    padded_h, padded_w = image_padded.shape[-2:]
-
-    y_positions = self._sliding_positions(
-        padded_h, tile_size, stride
-    )
-    x_positions = self._sliding_positions(
-        padded_w, tile_size, stride
-    )
-
-    # Cosine weight giảm seam tại biên giữa các patch
-    window_1d = torch.hann_window(
-        tile_size,
-        periodic=False,
-        device=image.device,
-        dtype=torch.float32,
-    ).clamp_min(0.05)
-
-    weight = (
-        window_1d[:, None] * window_1d[None, :]
-    ).view(1, 1, tile_size, tile_size)
-
-    logits_sum = torch.zeros(
-        (1, self.args.num_classes, padded_h, padded_w),
-        device=image.device,
-        dtype=torch.float32,
-    )
-
-    weight_sum = torch.zeros(
-        (1, 1, padded_h, padded_w),
-        device=image.device,
-        dtype=torch.float32,
-    )
-
-    patches = []
-    coordinates = []
-
-    def process_batch():
-        if not patches:
-            return
-
-        patch_batch = torch.cat(patches, dim=0)
-
-        with autocast(
-            device_type="cuda",
-            enabled=self.args.use_amp,
-        ):
-            patch_logits = self.model(patch_batch)
-
-            # Phòng trường hợp decoder trả nhiều output
-            if isinstance(patch_logits, (tuple, list)):
-                patch_logits = patch_logits[-1]
-
-            if isinstance(patch_logits, dict):
-                patch_logits = patch_logits.get(
-                    "out",
-                    patch_logits.get("main")
-                )
-
-            patch_logits = F.interpolate(
-                patch_logits,
-                size=(tile_size, tile_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-        patch_logits = patch_logits.float()
-
-        for index, (y, x) in enumerate(coordinates):
-            logits_sum[
-                :,
-                :,
-                y:y + tile_size,
-                x:x + tile_size
-            ] += patch_logits[index:index + 1] * weight
-
-            weight_sum[
-                :,
-                :,
-                y:y + tile_size,
-                x:x + tile_size
-            ] += weight
-
-        patches.clear()
-        coordinates.clear()
-
-    for y in y_positions:
-        for x in x_positions:
-            patch = image_padded[
-                :,
-                :,
-                y:y + tile_size,
-                x:x + tile_size
-            ]
-
-            patches.append(patch)
-            coordinates.append((y, x))
-
-            if len(patches) >= tile_batch_size:
-                process_batch()
-
-    process_batch()
-
-    logits = logits_sum / weight_sum.clamp_min(1e-6)
-
-    # Cắt bỏ phần padding
-    return logits[:, :, :height, :width]
+    def _sliding_positions(length, tile_size, stride):
+        """Sinh vị trí tile và bảo đảm phủ kín mép ảnh."""
+        if length <= tile_size:
+            return [0]
     
+        positions = list(
+            range(0, length - tile_size + 1, stride)
+        )
+    
+        last_position = length - tile_size
+    
+        if positions[-1] != last_position:
+            positions.append(last_position)
+    
+        return positions
+    
+    
+    @torch.no_grad()
+    def sliding_window_inference(
+        self,
+        image,
+        tile_size=512,
+        overlap=128,
+        tile_batch_size=4,
+    ):
+        """
+        image: [1, C, H, W]
+    
+        Chia ảnh thành các tile có overlap, dự đoán rồi ghép logits
+        bằng weighted averaging.
+        """
+        if image.shape[0] != 1:
+            raise ValueError(
+                "Sliding-window validation requires val batch_size=1."
+            )
+    
+        _, _, height, width = image.shape
+    
+        stride = tile_size - overlap
+        if stride <= 0:
+            raise ValueError("overlap must be smaller than tile_size.")
+    
+        # Trường hợp ảnh nhỏ hơn tile_size
+        pad_h = max(0, tile_size - height)
+        pad_w = max(0, tile_size - width)
+    
+        if pad_h > 0 or pad_w > 0:
+            image_padded = F.pad(
+                image,
+                (0, pad_w, 0, pad_h),
+                mode="reflect",
+            )
+        else:
+            image_padded = image
+    
+        padded_h, padded_w = image_padded.shape[-2:]
+    
+        y_positions = self._sliding_positions(
+            padded_h, tile_size, stride
+        )
+        x_positions = self._sliding_positions(
+            padded_w, tile_size, stride
+        )
+    
+        # Cosine weight giảm seam tại biên giữa các patch
+        window_1d = torch.hann_window(
+            tile_size,
+            periodic=False,
+            device=image.device,
+            dtype=torch.float32,
+        ).clamp_min(0.05)
+    
+        weight = (
+            window_1d[:, None] * window_1d[None, :]
+        ).view(1, 1, tile_size, tile_size)
+    
+        logits_sum = torch.zeros(
+            (1, self.args.num_classes, padded_h, padded_w),
+            device=image.device,
+            dtype=torch.float32,
+        )
+    
+        weight_sum = torch.zeros(
+            (1, 1, padded_h, padded_w),
+            device=image.device,
+            dtype=torch.float32,
+        )
+    
+        patches = []
+        coordinates = []
+
+        def process_batch():
+            if not patches:
+                return
+    
+            patch_batch = torch.cat(patches, dim=0)
+    
+            with autocast(
+                device_type="cuda",
+                enabled=self.args.use_amp,
+            ):
+                patch_logits = self.model(patch_batch)
+    
+                # Phòng trường hợp decoder trả nhiều output
+                if isinstance(patch_logits, (tuple, list)):
+                    patch_logits = patch_logits[-1]
+    
+                if isinstance(patch_logits, dict):
+                    patch_logits = patch_logits.get(
+                        "out",
+                        patch_logits.get("main")
+                    )
+    
+                patch_logits = F.interpolate(
+                    patch_logits,
+                    size=(tile_size, tile_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+    
+            patch_logits = patch_logits.float()
+    
+            for index, (y, x) in enumerate(coordinates):
+                logits_sum[
+                    :,
+                    :,
+                    y:y + tile_size,
+                    x:x + tile_size
+                ] += patch_logits[index:index + 1] * weight
+    
+                weight_sum[
+                    :,
+                    :,
+                    y:y + tile_size,
+                    x:x + tile_size
+                ] += weight
+    
+            patches.clear()
+            coordinates.clear()
+    
+        for y in y_positions:
+            for x in x_positions:
+                patch = image_padded[
+                    :,
+                    :,
+                    y:y + tile_size,
+                    x:x + tile_size
+                ]
+    
+                patches.append(patch)
+                coordinates.append((y, x))
+    
+                if len(patches) >= tile_batch_size:
+                    process_batch()
+    
+        process_batch()
+    
+        logits = logits_sum / weight_sum.clamp_min(1e-6)
+    
+        # Cắt bỏ phần padding
+        return logits[:, :, :height, :width]
+        
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
