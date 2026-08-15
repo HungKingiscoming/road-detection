@@ -102,25 +102,35 @@ class CoMingBlock(nn.Module):
     """Road-oriented reparameterizable convolution block.
 
     Training branches: 3x3, 1xK, Kx1 and KxK depthwise convolutions.
-    Deployment branch: one KxK depthwise convolution.  A shared pointwise
-    convolution mixes channels.  The public name is intentionally preserved.
+    Deployment branch: one KxK depthwise convolution.  An inverted pointwise
+    MLP expands channels, applies a non-linearity, then projects back to C.
+    The public name is intentionally preserved.
     """
 
     def __init__(
         self,
         channels: int,
         kernel_size: int = 5,
+        expansion: float = 1.0,
         deploy: bool = False,
         zero_init_residual: bool = True,
     ) -> None:
         super().__init__()
         if kernel_size < 3 or kernel_size % 2 == 0:
             raise ValueError("kernel_size must be an odd integer >= 3")
+        if expansion < 1.0:
+            raise ValueError("expansion must be >= 1.0")
 
         self.channels = channels
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
+        self.expansion = float(expansion)
         self.deploy = deploy
+        hidden_channels = max(
+            channels,
+            int(round(channels * self.expansion / 8.0)) * 8,
+        )
+        self.hidden_channels = hidden_channels
 
         if deploy:
             self.reparam_spatial = nn.Conv2d(
@@ -144,7 +154,10 @@ class CoMingBlock(nn.Module):
             )
 
         self.channel_mixer = nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.Conv2d(channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, 1, bias=False),
             nn.BatchNorm2d(channels),
         )
         self.activation = nn.ReLU(inplace=True)
@@ -165,8 +178,11 @@ class CoMingBlock(nn.Module):
 
     def zero_init_residual(self) -> None:
         """Start the residual path at zero without touching other BN layers."""
-        nn.init.zeros_(self.channel_mixer[1].weight)
-        nn.init.zeros_(self.channel_mixer[1].bias)
+        project_bn = self.channel_mixer[-1]
+        if not isinstance(project_bn, nn.BatchNorm2d):
+            raise TypeError("CoMingBlock channel mixer must end with BatchNorm2d")
+        nn.init.zeros_(project_bn.weight)
+        nn.init.zeros_(project_bn.bias)
 
     def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
         if self.deploy:
@@ -222,6 +238,7 @@ class CompactPyramidContext(nn.Module):
         out_channels: int,
         branch_channels: int = 32,
         kernel_size: int = 7,
+        expansion: float = 2.0,
         deploy: bool = False,
     ) -> None:
         super().__init__()
@@ -241,7 +258,10 @@ class CompactPyramidContext(nn.Module):
             in_channels, out_channels, 1, padding=0, activation=False
         )
         self.refine = CoMingBlock(
-            out_channels, kernel_size=kernel_size, deploy=deploy
+            out_channels,
+            kernel_size=kernel_size,
+            expansion=expansion,
+            deploy=deploy,
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -273,11 +293,13 @@ class CoMingNet(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        channels: int = 32,
+        channels: int = 48,
         local_blocks: Sequence[int] = (2, 2, 2),
         global_blocks: Sequence[int] = (2, 3),
         highres_kernel_size: int = 5,
         context_kernel_size: int = 7,
+        local_expansion: float = 1.5,
+        global_expansion: float = 2.0,
         kernel_size: int | None = None,
         deploy: bool = False,
         zero_init_residual: bool = True,
@@ -301,11 +323,13 @@ class CoMingNet(nn.Module):
         self.stem_quarter = ConvBNAct(c1, c2, 3, stride=2)
 
         self.local_stage1 = self._stage(
-            c2, local_blocks[0], highres_kernel_size, deploy
+            c2, local_blocks[0], highres_kernel_size, local_expansion, deploy
         )
         self.global_stage1 = nn.Sequential(
             ConvBNAct(c2, c4, 3, stride=2),
-            self._stage(c4, global_blocks[0], highres_kernel_size, deploy),
+            self._stage(
+                c4, global_blocks[0], highres_kernel_size, global_expansion, deploy
+            ),
         )
 
         # Bilateral fusion 1: s4 <-> s8.
@@ -315,11 +339,13 @@ class CoMingNet(nn.Module):
         self.global_fusion1 = nn.ReLU(inplace=True)
 
         self.local_stage2 = self._stage(
-            c2, local_blocks[1], highres_kernel_size, deploy
+            c2, local_blocks[1], highres_kernel_size, local_expansion, deploy
         )
         self.global_stage2 = nn.Sequential(
             ConvBNAct(c4, c8, 3, stride=2),
-            self._stage(c8, global_blocks[1], context_kernel_size, deploy),
+            self._stage(
+                c8, global_blocks[1], context_kernel_size, global_expansion, deploy
+            ),
         )
 
         # Bilateral fusion 2: s4 <-> s16.
@@ -333,13 +359,14 @@ class CoMingNet(nn.Module):
 
         self.local_transition = ConvBNAct(c2, c4, 3)
         self.local_stage3 = self._stage(
-            c4, local_blocks[2], highres_kernel_size, deploy
+            c4, local_blocks[2], highres_kernel_size, local_expansion, deploy
         )
         self.context = CompactPyramidContext(
             c8,
             c4,
             branch_channels=channels,
             kernel_size=context_kernel_size,
+            expansion=global_expansion,
             deploy=deploy,
         )
         self.deploy = deploy
@@ -349,7 +376,11 @@ class CoMingNet(nn.Module):
 
     @staticmethod
     def _stage(
-        channels: int, blocks: int, kernel_size: int, deploy: bool
+        channels: int,
+        blocks: int,
+        kernel_size: int,
+        expansion: float,
+        deploy: bool,
     ) -> nn.Sequential:
         if blocks < 1:
             raise ValueError("Each stage needs at least one CoMingBlock")
@@ -358,6 +389,7 @@ class CoMingNet(nn.Module):
                 CoMingBlock(
                     channels,
                     kernel_size=kernel_size,
+                    expansion=expansion,
                     deploy=deploy,
                     zero_init_residual=False,
                 )
