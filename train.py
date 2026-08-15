@@ -1,2187 +1,1077 @@
+"""Train the balanced CoMingNet on Massachusetts Roads.
+
+Key choices:
+  * 512x512 crops for training; no multi-scale augmentation.
+  * Official train/val/test folders when available.
+  * Sliding-window validation on complete 1500x1500 images.
+  * BCE + Dice + lightweight boundary + scheduled soft-clDice.
+  * Training-only deep supervision and optional logit distillation.
+  * Threshold calibration and both micro/macro road IoU.
+
+Place this file at ``road-detection/train.py`` and the accompanying backbone
+and decoder files under ``road-detection/modeling/``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
 import os
+import random
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
-from collections import defaultdict, deque
-import math, gc, json, warnings
-import numpy as np
-from tqdm import tqdm
-import argparse
-from pathlib import Path
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch import Tensor
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader, Dataset
 
-warnings.filterwarnings('ignore')
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    _TB = True
-except Exception:
-    _TB = False
-
-SEP = "=" * 70
-
+from modeling.backbone import CoMingBlock, CoMingNet
 from modeling.decoder import GCNetHead
 
 
-
-IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
-def replace_bn_with_gn(module, num_groups=32):
-    """
-    Recursively replaces all BatchNorm2d layers with GroupNorm.
-    
-    This is CRITICAL for training with batch_size < 16.
-    BatchNorm becomes unreliable when batch size is small.
-    GroupNorm works perfectly even with batch_size=1.
-    
-    Args:
-        module: PyTorch module (model)
-        num_groups: Number of groups for GroupNorm (default 32)
-    
-    Returns:
-        Module with GroupNorm instead of BatchNorm
-    
-    Example:
-        >>> model = replace_bn_with_gn(model)
-        >>> print(model)  # Should not have BatchNorm2d anymore
-    """
-    # If the module itself is BatchNorm, replace it
-    if isinstance(module, nn.BatchNorm2d):
-        num_channels = module.num_features
-        
-        # Ensure num_groups divides num_channels evenly
-        current_groups = num_groups
-        while num_channels % current_groups != 0:
-            current_groups //= 2
-        
-        # Create GroupNorm with same number of channels
-        return nn.GroupNorm(current_groups, num_channels)
-    
-    # Otherwise, recursively iterate over children
-    for name, child in module.named_children():
-        module.add_module(name, replace_bn_with_gn(child, num_groups))
-    
-    return module
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
+IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
 
-
-def init_weights(module):
-    """
-    Apply robust Kaiming (He) initialization for training from scratch.
-    
-    This is CRITICAL for from-scratch training without pretrained weights.
-    Default initialization is too weak. Kaiming init jumpstarts learning.
-    
-    Args:
-        module: PyTorch module (usually apply with model.apply(init_weights))
-    
-    Example:
-        >>> model.apply(init_weights)
-        >>> # Now model has proper Kaiming initialization
-    """
-    if isinstance(module, (nn.Conv2d, nn.Linear)):
-        # Kaiming Normal (He Init) for ReLU/GeLU networks
-        # Fan-out mode: good for conv layers
-        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-        
-        # Initialize bias to 0
-        if module.bias is not None:
-            nn.init.constant_(module.bias, 0)
-    
-    elif isinstance(module, (nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm)):
-        # Normalization layers: weight=1.0, bias=0.0
-        nn.init.constant_(module.weight, 1)
-        nn.init.constant_(module.bias, 0)
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def count_parameters(model):
-    """
-    Count total trainable parameters in the model.
-    
-    Args:
-        model: PyTorch module
-    
-    Returns:
-        int: Number of trainable parameters
-    
-    Example:
-        >>> total = count_parameters(model)
-        >>> print(f"Model has {total:,} parameters")
-    """
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def _sample_key(path):
-    """Normalize common image/mask suffixes so files can be paired safely."""
+def sample_key(path: Path) -> str:
     key = path.stem.lower()
-    suffixes = ('_image', '_images', '_img', '_sat', '_mask', '_masks',
-                '_gt', '_label', '_labels')
-    changed = True
-    while changed:
-        changed = False
-        for suffix in suffixes:
-            if key.endswith(suffix):
-                key = key[:-len(suffix)]
-                changed = True
-                break
+    for suffix in ("_image", "_images", "_img", "_sat", "_mask", "_masks", "_gt", "_label", "_labels"):
+        if key.endswith(suffix):
+            key = key[: -len(suffix)]
+            break
     return key
 
 
-def _index_files(folder):
+def index_files(folder: str | Path) -> Dict[str, Path]:
     folder = Path(folder)
     if not folder.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {folder}")
-    files = sorted(p for p in folder.rglob('*') if p.suffix.lower() in IMAGE_EXTENSIONS)
+    files = sorted(
+        path for path in folder.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS
+    )
     if not files:
-        raise RuntimeError(f"No supported image files found in: {folder}")
-    index = {}
+        raise RuntimeError(f"No images found in {folder}")
+    result: Dict[str, Path] = {}
     for path in files:
-        key = _sample_key(path)
-        if key in index:
-            raise RuntimeError(f"Duplicate sample key '{key}': {index[key]} and {path}")
-        index[key] = path
-    return index
+        key = sample_key(path)
+        if key in result:
+            raise RuntimeError(f"Duplicate sample key {key}: {result[key]} and {path}")
+        result[key] = path
+    return result
 
 
-def build_image_mask_pairs(image_dir, mask_dir):
-    images, masks = _index_files(image_dir), _index_files(mask_dir)
-    common = sorted(images.keys() & masks.keys())
-    missing_masks = sorted(images.keys() - masks.keys())
-    missing_images = sorted(masks.keys() - images.keys())
-    if missing_masks or missing_images:
+def build_pairs(image_dir: str | Path, mask_dir: str | Path) -> List[Tuple[Path, Path]]:
+    images, masks = index_files(image_dir), index_files(mask_dir)
+    keys = sorted(images.keys() & masks.keys())
+    if len(keys) != len(images) or len(keys) != len(masks):
         raise RuntimeError(
-            f"Image/mask pairing failed: {len(missing_masks)} images have no mask and "
-            f"{len(missing_images)} masks have no image. "
-            f"Examples: missing masks={missing_masks[:5]}, missing images={missing_images[:5]}"
+            f"Pairing mismatch: images={len(images)}, masks={len(masks)}, pairs={len(keys)}"
         )
-    if len(common) < 2:
-        raise RuntimeError("At least two paired samples are required for train/validation split.")
-    return [(images[key], masks[key]) for key in common]
+    return [(images[key], masks[key]) for key in keys]
 
 
-class RoadFolderDataset(Dataset):
-    """Road segmentation dataset.
+def read_rgb(path: Path) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
-    [FIX] Resizing a square source tile (Massachusetts Roads tiles are
-    1500x1500) to a non-square target (e.g. img_h=512, img_w=1024, as used
-    in one run) stretches every road by a *different* factor horizontally
-    vs. vertically. For a class defined almost entirely by shape (width,
-    curvature, connectivity) that distortion actively hurts learning —
-    worse than plain downsampling. When `crop_size` is given, we instead
-    resize so the short side matches `crop_size` (aspect-ratio preserving)
-    and crop a square patch, so road geometry is never stretched.
 
-    [NEW] `road_oversample_tries`: plain random cropping on this dataset
-    would draw mostly pure-background patches, since roads are a thin,
-    sparse minority class. When training, we sample up to
-    `road_oversample_tries` candidate crop locations and keep the one with
-    the most road pixels, biasing training batches towards patches that
-    actually contain road to learn from.
-    """
+def read_binary_mask(path: Path) -> np.ndarray:
+    mask = np.asarray(Image.open(path))
+    if mask.ndim == 3:
+        mask = mask.max(axis=2)
+    return (mask > 0).astype(np.uint8)
 
-    def __init__(self, pairs, img_size, num_classes=2, augment=False,
-             crop_size=None, road_oversample_tries=0,
-             full_image=False):
+
+class RoadDataset(Dataset):
+    def __init__(
+        self,
+        pairs: Sequence[Tuple[Path, Path]],
+        crop_size: int = 512,
+        training: bool = False,
+        full_image: bool = False,
+        road_crop_probability: float = 0.5,
+        road_oversample_tries: int = 4,
+    ) -> None:
         self.pairs = list(pairs)
-        self.img_size = tuple(img_size)
-        self.num_classes = num_classes
-        self.augment = augment
         self.crop_size = crop_size
-        self.road_oversample_tries = (
-            road_oversample_tries if augment else 0
-        )
+        self.training = training
         self.full_image = full_image
+        self.road_crop_probability = road_crop_probability
+        self.road_oversample_tries = max(1, road_oversample_tries)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.pairs)
 
-    def _read_mask(self, path):
-        mask = np.asarray(Image.open(path))
-        if mask.ndim == 3:
-            mask = mask.max(axis=2)
-        if self.num_classes == 2:
-            mask = (mask > 0).astype(np.uint8)
-        elif mask.max() >= self.num_classes:
-            raise ValueError(
-                f"Mask {path} contains label {int(mask.max())}, but num_classes={self.num_classes}."
-            )
-        return mask
-
-    def _resize_short_side(self, image, mask, target):
-        """Giữ nguyên ảnh nếu đã đủ lớn; chỉ upscale ảnh nhỏ hơn crop."""
-        w, h = image.size
-    
-        if w >= target and h >= target:
-            return image, mask
-    
-        scale = max(target / w, target / h)
-    
-        new_w = max(target, round(w * scale))
-        new_h = max(target, round(h * scale))
-    
-        image = image.resize(
-            (new_w, new_h),
-            Image.Resampling.BILINEAR,
-        )
-    
-        mask = mask.resize(
-            (new_w, new_h),
-            Image.Resampling.NEAREST,
-        )
-    
+    @staticmethod
+    def _pad(image: np.ndarray, mask: np.ndarray, size: int) -> Tuple[np.ndarray, np.ndarray]:
+        height, width = mask.shape
+        pad_h, pad_w = max(0, size - height), max(0, size - width)
+        if pad_h or pad_w:
+            image = np.pad(image, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+            mask = np.pad(mask, ((0, pad_h), (0, pad_w)), mode="constant")
         return image, mask
 
-    def _crop(self, image, mask, x, y, size):
-        box = (x, y, x + size, y + size)
-        return image.crop(box), mask.crop(box)
+    def _crop(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        image, mask = self._pad(image, mask, self.crop_size)
+        height, width = mask.shape
+        max_y, max_x = height - self.crop_size, width - self.crop_size
 
-    def _road_aware_random_crop(self, image, mask, size):
-        w, h = image.size
-        max_x = max(0, w - size)
-        max_y = max(0, h - size)
-    
-        mask_array = np.asarray(mask)
-        best = None
-    
-        for _ in range(max(1, self.road_oversample_tries)):
-            x = int(torch.randint(0, max_x + 1, (1,)).item())
-            y = int(torch.randint(0, max_y + 1, (1,)).item())
-    
-            patch = mask_array[y:y + size, x:x + size]
-            road_px = int((patch > 0).sum())
-    
-            if best is None or road_px > best[0]:
-                best = (road_px, x, y)
-    
-        _, x, y = best
-        return self._crop(image, mask, x, y, size)
+        def uniform_position() -> Tuple[int, int]:
+            return random.randint(0, max_y), random.randint(0, max_x)
 
-    def __getitem__(self, index):
-        image_path, mask_path = self.pairs[index]
-        image = Image.open(image_path).convert('RGB')
-        mask = Image.fromarray(self._read_mask(mask_path))
-
-        if self.full_image:
-            pass
-        
-        # Training crop từ ảnh gốc
-        elif self.crop_size:
-            image, mask = self._resize_short_side(
-                image, mask, self.crop_size
-            )
-        
-            if self.augment:
-                image, mask = self._road_aware_random_crop(
-                    image, mask, self.crop_size
-                )
-            else:
-                w, h = image.size
-                x = (w - self.crop_size) // 2
-                y = (h - self.crop_size) // 2
-                image, mask = self._crop(
-                    image, mask, x, y, self.crop_size
-                )
-        
-        # Chỉ resize khi không sử dụng crop_size
+        use_road_crop = random.random() < self.road_crop_probability and mask.any()
+        if not use_road_crop:
+            top, left = uniform_position()
         else:
-            height, width = self.img_size
-            image = image.resize(
-                (width, height),
-                Image.Resampling.BILINEAR
+            road_y, road_x = np.nonzero(mask)
+            candidates: List[Tuple[int, int]] = []
+            for _ in range(self.road_oversample_tries):
+                index = random.randrange(len(road_y))
+                jitter = self.crop_size // 4
+                center_y = int(road_y[index]) + random.randint(-jitter, jitter)
+                center_x = int(road_x[index]) + random.randint(-jitter, jitter)
+                top = min(max(center_y - self.crop_size // 2, 0), max_y)
+                left = min(max(center_x - self.crop_size // 2, 0), max_x)
+                candidates.append((top, left))
+            top, left = max(
+                candidates,
+                key=lambda position: int(
+                    mask[
+                        position[0] : position[0] + self.crop_size,
+                        position[1] : position[1] + self.crop_size,
+                    ].sum()
+                ),
             )
-            mask = mask.resize(
-                (width, height),
-                Image.Resampling.NEAREST
-            )
 
-        image = torch.from_numpy(np.asarray(image, dtype=np.float32).copy()).permute(2, 0, 1) / 255.0
-        mask = torch.from_numpy(np.asarray(mask, dtype=np.int64).copy())
-
-        if self.augment:
-            if torch.rand(()) < 0.5:
-                image, mask = image.flip(-1), mask.flip(-1)
-            if torch.rand(()) < 0.5:
-                image, mask = image.flip(-2), mask.flip(-2)
-            # [NEW] 90-degree rotations: roads run in every direction in
-            # aerial imagery and this augmentation is "free" (no
-            # interpolation blur/artifacts unlike arbitrary-angle rotation).
-            k = int(torch.randint(0, 4, (1,)).item())
-            if k > 0:
-                image = torch.rot90(image, k, dims=(-2, -1))
-                mask = torch.rot90(mask, k, dims=(-2, -1))
-
-        mean = image.new_tensor((0.485, 0.456, 0.406)).view(3, 1, 1)
-        std = image.new_tensor((0.229, 0.224, 0.225)).view(3, 1, 1)
-        return (image - mean) / std, mask.long()
-
-
-def _compute_class_weights(pairs, num_classes):
-    counts = np.zeros(num_classes, dtype=np.float64)
-    for _, mask_path in tqdm(pairs, desc="Computing class weights"):
-        mask = np.asarray(Image.open(mask_path))
-        if mask.ndim == 3:
-            mask = mask.max(axis=2)
-        if num_classes == 2:
-            mask = (mask > 0).astype(np.int64)
-        valid = (mask >= 0) & (mask < num_classes)
-        counts += np.bincount(mask[valid].astype(np.int64), minlength=num_classes)
-    weights = counts.sum() / np.maximum(counts, 1.0)
-    weights /= weights.mean()
-    return torch.tensor(weights, dtype=torch.float32)
-
-
-def create_folder_dataloaders(image_dir, mask_dir, val_ratio, seed, batch_size,
-                              num_workers, img_size, num_classes,
-                              compute_class_weights=False,
-                              crop_size=None, road_oversample_tries=4):
-    if not 0.0 < val_ratio < 1.0:
-        raise ValueError("val_ratio must be between 0 and 1.")
-    pairs = build_image_mask_pairs(image_dir, mask_dir)
-    generator = torch.Generator().manual_seed(seed)
-    order = torch.randperm(len(pairs), generator=generator).tolist()
-    val_count = max(1, min(len(pairs) - 1, round(len(pairs) * val_ratio)))
-    val_pairs = [pairs[i] for i in order[:val_count]]
-    train_pairs = [pairs[i] for i in order[val_count:]]
-
-    # [FIX] Warn loudly about aspect-ratio-distorting resize, which silently
-    # stretches road width/curvature and is easy to miss (it trained
-    # "successfully", just worse — no error, no crash).
-    if not crop_size and img_size[0] != img_size[1]:
-        print(f"  ⚠️  WARNING: img_size={img_size} is non-square while source "
-              f"tiles are square. Resizing directly to a non-square target "
-              f"stretches roads by different factors horizontally vs. "
-              f"vertically, distorting the exact shape info the model needs "
-              f"for a thin, curved class like 'road'. Prefer --crop_size "
-              f"(aspect-preserving square crop) or a square img_h/img_w.")
-
-    train_set = RoadFolderDataset(train_pairs, img_size, num_classes, augment=True,
-                                  crop_size=crop_size, road_oversample_tries=road_oversample_tries)
-    # Validation giữ nguyên ảnh 1500x1500.
-    # Việc chia tile được thực hiện trong Trainer.validate().
-    val_set = RoadFolderDataset(
-        val_pairs,
-        img_size,
-        num_classes,
-        augment=False,
-        crop_size=None,
-        road_oversample_tries=0,
-        full_image=True,
-    )
-    loader_args = dict(num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                       persistent_workers=num_workers > 0)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              drop_last=len(train_set) > batch_size, **loader_args)
-    val_loader = DataLoader(
-        val_set,
-        batch_size=1,
-        shuffle=False,
-        drop_last=False,
-        **loader_args
-    )
-    weights = _compute_class_weights(train_pairs, num_classes) if compute_class_weights else None
-    print(f"Dataset: {len(pairs)} pairs | train={len(train_set)} | val={len(val_set)} "
-          f"| split_seed={seed}")
-    print(f"Example pair: {pairs[0][0].name} <-> {pairs[0][1].name}")
-    return train_loader, val_loader, weights
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-class _DummyWriter:
-    def __init__(self, log_dir):
-        import csv, pathlib
-        p = pathlib.Path(log_dir); p.mkdir(parents=True, exist_ok=True)
-        self._f   = open(p / "metrics.csv", 'w', newline='')
-        self._csv = csv.writer(self._f)
-        self._csv.writerow(['tag', 'step', 'value'])
-
-    def add_scalar(self, tag, value, step):
-        self._csv.writerow([tag, step, f"{value:.6f}"]); self._f.flush()
-
-    def close(self): self._f.close()
-
-
-def _make_writer(log_dir):
-    if _TB:
-        try: return SummaryWriter(log_dir=str(log_dir))
-        except Exception: pass
-    return _DummyWriter(log_dir)
-
-
-class DiagnosticLogger:
-    def __init__(self, save_dir, class_names):
-        import csv
-        self.save_dir    = Path(save_dir)
-        self.class_names = class_names
-        self.history     = defaultdict(list)
-        self._f   = open(self.save_dir / "diagnostics.csv", 'w', newline='')
-        self._csv = csv.writer(self._f)
-        self._csv.writerow(['epoch', 'key', 'value'])
-
-    def log(self, epoch, key, value):
-        self.history[key].append((epoch, float(value)))
-        self._csv.writerow([epoch, key, f"{float(value):.6f}"])
-        self._f.flush()
-
-    def log_dict(self, epoch, d, prefix=''):
-        for k, v in d.items():
-            self.log(epoch, f"{prefix}{k}" if prefix else k, v)
-
-    def print_epoch_summary(self, epoch):
-        print(f"\n{'─'*70}\n  EPOCH {epoch+1:>3} SUMMARY\n{'─'*70}")
-        metrics = [
-            ('val/miou',         'Val mIoU',        '.4f'),
-            ('val/miou_smooth',  'Val mIoU (smooth)','.4f'),
-            ('val/accuracy',     'Val Accuracy',    '.4f'),
-            ('val/loss',         'Val Loss',        '.4f'),
-            ('train/bce',        'Train BCE',       '.4f'),
-            ('train/dice',       'Train Dice',      '.4f'),
-            ('train/max_grad',   'Max Gradient',    '.3f'),
-            ('dwsa/gamma4',      'DWSA gamma4',     '.4f'),
-            ('dwsa/gamma5',      'DWSA gamma5',     '.4f'),
-            ('dwsa/gamma6',      'DWSA gamma6',     '.4f'),
-            ('fan/alpha1_mean',  'FAN alpha1',      '.4f'),
-            ('fan/alpha2_mean',  'FAN alpha2',      '.4f'),
-        ]
-        print(f"  {'Metric':<24}  {'Value':>10}  {'Trend':>12}")
-        print(f"  {'─'*24}  {'─'*10}  {'─'*12}")
-        for key, label, fmt in metrics:
-            h = self.history.get(key, [])
-            if not h: continue
-            val = h[-1][1]
-            if len(h) < 3:
-                trend = '(new)'
-            else:
-                delta = h[-1][1] - h[-3][1]
-                arrow = '↑' if delta > 1e-4 else ('↓' if delta < -1e-4 else '→')
-                trend = f"{arrow} {abs(delta):.4f}"
-            print(f"  {label:<24}  {val:>10{fmt}}  {trend:>12}")
-        print(f"{'─'*70}\n")
-
-    def print_full_history(self):
-        print(f"\n{'='*70}\n  FULL TRAINING HISTORY\n{'='*70}")
-        miou_hist = self.history.get('val/miou', [])
-        if miou_hist:
-            best_ep, best_val = max(miou_hist, key=lambda x: x[1])
-            print(f"  Best mIoU: {best_val:.4f} at epoch {best_ep+1}")
-            print(f"  Final mIoU: {miou_hist[-1][1]:.4f}")
-            if len(miou_hist) >= 10:
-                last10 = [v for _, v in miou_hist[-10:]]
-                spread = max(last10) - min(last10)
-                print(f"  Last-10 spread: {spread:.4f} {'← PLATEAU' if spread<0.003 else ''}")
-        print(f"\n  Epoch │ mIoU   │ BCE    │ Dice   │ gamma4 │ gamma5")
-        print(f"  {'─'*65}")
-        n = max((len(v) for v in self.history.values()), default=0)
-        best_miou = max((v for _, v in self.history.get('val/miou', [(0,0)])), default=0)
-        for i in range(n):
-            def _g(k):
-                h = self.history.get(k, [])
-                return h[i][1] if i < len(h) else float('nan')
-            miou = _g('val/miou')
-            mark = ' ← BEST' if not math.isnan(miou) and miou == best_miou else ''
-            print(f"  {i+1:>5} │ {miou:.4f} │ {_g('train/bce'):.4f} │ "
-                  f"{_g('train/dice'):.4f} │ {_g('dwsa/gamma4'):.4f} │ "
-                  f"{_g('dwsa/gamma5'):.4f}{mark}")
-        print(f"{'='*70}\n")
-
-    def close(self): self._f.close()
-
-
-# ============================================================
-# BN RESET (K1)
-# ============================================================
-
-def reset_bn_stats(model, momentum=0.3):
-    n = sum(1 for m in model.modules() if isinstance(m, nn.BatchNorm2d))
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.reset_running_stats(); m.momentum = momentum
-    print(f"  K1: Reset {n} BN layers, momentum={momentum}")
-
-def restore_bn_momentum(model, momentum=0.1):
-    n = sum(1 for m in model.modules() if isinstance(m, nn.BatchNorm2d))
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.momentum = momentum
-    print(f"  K1: BN momentum restored to {momentum} ({n} layers)")
-
-
-# ============================================================
-# WEIGHT LOADING
-# ============================================================
-
-def _remap_stem_key(key, N2=4):
-    import re
-    for pref in ['backbone.', 'model.', 'module.']:
-        if key.startswith(pref): key = key[len(pref):]
-    m = re.match(r'stem\.(\d+)\.(.+)$', key)
-    if not m: return key
-    idx, rest = int(m.group(1)), m.group(2)
-    def _cm(rest, pref):
-        return f'{pref}.{rest[len("conv."):].lstrip(".")}' if rest.startswith('conv.') else None
-    if idx == 0:   return _cm(rest, 'stem_conv1.0')
-    elif idx == 1: return _cm(rest, 'stem_conv2.0')
-    elif 2 <= idx <= 1+N2: return f'stem_stage2.{idx-2}.{rest}'
-    else: return f'stem_stage3.{idx-(2+N2)}.{rest}'
-
-
-def _strip_checkpoint_prefix(key):
-    """Remove wrapper prefixes while preserving backbone/head ownership."""
-    changed = True
-    while changed:
-        changed = False
-        for prefix in ('module.', 'model.'):
-            if key.startswith(prefix):
-                key = key[len(prefix):]
-                changed = True
-    return key
-
-
-def _map_gcnet_key_to_coming(key):
-    """Map only semantically compatible GCNet modules to CoMingNet."""
-    prefix_map = (
-        ('stem_conv1.0.', 'stem.0.'),
-        ('stem_conv2.0.', 'stem.1.'),
-        ('compression_1.', 'global_to_local1.'),
-        ('compression_2.', 'global_to_local2.'),
-        ('down_1.', 'local_to_global1.'),
-        ('down_2.', 'local_to_global2.'),
-        ('spp.', 'context.'),
-    )
-    for source, destination in prefix_map:
-        if key.startswith(source):
-            return destination + key[len(source):]
-    return key
-
-
-def load_pretrained_weights(
-    model,
-    ckpt_path,
-    target_variant='coming',
-    source='auto',
-    strict_match=False,
-):
-    """Load same-architecture weights or transfer compatible GCNet weights.
-
-    For GCNet -> CoMingNet, only compatible stem/fusion/context/head tensors
-    are transferred. New CoMingBlock parameters remain randomly initialized.
-    """
-    print(f"Loading pretrained weights from: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = (
-        ckpt.get('model')
-        or ckpt.get('model_state_dict')
-        or ckpt.get('state_dict')
-        or ckpt
-    )
-
-    backbone_state = model.backbone.state_dict()
-    head_state = model.decode_head.state_dict()
-    backbone_loaded, head_loaded = {}, {}
-    skipped = []
-
-    normalized = {}
-    for source_key, value in state.items():
-        key = _strip_checkpoint_prefix(source_key)
-        normalized[key] = value
-
-    if source == 'auto':
-        source = 'coming' if any(
-            ('branch_horizontal' in key or 'local_stage1' in key)
-            for key in normalized
-        ) else 'gcnet'
-    print(f"Detected pretrained source: {source}")
-
-    for source_key, value in normalized.items():
-        if source_key.startswith('decode_head.'):
-            head_key = source_key[len('decode_head.'):]
-            if head_key.startswith('conv_seg.'):
-                head_key = 'cls_seg.' + head_key[len('conv_seg.'):]
-            if head_key in head_state and head_state[head_key].shape == value.shape:
-                head_loaded[head_key] = value
-            continue
-
-        backbone_key = (
-            source_key[len('backbone.') :]
-            if source_key.startswith('backbone.')
-            else source_key
+        return (
+            image[top : top + self.crop_size, left : left + self.crop_size],
+            mask[top : top + self.crop_size, left : left + self.crop_size],
         )
 
-        if target_variant == 'coming' and source == 'gcnet':
-            # Handle the original sequential GCNet stem first.
-            if backbone_key.startswith('stem.'):
-                mapped_key = backbone_key
-            else:
-                mapped_key = _map_gcnet_key_to_coming(backbone_key)
-        elif target_variant != 'coming':
-            mapped_key = _remap_stem_key(backbone_key)
-        else:
-            mapped_key = backbone_key
-
-        matched = False
-        if (
-            mapped_key in backbone_state
-            and backbone_state[mapped_key].shape == value.shape
-        ):
-            backbone_loaded[mapped_key] = value
-            matched = True
-
-        # Suffix matching is retained only for legacy GCNet variants. It is
-        # intentionally disabled for GCNet -> CoMingNet to avoid accidental
-        # transfer into an unrelated road block with the same tensor shape.
-        if not matched and not strict_match and target_variant != 'coming':
-            for candidate in backbone_state:
-                if (
-                    (candidate.endswith(mapped_key) or mapped_key.endswith(candidate))
-                    and backbone_state[candidate].shape == value.shape
-                ):
-                    backbone_loaded[candidate] = value
-                    matched = True
-                    break
-
-        if not matched:
-            skipped.append(source_key)
-
-    model.backbone.load_state_dict(backbone_loaded, strict=False)
-    model.decode_head.load_state_dict(head_loaded, strict=False)
-
-    loaded_backbone_params = sum(
-        backbone_state[key].numel() for key in backbone_loaded
-    )
-    total_backbone_params = sum(t.numel() for t in backbone_state.values())
-    backbone_ratio = 100.0 * loaded_backbone_params / max(total_backbone_params, 1)
-
-    print(f"\n{SEP}\nTRANSFER-LEARNING SUMMARY\n{SEP}")
-    print(f"Backbone tensors: {len(backbone_loaded):>5} / {len(backbone_state)}")
-    print(f"Backbone params:  {loaded_backbone_params:>12,} / "
-          f"{total_backbone_params:,} ({backbone_ratio:.2f}%)")
-    print(f"Head tensors:     {len(head_loaded):>5} / {len(head_state)}")
-    print(f"Skipped tensors:  {len(skipped):>5}")
-    if target_variant == 'coming' and source == 'gcnet':
-        print("NOTE: CoMingBlock weights are new and were not copied from GCNet.")
-    print(f"{SEP}\n")
-    return backbone_ratio
-
-
-# ============================================================
-# OPTIMIZER & SCHEDULER
-# ============================================================
-
-def build_optimizer(model, args):
-    STEM = {'stem','stem_conv1','stem_conv2','stem_stage2','stem_stage3'}
-    dwsa, alpha, stem, backbone, head = [], [], [], [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if 'dwsa' in name:
-            dwsa.append(p)
-        elif 'alpha' in name:
-            alpha.append(p)
-        elif 'backbone' in name:
-            part = name.split('.')[1] if len(name.split('.')) > 1 else ''
-            if part in STEM:
-                stem.append(p)
-            else:
-                backbone.append(p)
-        else:
-            head.append(p)
-
-    slr = getattr(args, 'stem_lr_factor', 0.01)
-    groups = []
-    if head:     groups.append({'params': head,     'lr': args.lr,                          'name': 'head'})
-    if backbone: groups.append({'params': backbone, 'lr': args.lr * args.backbone_lr_factor,'name': 'backbone'})
-    if stem:     groups.append({'params': stem,     'lr': args.lr * slr,                    'name': 'stem'})
-    if dwsa:     groups.append({'params': dwsa,     'lr': args.lr * args.dwsa_lr_factor,    'name': 'dwsa'})
-    if alpha:    groups.append({'params': alpha,    'lr': args.lr * args.alpha_lr_factor,   'name': 'alpha'})
-
-    for g in groups: g.setdefault('initial_lr', g['lr'])
-
-    if getattr(args, 'optimizer', 'adamw').lower() == 'sgd':
-        opt = torch.optim.SGD(groups, momentum=getattr(args,'sgd_momentum',0.9),
-                              weight_decay=args.weight_decay, nesterov=True)
-        print(f"Optimizer: SGD (momentum={getattr(args,'sgd_momentum',0.9)})")
-    else:
-        opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-        print("Optimizer: AdamW")
-
-    print(f"\n{SEP}\nOPTIMIZER PARAMETER GROUPS\n{SEP}")
-    for g in groups:
-        print(f"  '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
-
-    # [FIX] The right advice here depends on whether the backbone starts
-    # from pretrained weights or from scratch — a fixed rule of thumb was
-    # wrong for one of those two cases and gave bad guidance in an earlier
-    # run. Discounting backbone/stem LR (small --*_lr_factor) is the right
-    # move when finetuning a *pretrained* backbone (protects good features
-    # from being overwritten by a freshly-initialized head). It is the
-    # *wrong* move when training everything from scratch (as CoMingNet is
-    # here, with no --pretrained_weights): the backbone then needs to learn
-    # its features at a comparable rate to the head, or it lags badly and
-    # caps achievable IoU (observed: --backbone_lr_factor 0.1 --stem_lr_factor
-    # 0.01 from scratch capped road IoU well below a from-scratch run with
-    # equal LR across groups).
-    is_finetune = bool(getattr(args, 'pretrained_weights', None))
-    head_lr = next((g['lr'] for g in groups if g['name'] == 'head'), args.lr)
-    for g in groups:
-        if g['name'] not in ('backbone', 'stem'):
-            continue
-        ratio = g['lr'] / head_lr if head_lr else 1.0
-        if is_finetune and ratio >= 0.9:
-            print(f"  ⚠️  WARNING: '{g['name']}' LR ({g['lr']:.2e}) is not meaningfully "
-                  f"lower than head LR ({head_lr:.2e}) while finetuning pretrained "
-                  f"weights (--pretrained_weights set). This risks overwriting good "
-                  f"pretrained features with noisy head gradients early on. Consider "
-                  f"--{g['name']}_lr_factor < 1.0.")
-        elif not is_finetune and ratio <= 0.05:
-            print(f"  ⚠️  WARNING: '{g['name']}' LR ({g['lr']:.2e}) is {ratio:.3f}x the "
-                  f"head LR while training from scratch (no --pretrained_weights). A "
-                  f"randomly-initialized backbone needs to learn features at a "
-                  f"comparable rate to the head, or it becomes a bottleneck that caps "
-                  f"achievable IoU. Consider raising --{g['name']}_lr_factor towards "
-                  f"0.5-1.0 for from-scratch training.")
-    print(f"{SEP}\n")
-    return opt
-
-
-class WarmupWrapper:
-    """Linear LR warmup applied before handing control to the base scheduler.
-
-    [FIX] Training from scratch with lr=3e-4 applied immediately to the whole
-    backbone is a common source of the large early-epoch gradient spikes and
-    mIoU oscillation seen in the logs (e.g. max grad 1.86 -> 0.54 -> 0.78 in
-    the first few epochs, mIoU dropping from 0.50 to 0.37 at epoch 4). A short
-    linear warmup smooths this out.
-    """
-
-    def __init__(self, optimizer, base_scheduler, warmup_epochs, warmup_start_factor=0.1):
-        self.optimizer = optimizer
-        self.base_scheduler = base_scheduler
-        self.warmup_epochs = max(0, warmup_epochs)
-        self.warmup_start_factor = warmup_start_factor
-        self.target_lrs = [g['lr'] for g in optimizer.param_groups]
-        self._epoch = 0
-        if self.warmup_epochs > 0:
-            self._set_lrs(self.warmup_start_factor)
-
-    def _set_lrs(self, factor):
-        for g, target in zip(self.optimizer.param_groups, self.target_lrs):
-            g['lr'] = target * factor
-
-    def step(self):
-        self._epoch += 1
-        if self._epoch <= self.warmup_epochs:
-            factor = self.warmup_start_factor + (1.0 - self.warmup_start_factor) * (
-                self._epoch / max(1, self.warmup_epochs)
-            )
-            self._set_lrs(factor)
-        else:
-            if self.base_scheduler is not None:
-                self.base_scheduler.step()
-
-    def state_dict(self):
-        return {
-            'epoch': self._epoch,
-            'base': self.base_scheduler.state_dict() if self.base_scheduler else None,
-        }
-
-    def load_state_dict(self, state):
-        if not state:
-            return
-        self._epoch = state.get('epoch', 0)
-        if self.base_scheduler is not None and state.get('base'):
-            try:
-                self.base_scheduler.load_state_dict(state['base'])
-            except Exception as e:
-                print(f"Warmup base scheduler not loaded: {e}")
-
-
-def build_scheduler(optimizer, args, train_loader, start_epoch=0):
-    use_cosine = (args.freeze_backbone and args.unfreeze_schedule) or args.scheduler == 'cosine'
-    warmup_epochs = getattr(args, 'warmup_epochs', 0)
-    remaining_epochs = max(1, args.epochs - start_epoch - warmup_epochs)
-
-    if use_cosine:
-        sch = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=remaining_epochs, eta_min=1e-6)
-        print(f"CosineAnnealingLR (T_max={remaining_epochs})")
-    elif args.scheduler == 'onecycle':
-        steps   = len(train_loader) * (args.epochs - start_epoch)
-        max_lrs = [g['initial_lr'] for g in optimizer.param_groups]
-        sch = optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=max_lrs, total_steps=steps,
-            pct_start=0.05, anneal_strategy='cos',
-            cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,
-            div_factor=25, final_div_factor=100000)
-        print(f"OneCycleLR (steps={steps})")
-    elif args.scheduler == 'cosine_wr':
-        T0 = getattr(args, 'cosine_wr_t0', 10)
-        sch = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=T0, T_mult=1, eta_min=1e-7)
-        print(f"CosineAnnealingWarmRestarts (T_0={T0})")
-    else:
-        sch = optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lambda e: (1 - e/args.epochs)**0.9)
-        print("Polynomial LR")
-
-    if warmup_epochs > 0 and args.scheduler != 'onecycle':
-        print(f"Linear LR warmup: {warmup_epochs} epoch(s)")
-        return WarmupWrapper(optimizer, sch, warmup_epochs,
-                             warmup_start_factor=getattr(args, 'warmup_start_factor', 0.1))
-    return sch
-
-
-# ============================================================
-# LOSS FUNCTIONS
-# ============================================================
-
-class BCEDiceLoss(nn.Module):
-    """Binary Cross-Entropy + Dice — simple, standard combo for binary
-    (background/road) segmentation. No hard-example mining, no
-    Tversky/clDice knobs: two terms, easy to reason about while the model
-    architecture itself is being iterated on.
-
-    Works directly on the model's 2-channel logits (road_logit =
-    logits[:,1] - logits[:,0] is exactly the binary logit a 2-class softmax
-    implies, so this is a drop-in replacement for CE on a 2-class head).
-
-    `pos_weight` (optional) up-weights the positive/road class in the BCE
-    term — pass `neg_count / pos_count` to counter class imbalance, e.g.
-    derived from the same per-class counts used elsewhere for class_weights.
-    """
-
-    def __init__(self, dice_weight=0.5, smooth=1e-5, ignore_index=255,
-                 pos_weight=None, road_class=1):
-        super().__init__()
-        self.dice_weight = dice_weight
-        self.smooth = smooth
-        self.ignore_index = ignore_index
-        self.road_class = road_class
-        pw = torch.tensor(float(pos_weight)) if pos_weight is not None else None
-        self.register_buffer('pos_weight', pw)
-
-    def forward(self, logits, targets):
-        logits = logits.float()
-        valid = (targets != self.ignore_index).float()
-        target_bin = (targets == self.road_class).float()
-
-        road_logit = logits[:, self.road_class] - logits[:, 1 - self.road_class]
-
-        pos_weight = self.pos_weight.to(device=logits.device, dtype=logits.dtype) \
-            if self.pos_weight is not None else None
-        bce_px = F.binary_cross_entropy_with_logits(
-            road_logit, target_bin, pos_weight=pos_weight, reduction='none')
-        bce = (bce_px * valid).sum() / valid.sum().clamp(min=1)
-
-        prob = torch.sigmoid(road_logit) * valid
-        tgt = target_bin * valid
-        inter = (prob * tgt).sum(dim=(1, 2))
-        denom = prob.sum(dim=(1, 2)) + tgt.sum(dim=(1, 2))
-        dice = (2 * inter + self.smooth) / (denom + self.smooth)
-        dice_loss = 1.0 - dice.mean()
-
-        total = bce + self.dice_weight * dice_loss
-        return total, bce.detach(), dice_loss.detach()
-
-
-
-
-# ============================================================
-# UTILITIES
-# ============================================================
-
-def check_gradients(model, threshold=10.0):
-    max_g, max_n = 0.0, ""
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            g = p.grad.norm().item()
-            if g > max_g: max_g, max_n = g, name
-    if max_g > threshold:
-        print(f"Large gradient: {max_n[:60]}... = {max_g:.2f}")
-    return max_g
-
-
-def check_spp_bn_health(model, epoch):
-    spp = getattr(model.backbone, 'spp', None)
-    if spp is None:
-        spp = getattr(model.backbone, 'context', None)
-    if spp is None: return
-    for name, m in spp.named_modules():
-        if not isinstance(m, nn.BatchNorm2d): continue
-        rv = m.running_var
-        if rv is None: continue
-        bad = torch.isnan(rv).any() or torch.isinf(rv).any() or rv.min() < 1e-6
-        if bad:
-            print(f"  ⚠️ SPP BN bad: spp.{name} — resetting")
-            m.running_mean.zero_(); m.running_var.fill_(1.0)
-
-
-def log_dwsa_health(model, epoch, diag):
-    print(f"\n  DWSA Health (epoch {epoch+1}):")
-    print(f"  {'Stage':<12} {'gamma':>8}  {'Δgamma':>8}  Status")
-    print(f"  {'─'*48}")
-    for name, tag in [('dwsa_stage4','gamma4'),('dwsa_stage5','gamma5'),('dwsa_stage6','gamma6')]:
-        mod = getattr(model.backbone, name, None)
-        if mod is None: continue
-        g = mod.gamma.item()
-        diag.log(epoch, f'dwsa/{tag}', g)
-        h = diag.history.get(f'dwsa/{tag}', [])
-        delta = f"{g-h[-2][1]:+.5f}" if len(h) >= 2 else '(first)'
-        status = ('⚠️  NOT LEARNING' if g < 0.11 else '📈 Warming up' if g < 0.2 else '✅ Active' if g < 0.4 else '🔥 Highly active')
-        print(f"  {name:<12} {g:>8.5f}  {delta:>8}  {status}")
-    print()
-
-
-def log_fan_health(model, epoch, diag):
-    info = []
-    for stem, tag in [('stem_conv1','1'),('stem_conv2','2')]:
-        mod = getattr(model.backbone, stem, None)
-        if mod is None or len(mod) < 2 or not hasattr(mod[1], 'alpha'): continue
-        a   = torch.sigmoid(mod[1].alpha.data)
-        info.append((stem, a.mean().item(), a.std().item(), a.min().item(), a.max().item()))
-        diag.log(epoch, f'fan/alpha{tag}_mean', a.mean().item())
-    if not info: return
-    print(f"  FoggyAwareNorm alpha (epoch {epoch+1}):")
-    print(f"  {'Layer':<12} {'mean':>7} {'std':>7} {'min':>7} {'max':>7}  Blend")
-    print(f"  {'─'*53}")
-    for stem, mean, std, mn, mx in info:
-        bias = '→ IN' if mean > 0.6 else ('→ BN' if mean < 0.4 else 'balanced')
-        print(f"  {stem:<12} {mean:>7.4f} {std:>7.4f} {mn:>7.4f} {mx:>7.4f}  {bias} {'█'*int(mean*20)}")
-    print()
-
-
-def count_trainable_params(model):
-    tot  = sum(p.numel() for p in model.parameters())
-    tr   = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    bbt  = sum(p.numel() for p in model.backbone.parameters())
-    bbtr = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
-    hdt  = sum(p.numel() for p in model.decode_head.parameters())
-    hdtr = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
-    print(f"\n{SEP}\nPARAMETER STATISTICS\n{SEP}")
-    print(f"Total:      {tot:>15,} | 100%")
-    print(f"Trainable:  {tr:>15,} | {100*tr/tot:.1f}%")
-    print(f"Frozen:     {tot-tr:>15,} | {100*(tot-tr)/tot:.1f}%")
-    print(f"{'─'*70}")
-    print(f"Backbone:   {bbtr:>15,} / {bbt:,} | {100*bbtr/max(bbt,1):.1f}%")
-    print(f"Head:       {hdtr:>15,} / {hdt:,} | {100*hdtr/max(hdt,1):.1f}%")
-    print(f"{SEP}\n")
-
-
-def freeze_backbone(model, variant='fan_dwsa'):
-    has_dwsa = hasattr(model.backbone, 'dwsa_stage4')
-    has_fan  = (hasattr(model.backbone, 'stem_conv1') and
-                len(model.backbone.stem_conv1) > 1 and
-                hasattr(model.backbone.stem_conv1[1], 'alpha'))
-    print(f"Freezing backbone...")
-    for p in model.backbone.parameters(): p.requires_grad = False
-    for m in model.backbone.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.eval()
-            if m.weight is not None: m.weight.requires_grad = False
-            if m.bias   is not None: m.bias.requires_grad   = False
-
-    if has_dwsa:
-        for name in ['dwsa_stage4','dwsa_stage5','dwsa_stage6']:
-            mod = getattr(model.backbone, name, None)
-            if mod is None: continue
-            for p in mod.parameters(): p.requires_grad = True
-            for m in mod.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.train()
-                    if m.weight is not None: m.weight.requires_grad = True
-                    if m.bias   is not None: m.bias.requires_grad   = True
-
-    if has_fan:
-        for name in ['stem_conv1','stem_conv2']:
-            mod = getattr(model.backbone, name, None)
-            if mod is None or len(mod) < 2 or not hasattr(mod[1], 'alpha'): continue
-            for p in mod[1].parameters(): p.requires_grad = True
-            mod[1].bn.train()
-            if mod[1].bn.weight is not None: mod[1].bn.weight.requires_grad = True
-            if mod[1].bn.bias   is not None: mod[1].bn.bias.requires_grad   = True
-    print("Backbone frozen\n")
-
-
-def unfreeze_backbone_progressive(model, stage_names):
-    if isinstance(stage_names, str): stage_names = [stage_names]
-    total = 0
-    for name in stage_names:
-        mod = getattr(model.backbone, name, None)
-        if mod is None and '.' in name:
-            parts = name.split('.', 1)
-            base  = getattr(model.backbone, parts[0], None)
-            if base is not None and parts[1].isdigit():
-                try: mod = base[int(parts[1])]
-                except: pass
-        if mod is None: print(f"  [skip] '{name}' not found"); continue
-        cnt = 0
-        for p in mod.parameters():
-            if not p.requires_grad: p.requires_grad = True; cnt += 1
-        for m in mod.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.train()
-                if m.weight is not None: m.weight.requires_grad = True
-                if m.bias   is not None: m.bias.requires_grad   = True
-        total += cnt
-        if cnt: print(f"  Unfrozen: backbone.{name} ({cnt:,} params)")
-    print(f"  Total unfrozen: {total:,} params\n")
-
-
-def print_backbone_structure(model):
-    print(f"\n{SEP}\n BACKBONE STRUCTURE\n{SEP}")
-    for name, mod in model.backbone.named_children():
-        n = sum(p.numel() for p in mod.parameters())
-        if isinstance(mod, nn.ModuleList):
-            print(f"  {name}: ModuleList[{len(mod)}]  ({n:,} params)")
-            for i, sub in enumerate(mod):
-                sp = sum(p.numel() for p in sub.parameters())
-                print(f"    [{i}]: {type(sub).__name__}  ({sp:,} params)")
-        else:
-            print(f"  {name}: {type(mod).__name__}  ({n:,} params)")
-    print(f"{SEP}\n")
-
-
-def get_context_module(backbone):
-    """Return GCNet SPP or CoMingNet context module."""
-    module = getattr(backbone, 'spp', None)
-    return module if module is not None else getattr(backbone, 'context', None)
-
-
-def freeze_module_and_bn(module):
-    if module is None:
-        return 0
-    frozen = 0
-    for parameter in module.parameters():
-        if parameter.requires_grad:
-            frozen += parameter.numel()
-        parameter.requires_grad = False
-    for child in module.modules():
-        if isinstance(child, nn.BatchNorm2d):
-            child.eval()
-    return frozen
-
-
-def freeze_stem_only(model, variant, verbose=True):
-    """Freeze the selected backbone stem without assuming GCNet key names."""
-    if variant == 'coming':
-        frozen = freeze_module_and_bn(getattr(model.backbone, 'stem', None))
-        if verbose:
-            print(f"CoMingNet stem frozen: {frozen:,} params")
-        return frozen
-
-    frozen = 0
-    for stem_name in ('stem_conv1', 'stem_conv2'):
-        module = getattr(model.backbone, stem_name, None)
-        if module is None:
-            continue
-        for parameter_name, parameter in module.named_parameters():
-            # Preserve trainable FAN parameters in legacy variants.
-            if not any(key in parameter_name for key in ('alpha', 'bn.', 'in_.')):
-                if parameter.requires_grad:
-                    frozen += parameter.numel()
-                parameter.requires_grad = False
-
-    for stem_name in ('stem_stage2', 'stem_stage3'):
-        frozen += freeze_module_and_bn(getattr(model.backbone, stem_name, None))
-    if verbose:
-        print(f"GCNet stem frozen: {frozen:,} params (FAN remains trainable)")
-    return frozen
-
-
-# ============================================================
-# MODEL CONFIG
-# ============================================================
-
-class ModelConfig:
     @staticmethod
-    def get_config(
-        variant='fan_dwsa',
-        coming_kernel_size=7,
-        local_blocks=(2, 2, 2),
-        global_blocks=(2, 3, 2),
-    ):
-        C = 32
-        if variant == 'coming':
-            return {
-                "backbone": {
-                    "in_channels": 3,
-                    "channels": C,
-                    "ppm_channels": 128,
-                    "local_blocks": tuple(local_blocks),
-                    "global_blocks": tuple(global_blocks),
-                    "kernel_size": coming_kernel_size,
-                    "align_corners": False,
-                    "deploy": False,
-                    "zero_init_residual": False,
-                    "norm_cfg": dict(type='BN', requires_grad=True),
-                    "act_cfg": dict(type='ReLU', inplace=True),
-                },
-                "head": {
-                    "in_channels": C * 4,
-                    "channels": 64,
-                    "align_corners": False,
-                    "dropout_ratio": 0.1,
-                    "loss_weight_aux": 0.4,
-                    "norm_cfg": dict(type='BN', requires_grad=True),
-                    "act_cfg": dict(type='ReLU', inplace=True),
-                },
-                "loss": {
-                    "dice_weight": 0.5,
-                    "dice_smooth": 1e-5,
-                },
-            }
+    def _augment(image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Spatial scale never changes: item 12 (multi-scale augmentation) is omitted.
+        if random.random() < 0.5:
+            image, mask = image[:, ::-1], mask[:, ::-1]
+        if random.random() < 0.5:
+            image, mask = image[::-1, :], mask[::-1, :]
+        rotations = random.randrange(4)
+        if rotations:
+            image = np.rot90(image, rotations)
+            mask = np.rot90(mask, rotations)
+        if random.random() < 0.6:
+            gain = random.uniform(0.85, 1.15)
+            bias = random.uniform(-12.0, 12.0)
+            image = np.clip(image.astype(np.float32) * gain + bias, 0, 255).astype(np.uint8)
+        return image, mask
 
-        bb = {
-            "in_channels": 3, "channels": C, "ppm_channels": 128,
-            "num_blocks_per_stage": [4, 4, [5,4], [5,4], [2,2]],
-            "align_corners": False, "deploy": False,
-            "norm_cfg": dict(type='BN', requires_grad=True),
-            "act_cfg":  dict(type='ReLU', inplace=True),
-        }
-        if variant in ('fan_dwsa', 'dwsa_only'):
-            bb["dwsa_reduction"] = 8
-        return {
-            "backbone": bb,
-            "head": {
-                "in_channels": C*4, "channels": 64,
-                "align_corners": False, "dropout_ratio": 0.1,
-                "loss_weight_aux": 0.4,
-                "norm_cfg": dict(type='BN', requires_grad=True),
-                "act_cfg":  dict(type='ReLU', inplace=True),
-            },
-            "loss": {"dice_weight": 0.5, "dice_smooth": 1e-5},
-        }
+    @staticmethod
+    def _to_tensor(image: np.ndarray, mask: np.ndarray) -> Tuple[Tensor, Tensor]:
+        image_float = image.astype(np.float32) / 255.0
+        image_float = (image_float - IMAGENET_MEAN) / IMAGENET_STD
+        image_tensor = torch.from_numpy(
+            np.ascontiguousarray(image_float.transpose(2, 0, 1))
+        )
+        mask_tensor = torch.from_numpy(np.ascontiguousarray(mask)).long()
+        return image_tensor, mask_tensor
+
+    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor]:
+        image_path, mask_path = self.pairs[index]
+        image, mask = read_rgb(image_path), read_binary_mask(mask_path)
+        if not self.full_image:
+            image, mask = self._crop(image, mask)
+        if self.training:
+            image, mask = self._augment(image, mask)
+        return self._to_tensor(image, mask)
 
 
-# ============================================================
-# SEGMENTOR
-# ============================================================
+def split_or_official_pairs(args: argparse.Namespace) -> Tuple[List, List]:
+    train_pairs = build_pairs(args.image_dir, args.mask_dir)
+    val_image_dir, val_mask_dir = Path(args.val_image_dir), Path(args.val_mask_dir)
+    if val_image_dir.is_dir() and val_mask_dir.is_dir():
+        val_pairs = build_pairs(val_image_dir, val_mask_dir)
+        print(f"Official split: train={len(train_pairs)}, val={len(val_pairs)}")
+        return train_pairs, val_pairs
+
+    generator = np.random.default_rng(args.seed)
+    indices = generator.permutation(len(train_pairs))
+    val_count = max(1, round(len(train_pairs) * args.val_ratio))
+    val_indices = set(indices[:val_count].tolist())
+    val_pairs = [pair for index, pair in enumerate(train_pairs) if index in val_indices]
+    train_pairs = [pair for index, pair in enumerate(train_pairs) if index not in val_indices]
+    print(
+        f"WARNING: official val folders not found; deterministic random split "
+        f"train={len(train_pairs)}, val={len(val_pairs)}"
+    )
+    return train_pairs, val_pairs
+
+
+def make_loaders(args: argparse.Namespace):
+    train_pairs, val_pairs = split_or_official_pairs(args)
+    train_dataset = RoadDataset(
+        train_pairs,
+        crop_size=args.crop_size,
+        training=True,
+        road_crop_probability=args.road_crop_probability,
+        road_oversample_tries=args.road_oversample_tries,
+    )
+    val_dataset = RoadDataset(
+        val_pairs, crop_size=args.crop_size, training=False, full_image=True
+    )
+    common = dict(
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        **common,
+    )
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, **common)
+    return train_loader, val_loader, train_pairs
+
+
+def compute_pos_weight(pairs: Sequence[Tuple[Path, Path]], cap: float) -> Tuple[float, float]:
+    positive, total = 0, 0
+    for _, mask_path in tqdm(pairs, desc="Computing road pixel ratio"):
+        mask = read_binary_mask(mask_path)
+        positive += int(mask.sum())
+        total += mask.size
+    negative = total - positive
+    raw = negative / max(positive, 1)
+    used = min(math.sqrt(raw), cap)
+    return raw, used
+
 
 class Segmentor(nn.Module):
-    def __init__(self, backbone, head):
+    def __init__(self, backbone: CoMingNet, decode_head: GCNetHead) -> None:
         super().__init__()
-        self.backbone    = backbone
-        self.decode_head = head
+        self.backbone = backbone
+        self.decode_head = decode_head
 
-    def forward(self, x):
+    def forward(self, x: Tensor):
         return self.decode_head(self.backbone(x))
 
-    def forward_train(self, x):
-        return {"main": self.decode_head(self.backbone(x))}
+    def switch_to_deploy(self) -> "Segmentor":
+        self.backbone.switch_to_deploy()
+        self.decode_head.switch_to_deploy()
+        return self
 
 
-# ============================================================
-# TRAINER
-# ============================================================
+def build_model(args: argparse.Namespace) -> Segmentor:
+    if args.model_variant != "coming":
+        raise ValueError("This balanced file intentionally supports --model_variant coming only")
+    feature_channels = args.channels * 4
+    backbone = CoMingNet(
+        in_channels=3,
+        channels=args.channels,
+        local_blocks=args.local_blocks,
+        global_blocks=args.global_blocks,
+        highres_kernel_size=args.highres_kernel_size,
+        context_kernel_size=args.coming_kernel_size,
+    )
+    head = GCNetHead(
+        in_channels=feature_channels,
+        channels=args.decoder_channels,
+        num_classes=2,
+        feature_channels=(feature_channels, feature_channels, feature_channels),
+        highres_kernel_size=args.highres_kernel_size,
+        context_kernel_size=args.coming_kernel_size,
+        dropout_ratio=args.dropout,
+    )
+    model = Segmentor(backbone, head)
+    zeroed = 0
+    for module in model.modules():
+        if isinstance(module, CoMingBlock):
+            module.zero_init_residual()
+            zeroed += 1
+    print(f"Zero-initialized residual branches: {zeroed} CoMingBlocks")
+    return model
 
-class Trainer:
-    def __init__(self, model, optimizer, scheduler, device, args,
-                 class_weights=None, diag=None):
-        self.model       = model.to(device)
-        self.optimizer   = optimizer
-        self.scheduler   = scheduler
-        self.device      = device
-        self.args        = args
-        self.best_miou   = 0.0
-        self.best_metric_value = 0.0
-        self.start_epoch = 0
-        self.global_step = 0
-        self.diag        = diag
 
-        # [NEW] Smoothed / alternative best-checkpoint tracking.
-        # A single noisy epoch (val mIoU jumps of +/-0.08-0.15 are common in
-        # the previous run) can look like "the best model" while actually
-        # being a lucky/unlucky validation pass. Averaging over a small
-        # window makes checkpoint selection more robust.
-        self.miou_window = deque(maxlen=max(1, getattr(args, 'best_metric_window', 1)))
-        self.best_metric_class = getattr(args, 'best_metric_class', None)
+def road_logit(logits: Tensor) -> Tensor:
+    if logits.shape[1] != 2:
+        raise ValueError("The balanced loss expects two output channels")
+    return logits[:, 1:2] - logits[:, 0:1]
 
-        lcfg = args.loss_config
-        self.dice_weight  = lcfg['dice_weight']
-        self.base_loss_cfg = lcfg
-        self.loss_phase   = 'full'
 
-        # [SIMPLIFIED] Single BCE + Dice loss, no OHEM/Tversky/clDice —
-        # fewer moving parts while the model architecture is being
-        # iterated on. pos_weight (neg/pos pixel ratio) reuses the same
-        # per-class counts as class_weights to counter road being the
-        # minority class, without a separate hard-mining mechanism.
-        pos_weight = None
+def soft_dice_loss(probability: Tensor, target: Tensor, eps: float = 1e-6) -> Tensor:
+    dims = (1, 2, 3)
+    intersection = (probability * target).sum(dim=dims)
+    denominator = probability.sum(dim=dims) + target.sum(dim=dims)
+    return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
 
-        if class_weights is not None and len(class_weights) == 2:
-            raw_pos_weight = (
-                class_weights[1] / class_weights[0]
-            ).item()
-        
-            # Dùng căn bậc hai để tránh road class bị khuếch đại quá mạnh
-            pos_weight = min(math.sqrt(raw_pos_weight), 5.0)
-        
-            print(
-                f"Class imbalance: raw_pos_weight={raw_pos_weight:.4f}, "
-                f"used_pos_weight={pos_weight:.4f}"
-            )
-        self.criterion = BCEDiceLoss(
-            dice_weight=self.dice_weight,
-            smooth=lcfg['dice_smooth'],
-            ignore_index=args.ignore_index,
-            pos_weight=pos_weight,
-            road_class=getattr(args, 'road_class', 1),
-        ).to(device)
-        print(f"Loss: BCE + Dice({self.dice_weight})"
-              + (f", pos_weight={pos_weight:.3f}" if pos_weight is not None else ""))
 
-        self.scaler   = GradScaler(enabled=args.use_amp)
-        self.save_dir = Path(args.save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.writer   = _make_writer(self.save_dir / "tensorboard")
-        self._save_config()
-        self._print_config()
+def soft_boundary_map(value: Tensor, kernel_size: int = 3) -> Tensor:
+    padding = kernel_size // 2
+    maximum = F.max_pool2d(value, kernel_size, stride=1, padding=padding)
+    minimum = -F.max_pool2d(-value, kernel_size, stride=1, padding=padding)
+    return (maximum - minimum).clamp(0.0, 1.0)
 
-    def _save_config(self):
-        with open(self.save_dir / "config.json", "w") as f:
-            json.dump(vars(self.args), f, indent=2, default=str)
 
-    def _print_config(self):
-        print(f"\n{SEP}\nTRAINER CONFIGURATION\n{SEP}")
-        print(f"Batch size:            {self.args.batch_size}")
-        print(f"Gradient accumulation: {self.args.accumulation_steps}")
-        print(f"Effective batch:       {self.args.batch_size * self.args.accumulation_steps}")
-        print(f"Mixed precision:       {self.args.use_amp}")
-        print(f"Gradient clipping:     {self.args.grad_clip}")
-        print(f"Loss: BCE + Dice({self.dice_weight})")
-        print(f"{SEP}\n")
+def soft_erode(value: Tensor) -> Tensor:
+    vertical = -F.max_pool2d(-value, (3, 1), stride=1, padding=(1, 0))
+    horizontal = -F.max_pool2d(-value, (1, 3), stride=1, padding=(0, 1))
+    return torch.minimum(vertical, horizontal)
 
-    def set_loss_phase(self, phase):
-        if phase == self.loss_phase: return
-        self.dice_weight = 0.0 if phase == 'ce_only' else self.base_loss_cfg['dice_weight']
-        self.criterion.dice_weight = self.dice_weight
-        self.loss_phase  = phase
-        print(f"Loss phase → {phase}  (BCE + Dice={self.dice_weight})")
 
-    def train_epoch(self, loader, epoch):
-        self.model.train()
+def soft_dilate(value: Tensor) -> Tensor:
+    return F.max_pool2d(value, 3, stride=1, padding=1)
 
-        # Re-apply freezes each epoch (model.train() doesn't restore requires_grad)
-        if getattr(self.args, "freeze_spp_bn", False):
-            spp = get_context_module(self.model.backbone)
-            if spp:
-                for p in spp.parameters(): p.requires_grad = False
-                for m in spp.modules():
-                    if isinstance(m, nn.BatchNorm2d): m.eval()
 
-        if getattr(self.args, "freeze_stem_conv", False):
-            freeze_stem_only(self.model, self.args.model_variant, verbose=False)
+def soft_skeleton(value: Tensor, iterations: int = 5) -> Tensor:
+    opened = soft_dilate(soft_erode(value))
+    skeleton = F.relu(value - opened)
+    for _ in range(iterations):
+        value = soft_erode(value)
+        opened = soft_dilate(soft_erode(value))
+        delta = F.relu(value - opened)
+        skeleton = skeleton + F.relu(delta - skeleton * delta)
+    return skeleton
 
-        total_loss = total_bce = total_dice = 0.0
-        max_grad_epoch = 0.0
-        # [FIX] `mg` used to only be defined inside the
-        # `if (batch_idx+1) % accumulation_steps == 0:` block below, but was
-        # referenced unconditionally in `pbar.set_postfix` every iteration.
-        # With accumulation_steps > 1 this raises a NameError on the very
-        # first batch. Initialize it up-front so the progress bar always has
-        # a valid (possibly stale, until the next optimizer step) value.
-        mg = 0.0
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
 
-        for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs  = imgs.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True).long()
-            if masks.dim() == 4: masks = masks.squeeze(1)
+def soft_cldice_loss(probability: Tensor, target: Tensor, iterations: int = 5) -> Tensor:
+    pred_skeleton = soft_skeleton(probability, iterations)
+    target_skeleton = soft_skeleton(target, iterations)
+    smooth = 1e-6
+    topology_precision = (
+        (pred_skeleton * target).sum(dim=(1, 2, 3)) + smooth
+    ) / (pred_skeleton.sum(dim=(1, 2, 3)) + smooth)
+    topology_sensitivity = (
+        (target_skeleton * probability).sum(dim=(1, 2, 3)) + smooth
+    ) / (target_skeleton.sum(dim=(1, 2, 3)) + smooth)
+    cldice = (
+        2.0 * topology_precision * topology_sensitivity
+        / (topology_precision + topology_sensitivity + smooth)
+    )
+    return (1.0 - cldice).mean()
 
-            with autocast(device_type='cuda', enabled=self.args.use_amp):
-                c4_logit, c6_logit = self.model.forward_train(imgs)["main"]
-                target_size = masks.shape[-2:]
-                c4_full = F.interpolate(c4_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
-                c6_full = F.interpolate(c6_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
 
-                task_loss, bce_loss, dice_loss = self.criterion(c6_full, masks)
-
-                if self.args.aux_weight > 0:
-                    aux_decay = getattr(self.args, 'aux_decay_exp', 0.9)
-                    aux_w     = self.args.aux_weight * (1 - epoch / self.args.epochs) ** aux_decay
-                    aux_loss, _, _ = self.criterion(c4_full, masks)
-                    task_loss = task_loss + aux_w * aux_loss
-
-                loss = task_loss / self.args.accumulation_steps
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n⚠️ NaN/Inf loss at batch {batch_idx} — skipping")
-                self.optimizer.zero_grad(set_to_none=True); continue
-
-            self.scaler.scale(loss).backward()
-
-            if (batch_idx + 1) % self.args.accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-            
-                # Trả về total gradient norm trước clipping
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=self.args.grad_clip,
-                    error_if_nonfinite=False,
-                )
-            
-                mg = float(grad_norm.detach().cpu())
-            
-                # Không cập nhật weight nếu gradient là NaN hoặc Inf
-                if not torch.isfinite(grad_norm):
-                    print(
-                        f"\n⚠️ Non-finite gradient at batch {batch_idx}. "
-                        "Skipping optimizer step."
-                    )
-            
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scaler.update()
-                    mg = 0.0
-                    continue
-            
-                max_grad_epoch = max(max_grad_epoch, mg)
-            
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-            
-                self.global_step += 1
-            
-                if self.scheduler and self.args.scheduler == "onecycle":
-                    self.scheduler.step()
-
-            total_loss += loss.item() * self.args.accumulation_steps
-            total_bce  += bce_loss.item()
-            total_dice += dice_loss.item()
-
-            pbar.set_postfix({
-                'loss': f'{loss.item()*self.args.accumulation_steps:.4f}',
-                'bce':  f'{bce_loss.item():.4f}',
-                'dice': f'{dice_loss.item():.4f}',
-                'lr':   f'{self.optimizer.param_groups[0]["lr"]:.2e}',
-                'mg':   f'{mg:.2f}',
-            })
-            if batch_idx % 200 == 0: torch.cuda.empty_cache()
-
-        n = len(loader)
-        print(f"\nEpoch {epoch+1} — Max grad: {max_grad_epoch:.2f}")
-        print(f"  LR head={self.optimizer.param_groups[0]['lr']:.2e}")
-
-        torch.cuda.empty_cache()
-        if self.scheduler and self.args.scheduler != 'onecycle':
-            self.scheduler.step()
-
-        result = {'loss': total_loss/n, 'bce': total_bce/n, 'dice': total_dice/n}
-        if self.diag:
-            self.diag.log_dict(epoch, result, prefix='train/')
-            self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
-        return result
-    @staticmethod
-    def _sliding_positions(length, tile_size, stride):
-        """Sinh vị trí tile và bảo đảm phủ kín mép ảnh."""
-        if length <= tile_size:
-            return [0]
-    
-        positions = list(
-            range(0, length - tile_size + 1, stride)
-        )
-    
-        last_position = length - tile_size
-    
-        if positions[-1] != last_position:
-            positions.append(last_position)
-    
-        return positions
-    
-    
-    @torch.no_grad()
-    def sliding_window_inference(
+class RoadLoss(nn.Module):
+    def __init__(
         self,
-        image,
-        tile_size=512,
-        overlap=128,
-        tile_batch_size=4,
-    ):
-        """
-        image: [1, C, H, W]
-    
-        Chia ảnh thành các tile có overlap, dự đoán rồi ghép logits
-        bằng weighted averaging.
-        """
-        if image.shape[0] != 1:
-            raise ValueError(
-                "Sliding-window validation requires val batch_size=1."
-            )
-    
-        _, _, height, width = image.shape
-    
-        stride = tile_size - overlap
-        if stride <= 0:
-            raise ValueError("overlap must be smaller than tile_size.")
-    
-        # Trường hợp ảnh nhỏ hơn tile_size
-        pad_h = max(0, tile_size - height)
-        pad_w = max(0, tile_size - width)
-    
-        if pad_h > 0 or pad_w > 0:
-            image_padded = F.pad(
-                image,
-                (0, pad_w, 0, pad_h),
-                mode="reflect",
-            )
-        else:
-            image_padded = image
-    
-        padded_h, padded_w = image_padded.shape[-2:]
-    
-        y_positions = self._sliding_positions(
-            padded_h, tile_size, stride
-        )
-        x_positions = self._sliding_positions(
-            padded_w, tile_size, stride
-        )
-    
-        # Cosine weight giảm seam tại biên giữa các patch
-        window_1d = torch.hann_window(
-            tile_size,
-            periodic=False,
-            device=image.device,
-            dtype=torch.float32,
-        ).clamp_min(0.05)
-    
-        weight = (
-            window_1d[:, None] * window_1d[None, :]
-        ).view(1, 1, tile_size, tile_size)
-    
-        logits_sum = torch.zeros(
-            (1, self.args.num_classes, padded_h, padded_w),
-            device=image.device,
-            dtype=torch.float32,
-        )
-    
-        weight_sum = torch.zeros(
-            (1, 1, padded_h, padded_w),
-            device=image.device,
-            dtype=torch.float32,
-        )
-    
-        patches = []
-        coordinates = []
+        pos_weight: float = 1.0,
+        dice_weight: float = 0.5,
+        boundary_weight: float = 0.1,
+        cldice_weight: float = 0.05,
+        cldice_start_epoch: int = 10,
+        cldice_downsample: int = 2,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor([pos_weight], dtype=torch.float32))
+        self.dice_weight = dice_weight
+        self.boundary_weight = boundary_weight
+        self.cldice_weight = cldice_weight
+        self.cldice_start_epoch = cldice_start_epoch
+        self.cldice_downsample = max(1, cldice_downsample)
 
-        def process_batch():
-            if not patches:
-                return
-    
-            patch_batch = torch.cat(patches, dim=0)
-    
-            with autocast(
-                device_type="cuda",
-                enabled=self.args.use_amp,
-            ):
-                patch_logits = self.model(patch_batch)
-    
-                # Phòng trường hợp decoder trả nhiều output
-                if isinstance(patch_logits, (tuple, list)):
-                    patch_logits = patch_logits[-1]
-    
-                if isinstance(patch_logits, dict):
-                    patch_logits = patch_logits.get(
-                        "out",
-                        patch_logits.get("main")
-                    )
-    
-                patch_logits = F.interpolate(
-                    patch_logits,
-                    size=(tile_size, tile_size),
+    def base(self, logits: Tensor, target: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        target_float = target[:, None].float()
+        binary_logit = road_logit(logits)
+        probability = torch.sigmoid(binary_logit)
+        bce = F.binary_cross_entropy_with_logits(
+            binary_logit, target_float, pos_weight=self.pos_weight
+        )
+        dice = soft_dice_loss(probability, target_float)
+        return bce + self.dice_weight * dice, bce, dice, probability
+
+    def forward(self, logits: Tensor, target: Tensor, epoch: int) -> Dict[str, Tensor]:
+        total, bce, dice, probability = self.base(logits, target)
+        target_float = target[:, None].float()
+
+        boundary = logits.sum() * 0.0
+        if self.boundary_weight > 0:
+            pred_boundary = soft_boundary_map(probability)
+            target_boundary = soft_boundary_map(target_float)
+            boundary = F.binary_cross_entropy(
+                pred_boundary.clamp(1e-5, 1.0 - 1e-5), target_boundary
+            )
+            total = total + self.boundary_weight * boundary
+
+        cldice = logits.sum() * 0.0
+        if self.cldice_weight > 0 and epoch >= self.cldice_start_epoch:
+            if self.cldice_downsample > 1:
+                size = (
+                    max(1, probability.shape[-2] // self.cldice_downsample),
+                    max(1, probability.shape[-1] // self.cldice_downsample),
+                )
+                probability_topology = F.interpolate(
+                    probability, size=size, mode="bilinear", align_corners=False
+                )
+                target_topology = F.interpolate(target_float, size=size, mode="nearest")
+            else:
+                probability_topology, target_topology = probability, target_float
+            cldice = soft_cldice_loss(probability_topology, target_topology)
+            total = total + self.cldice_weight * cldice
+
+        return {
+            "total": total,
+            "bce": bce,
+            "dice": dice,
+            "boundary": boundary,
+            "cldice": cldice,
+        }
+
+
+def distillation_loss(student: Tensor, teacher: Tensor, temperature: float) -> Tensor:
+    student_distribution = F.log_softmax(student / temperature, dim=1)
+    teacher_distribution = F.softmax(teacher / temperature, dim=1)
+    return F.kl_div(
+        student_distribution, teacher_distribution, reduction="batchmean"
+    ) * (temperature**2) / (student.shape[-2] * student.shape[-1])
+
+
+def safe_torch_load(path: str | Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch < 2.6 has no weights_only argument.
+        return torch.load(path, map_location="cpu")
+
+
+def load_state(path: str | Path) -> Dict[str, Tensor]:
+    checkpoint = safe_torch_load(path)
+    state = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+    return {key.removeprefix("module."): value for key, value in state.items()}
+
+
+def load_transfer(model: nn.Module, path: str | Path) -> None:
+    source = load_state(path)
+    target = model.state_dict()
+    compatible = {
+        key: value for key, value in source.items()
+        if key in target and target[key].shape == value.shape
+    }
+    model.load_state_dict(compatible, strict=False)
+    ratio = 100.0 * sum(value.numel() for value in compatible.values()) / max(
+        sum(value.numel() for value in target.values()), 1
+    )
+    print(f"Transferred {len(compatible)}/{len(target)} tensors ({ratio:.1f}% by elements)")
+
+
+def build_teacher(args: argparse.Namespace, model: Segmentor, device: torch.device):
+    if not args.teacher_checkpoint:
+        return None
+    teacher = copy.deepcopy(model)
+    teacher.load_state_dict(load_state(args.teacher_checkpoint), strict=True)
+    teacher.to(device).eval()
+    for parameter in teacher.parameters():
+        parameter.requires_grad_(False)
+    print(f"Knowledge distillation enabled: {args.teacher_checkpoint}")
+    return teacher
+
+
+def parameter_groups(model: Segmentor, args: argparse.Namespace):
+    groups = {"head": [], "backbone": [], "stem": []}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("backbone.stem_"):
+            groups["stem"].append(parameter)
+        elif name.startswith("backbone."):
+            groups["backbone"].append(parameter)
+        else:
+            groups["head"].append(parameter)
+    learning_rates = {
+        "head": args.lr,
+        "backbone": args.lr * args.backbone_lr_factor,
+        "stem": args.lr * args.stem_lr_factor,
+    }
+    result = []
+    for name, parameters in groups.items():
+        if parameters:
+            result.append({"params": parameters, "lr": learning_rates[name], "name": name})
+            count = sum(parameter.numel() for parameter in parameters)
+            print(f"Optimizer group {name:>8}: lr={learning_rates[name]:.2e}, params={count:,}")
+    return result
+
+
+def build_scheduler(optimizer, steps_per_epoch: int, args: argparse.Namespace):
+    total_steps = max(1, args.epochs * steps_per_epoch)
+    warmup_steps = args.warmup_epochs * steps_per_epoch
+
+    def multiplier(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            progress = step / max(warmup_steps, 1)
+            return args.warmup_start_factor + (1.0 - args.warmup_start_factor) * progress
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+        return args.min_lr_ratio + (1.0 - args.min_lr_ratio) * cosine
+
+    return LambdaLR(optimizer, multiplier)
+
+
+def make_scaler(enabled: bool):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except TypeError:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def autocast_context(device: torch.device, enabled: bool):
+    return torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled)
+
+
+def train_one_epoch(
+    model: Segmentor,
+    teacher: Optional[Segmentor],
+    loader: DataLoader,
+    criterion: RoadLoss,
+    optimizer: AdamW,
+    scheduler: LambdaLR,
+    scaler,
+    device: torch.device,
+    epoch: int,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    totals = {key: 0.0 for key in ("total", "bce", "dice", "boundary", "cldice", "aux", "kd")}
+    updates = 0
+    max_gradient = 0.0
+    progress = tqdm(loader, desc=f"Train {epoch + 1}/{args.epochs}")
+
+    for batch_index, (images, masks) in enumerate(progress):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+
+        teacher_logits = None
+        if teacher is not None:
+            with torch.no_grad(), autocast_context(device, args.use_amp):
+                teacher_logits = teacher(images)
+
+        with autocast_context(device, args.use_amp):
+            aux_logits, main_logits = model(images)
+            main_logits = F.interpolate(
+                main_logits, masks.shape[-2:], mode="bilinear", align_corners=False
+            )
+            aux_logits = F.interpolate(
+                aux_logits, masks.shape[-2:], mode="bilinear", align_corners=False
+            )
+            losses = criterion(main_logits, masks, epoch)
+            aux_base, _, _, _ = criterion.base(aux_logits, masks)
+            aux_weight = args.aux_weight * (1.0 - epoch / args.epochs) ** args.aux_decay_exp
+            total_loss = losses["total"] + aux_weight * aux_base
+
+            kd = main_logits.sum() * 0.0
+            if teacher_logits is not None:
+                teacher_logits = F.interpolate(
+                    teacher_logits,
+                    masks.shape[-2:],
                     mode="bilinear",
                     align_corners=False,
                 )
-    
-            patch_logits = patch_logits.float()
-    
-            for index, (y, x) in enumerate(coordinates):
-                logits_sum[
-                    :,
-                    :,
-                    y:y + tile_size,
-                    x:x + tile_size
-                ] += patch_logits[index:index + 1] * weight
-    
-                weight_sum[
-                    :,
-                    :,
-                    y:y + tile_size,
-                    x:x + tile_size
-                ] += weight
-    
-            patches.clear()
-            coordinates.clear()
-    
-        for y in y_positions:
-            for x in x_positions:
-                patch = image_padded[
-                    :,
-                    :,
-                    y:y + tile_size,
-                    x:x + tile_size
-                ]
-    
-                patches.append(patch)
-                coordinates.append((y, x))
-    
-                if len(patches) >= tile_batch_size:
-                    process_batch()
-    
-        process_batch()
-    
-        logits = logits_sum / weight_sum.clamp_min(1e-6)
-    
-        # Cắt bỏ phần padding
-        return logits[:, :, :height, :width]
-        
-    @torch.no_grad()
-    def validate(self, loader, epoch):
-        self.model.eval()
-    
-        total_loss = 0.0
-        num_samples = 0
-    
-        num_classes = self.args.num_classes
-        cm = np.zeros(
-            (num_classes, num_classes),
-            dtype=np.int64
+                kd = distillation_loss(main_logits, teacher_logits, args.kd_temperature)
+                total_loss = total_loss + args.kd_weight * kd
+
+            scaled_loss = total_loss / args.accumulation_steps
+
+        if not torch.isfinite(scaled_loss):
+            print(f"Non-finite loss at batch {batch_index}; batch skipped")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        scaler.scale(scaled_loss).backward()
+        should_update = (
+            (batch_index + 1) % args.accumulation_steps == 0
+            or batch_index + 1 == len(loader)
         )
-    
-        tile_size = (
-            self.args.crop_size
-            if self.args.crop_size is not None
-            else self.args.img_h
-        )
-    
-        overlap = getattr(self.args, "val_overlap", 128)
-        tile_batch_size = getattr(
-            self.args,
-            "val_tile_batch_size",
-            4
-        )
-    
-        pbar = tqdm(loader, desc="Full-image validation")
-    
-        for imgs, masks in pbar:
-            imgs = imgs.to(
-                self.device,
-                non_blocking=True
+        if should_update:
+            scaler.unscale_(optimizer)
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip, error_if_nonfinite=False
             )
-            masks = masks.to(
-                self.device,
-                non_blocking=True
-            ).long()
-    
-            if masks.dim() == 4:
-                masks = masks.squeeze(1)
-    
-            logits = self.sliding_window_inference(
-                imgs,
-                tile_size=tile_size,
-                overlap=overlap,
-                tile_batch_size=tile_batch_size,
-            )
-    
-            loss, _, _ = self.criterion(logits, masks)
-    
-            batch_size = imgs.shape[0]
-            total_loss += loss.item() * batch_size
-            num_samples += batch_size
-    
-            pred = logits.argmax(dim=1).cpu().numpy()
-            target = masks.cpu().numpy()
-    
-            valid = (
-                (target >= 0)
-                & (target < num_classes)
-                & (target != self.args.ignore_index)
-            )
-    
-            labels = (
-                num_classes * target[valid].astype(np.int64)
-                + pred[valid].astype(np.int64)
-            )
-    
-            cm += np.bincount(
-                labels,
-                minlength=num_classes ** 2
-            ).reshape(num_classes, num_classes)
-    
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}"
-            })
-    
-        intersection = np.diag(cm).astype(np.float64)
-    
-        union = (
-            cm.sum(axis=1)
-            + cm.sum(axis=0)
-            - intersection
+            if torch.isfinite(gradient_norm):
+                max_gradient = max(max_gradient, float(gradient_norm))
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                updates += 1
+            else:
+                print(f"Non-finite gradient at batch {batch_index}; optimizer step skipped")
+                scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        totals["total"] += float(total_loss.detach())
+        for key in ("bce", "dice", "boundary", "cldice"):
+            totals[key] += float(losses[key].detach())
+        totals["aux"] += float(aux_base.detach())
+        totals["kd"] += float(kd.detach())
+        progress.set_postfix(
+            loss=f"{float(total_loss.detach()):.4f}",
+            road_dice=f"{1.0 - float(losses['dice'].detach()):.3f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.1e}",
         )
-    
-        iou = np.divide(
-            intersection,
-            union,
-            out=np.zeros_like(intersection),
-            where=union > 0,
+
+    count = max(len(loader), 1)
+    metrics = {key: value / count for key, value in totals.items()}
+    metrics["max_gradient"] = max_gradient
+    metrics["updates"] = float(updates)
+    return metrics
+
+
+def sliding_positions(length: int, tile_size: int, stride: int) -> List[int]:
+    if length <= tile_size:
+        return [0]
+    positions = list(range(0, length - tile_size + 1, stride))
+    last = length - tile_size
+    if positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+@torch.no_grad()
+def sliding_window_inference(
+    model: Segmentor,
+    image: Tensor,
+    tile_size: int,
+    overlap: int,
+    tile_batch_size: int,
+    device: torch.device,
+    use_amp: bool,
+) -> Tensor:
+    if image.shape[0] != 1:
+        raise ValueError("Full-image sliding validation requires batch_size=1")
+    stride = tile_size - overlap
+    if stride <= 0:
+        raise ValueError("val_overlap must be smaller than crop_size")
+
+    _, _, original_h, original_w = image.shape
+    pad_h, pad_w = max(0, tile_size - original_h), max(0, tile_size - original_w)
+    if pad_h or pad_w:
+        image = F.pad(image, (0, pad_w, 0, pad_h), mode="reflect")
+    height, width = image.shape[-2:]
+    y_positions = sliding_positions(height, tile_size, stride)
+    x_positions = sliding_positions(width, tile_size, stride)
+
+    one_dimensional = torch.hann_window(
+        tile_size, periodic=False, device=device, dtype=torch.float32
+    ).clamp_min(0.05)
+    weight = (one_dimensional[:, None] * one_dimensional[None, :])[None, None]
+    logits_sum = torch.zeros((1, 2, height, width), device=device, dtype=torch.float32)
+    weight_sum = torch.zeros((1, 1, height, width), device=device, dtype=torch.float32)
+
+    patches: List[Tensor] = []
+    coordinates: List[Tuple[int, int]] = []
+
+    def flush() -> None:
+        if not patches:
+            return
+        batch = torch.cat(patches, dim=0)
+        with autocast_context(device, use_amp):
+            batch_logits = model(batch)
+            batch_logits = F.interpolate(
+                batch_logits,
+                (tile_size, tile_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        batch_logits = batch_logits.float()
+        for index, (top, left) in enumerate(coordinates):
+            logits_sum[:, :, top : top + tile_size, left : left + tile_size] += (
+                batch_logits[index : index + 1] * weight
+            )
+            weight_sum[:, :, top : top + tile_size, left : left + tile_size] += weight
+        patches.clear()
+        coordinates.clear()
+
+    for top in y_positions:
+        for left in x_positions:
+            patches.append(image[:, :, top : top + tile_size, left : left + tile_size])
+            coordinates.append((top, left))
+            if len(patches) == tile_batch_size:
+                flush()
+    flush()
+    logits = logits_sum / weight_sum.clamp_min(1e-6)
+    return logits[:, :, :original_h, :original_w]
+
+
+class ProbabilityHistogram:
+    """Threshold metrics without storing all 1500x1500 probability maps."""
+
+    def __init__(self, bins: int = 1001) -> None:
+        self.bins = bins
+        self.positive = np.zeros(bins, dtype=np.int64)
+        self.negative = np.zeros(bins, dtype=np.int64)
+        self.per_image: List[Tuple[np.ndarray, np.ndarray]] = []
+
+    def update(self, probability: Tensor, target: Tensor) -> None:
+        probability_np = probability.detach().cpu().numpy().reshape(-1)
+        target_np = target.detach().cpu().numpy().reshape(-1).astype(bool)
+        indices = np.minimum(
+            (probability_np * (self.bins - 1)).astype(np.int64), self.bins - 1
         )
-    
-        result = {
-            "loss": total_loss / max(num_samples, 1),
-            "miou": float(np.mean(iou)),
-            "accuracy": float(
-                intersection.sum()
-                / max(cm.sum(), 1)
-            ),
-            "per_class_iou": iou,
-            "confusion_matrix": cm,
+        positive = np.bincount(indices[target_np], minlength=self.bins)
+        negative = np.bincount(indices[~target_np], minlength=self.bins)
+        self.positive += positive
+        self.negative += negative
+        self.per_image.append((positive, negative))
+
+    @staticmethod
+    def _counts(positive: np.ndarray, negative: np.ndarray, index: int):
+        true_positive = int(positive[index:].sum())
+        false_positive = int(negative[index:].sum())
+        false_negative = int(positive[:index].sum())
+        true_negative = int(negative[:index].sum())
+        return true_positive, false_positive, false_negative, true_negative
+
+    def at_threshold(self, threshold: float) -> Dict[str, float]:
+        index = min(self.bins - 1, max(0, math.ceil(threshold * (self.bins - 1))))
+        tp, fp, fn, tn = self._counts(self.positive, self.negative, index)
+        road_iou = tp / max(tp + fp + fn, 1)
+        background_iou = tn / max(tn + fp + fn, 1)
+        macro_values = []
+        for positive, negative in self.per_image:
+            image_tp, image_fp, image_fn, _ = self._counts(positive, negative, index)
+            denominator = image_tp + image_fp + image_fn
+            if denominator > 0:
+                macro_values.append(image_tp / denominator)
+        return {
+            "threshold": threshold,
+            "road_iou_micro": road_iou,
+            "road_iou_macro": float(np.mean(macro_values)) if macro_values else 0.0,
+            "background_iou": background_iou,
+            "miou": 0.5 * (road_iou + background_iou),
+            "accuracy": (tp + tn) / max(tp + fp + fn + tn, 1),
+            "precision": tp / max(tp + fp, 1),
+            "recall": tp / max(tp + fn, 1),
         }
-    
-        if self.diag:
-            self.diag.log(
-                epoch,
-                "val/miou",
-                result["miou"]
-            )
-            self.diag.log(
-                epoch,
-                "val/loss",
-                result["loss"]
-            )
-            self.diag.log(
-                epoch,
-                "val/accuracy",
-                result["accuracy"]
-            )
-    
-            for class_index, class_iou in enumerate(iou):
-                self.diag.log(
-                    epoch,
-                    f"val/iou_class_{class_index}",
-                    class_iou
-                )
-    
-        return result
-
-    def compute_checkpoint_metric(self, val_metrics, epoch):
-        """[NEW] Decide what value drives 'is this the best checkpoint?'.
-
-        Two knobs, both optional and backward-compatible (default behaviour
-        is identical to before: raw val mIoU, single epoch):
-          --best_metric_window N : average the metric over the last N epochs
-                                    before comparing to the running best.
-          --best_metric_class I  : use per_class_iou[I] (e.g. the road class)
-                                    instead of mean IoU.
-        """
-        if self.best_metric_class is not None:
-            raw = float(val_metrics['per_class_iou'][self.best_metric_class])
-        else:
-            raw = val_metrics['miou']
-
-        self.miou_window.append(raw)
-        smoothed = float(np.mean(self.miou_window))
-        if self.diag:
-            self.diag.log(epoch, 'val/miou_smooth', smoothed)
-        return smoothed
-
-    def save_checkpoint(self, epoch, metrics, is_best=False):
-        ckpt = {
-            'epoch': epoch, 'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler': self.scaler.state_dict(),
-            'best_miou': self.best_miou, 'metrics': metrics,
-            'global_step': self.global_step,
-        }
-        torch.save(ckpt, self.save_dir / "last.pth")
-        if is_best:
-            torch.save(ckpt, self.save_dir / "best.pth")
-            print(f"Best model saved! mIoU: {metrics['miou']:.4f}")
-        if (epoch + 1) % self.args.save_interval == 0:
-            torch.save(ckpt, self.save_dir / f"epoch_{epoch+1}.pth")
-
-    def load_checkpoint(self, path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
-        ckpt  = torch.load(path, map_location=self.device, weights_only=False)
-        state = ckpt.get('model') or ckpt.get('model_state_dict') or ckpt.get('state_dict') or ckpt
-        self.model.load_state_dict(state, strict=False)
-        if load_optimizer and not reset_epoch:
-            try: self.optimizer.load_state_dict(ckpt['optimizer'])
-            except (ValueError, KeyError) as e: print(f"Optimizer not loaded: {e}")
-            if self.scheduler and ckpt.get('scheduler'):
-                try: self.scheduler.load_state_dict(ckpt['scheduler'])
-                except Exception as e: print(f"Scheduler not loaded: {e}")
-            if 'scaler' in ckpt and ckpt['scaler']:
-                try: self.scaler.load_state_dict(ckpt['scaler'])
-                except Exception as e: print(f"Scaler not loaded: {e}")
-        if reset_epoch:
-            self.start_epoch = 0; self.global_step = 0
-            self.best_miou   = 0.0 if reset_best_metric else ckpt.get('best_miou', 0.0)
-            print(f"Weights loaded (epoch {ckpt.get('epoch','?')}), starting from 0")
-        else:
-            self.start_epoch = ckpt['epoch'] + 1
-            self.best_miou   = ckpt.get('best_miou', 0.0)
-            self.global_step = ckpt.get('global_step', 0)
-            print(f"Resuming from epoch {self.start_epoch}")
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-UNFREEZE_STAGES_GCNET = [
-    ['stem_conv1','stem_conv2','stem_stage2','stem_stage3','compression_1','down_1'],
-    ['semantic_branch_layers.0','detail_branch_layers.0','dwsa_stage4'],
-    ['semantic_branch_layers.1','detail_branch_layers.1','dwsa_stage5','compression_2','down_2'],
-    ['semantic_branch_layers.2','detail_branch_layers.2','dwsa_stage6','spp'],
-]
-
-UNFREEZE_STAGES_COMING = [
-    ['stem'],
-    ['local_stage1','global_stage1','global_to_local1','local_to_global1'],
-    ['local_stage2','global_stage2','global_to_local2','local_to_global2'],
-    ['local_transition','local_stage3','global_stage3','context',
-     'local_projection','final_refine'],
-]
-
-CLASS_NAMES = ['road','sidewalk','building','wall','fence','pole',
-               'traffic_light','traffic_sign','vegetation','terrain',
-               'sky','person','rider','car','truck','bus',
-               'train','motorcycle','bicycle']
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def _parse_stage_blocks(value):
-    blocks = tuple(int(item.strip()) for item in value.split(',') if item.strip())
-    if len(blocks) != 3 or any(item < 1 for item in blocks):
-        raise argparse.ArgumentTypeError(
-            "Stage blocks must contain three positive integers, e.g. 2,2,2."
-        )
-    return blocks
-
-
-def main():
-    parser = argparse.ArgumentParser(description="GCNet / CoMingNet Training")
-    # Model
-    parser.add_argument("--model_variant",      type=str, default="fan_dwsa",
-                        choices=["fan_dwsa","fan_only","dwsa_only","coming"])
-    parser.add_argument("--pretrained_weights", type=str, default=None)
-    parser.add_argument("--pretrained_source",  type=str, default="auto",
-                        choices=["auto","gcnet","coming"])
-    parser.add_argument("--coming_kernel_size", type=int, default=7)
-    parser.add_argument("--local_blocks", type=_parse_stage_blocks, default=(2,2,2),
-                        help="CoMingNet local blocks, e.g. 2,2,2")
-    parser.add_argument("--global_blocks", type=_parse_stage_blocks, default=(2,3,2),
-                        help="CoMingNet global blocks, e.g. 2,3,2")
-    # Backbone freeze/unfreeze
-    parser.add_argument(
-        "--val_overlap",
-        type=int,
-        default=128,
-        help="Overlap giữa các validation tile."
-    )
-    
-    parser.add_argument(
-        "--val_tile_batch_size",
-        type=int,
-        default=4,
-        help="Số tile validation chạy đồng thời trên GPU."
-    )
-    parser.add_argument("--freeze_backbone",    action="store_true")
-    parser.add_argument("--unfreeze_schedule",  type=str, default="")
-    parser.add_argument("--freeze_stem_conv",   action="store_true")
-    parser.add_argument("--freeze_spp_bn",      action="store_true")
-    # LR factors
-    # [FIX] Previous defaults (0.1 / 0.01) assumed a *pretrained* backbone
-    # being finetuned. CoMingNet here trains from scratch by default (no
-    # --pretrained_weights), where discounting backbone/stem LR this hard
-    # starves the backbone and caps achievable road IoU (confirmed: a
-    # from-scratch run using these old defaults topped out at road IoU
-    # 0.23 vs. ~0.30 with equal LR across groups). New defaults keep
-    # backbone/stem close to the head LR; explicitly lower them via these
-    # flags only when passing --pretrained_weights.
-    parser.add_argument("--backbone_lr_factor", type=float, default=1.0,
-                        help="Backbone LR = lr * this. Use ~0.1 only when finetuning "
-                             "--pretrained_weights; keep near 1.0 for from-scratch training.")
-    parser.add_argument("--dwsa_lr_factor",     type=float, default=0.5)
-    parser.add_argument("--alpha_lr_factor",    type=float, default=0.1)
-    parser.add_argument("--stem_lr_factor",     type=float, default=1.0,
-                        help="Stem LR = lr * this. Use ~0.01 only when finetuning "
-                             "--pretrained_weights; keep near 1.0 for from-scratch training.")
-    # [NEW] LR warmup — mitigates the large early-epoch gradient spikes /
-    # mIoU oscillation seen when training the backbone from scratch.
-    parser.add_argument("--warmup_epochs",      type=int,   default=3,
-                        help="Linear LR warmup epochs before the main scheduler kicks in. 0 disables.")
-    parser.add_argument("--warmup_start_factor", type=float, default=0.1,
-                        help="LR multiplier at the very start of warmup (fraction of target LR).")
-    # Data
-    parser.add_argument("--image_dir", type=str, default=(
-        "/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/"
-        "tiff/train"))
-    parser.add_argument("--mask_dir", type=str, default=(
-        "/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/"
-        "tiff/train_labels"))
-    parser.add_argument("--val_ratio", type=float, default=0.2,
-                        help="Deterministic validation fraction split from the paired folders")
-    parser.add_argument("--num_classes",        type=int, default=2)
-    parser.add_argument("--ignore_index",       type=int, default=255)
-    parser.add_argument("--use_class_weights",  action="store_true")
-    parser.add_argument("--class_weights_file", type=str, default=None)
-    # Training
-    parser.add_argument("--epochs",             type=int,   default=100)
-    parser.add_argument("--batch_size",         type=int,   default=4)
-    parser.add_argument("--accumulation_steps", type=int,   default=2)
-    parser.add_argument("--lr",                 type=float, default=5e-4)
-    parser.add_argument("--weight_decay",       type=float, default=1e-4)
-    parser.add_argument("--optimizer",          type=str,   default="adamw",
-                        choices=["adamw","sgd"])
-    parser.add_argument("--sgd_momentum",       type=float, default=0.9)
-    parser.add_argument("--grad_clip",          type=float, default=5.0)
-    parser.add_argument("--scheduler",          default="cosine",
-                        choices=["onecycle","poly","cosine","cosine_wr"])
-    parser.add_argument("--cosine_wr_t0",       type=int,   default=10)
-    # Loss
-    # [SIMPLIFIED] BCE + Dice only — OHEM/Tversky/clDice removed to keep the
-    # loss surface simple while the model architecture is being iterated on.
-    parser.add_argument("--aux_weight",         type=float, default=0.4)
-    parser.add_argument("--aux_decay_exp",      type=float, default=0.9)
-    parser.add_argument("--dice_weight",        type=float, default=0.5,
-                        help="Weight of the Dice term added to BCE.")
-    parser.add_argument("--label_smoothing",    type=float, default=0.0)
-    # Resolution
-    parser.add_argument("--img_h",              type=int,   default=512)
-    parser.add_argument("--img_w",              type=int,   default=512,
-                        help="[FIX] Was 1024. Source tiles are square (e.g. 1500x1500); "
-                             "a non-square img_h/img_w stretches roads by different "
-                             "factors horizontally vs. vertically. Prefer --crop_size "
-                             "instead of relying on img_h/img_w resize.")
-    # [NEW] Aspect-preserving square crop, recommended over plain resize.
-    parser.add_argument("--crop_size",          type=int,   default=None,
-                        help="If set, train/val on an aspect-ratio-preserving square crop "
-                             "of this size instead of resizing to --img_h/--img_w (which "
-                             "distorts road geometry on non-square targets). Recommended.")
-    parser.add_argument("--road_oversample_tries", type=int, default=4,
-                        help="During training with --crop_size, sample this many candidate "
-                             "crop locations and keep the one with the most road pixels, "
-                             "since plain random crops are mostly pure background.")
-    # BN warmup (K1)
-    parser.add_argument("--reset_bn_stats",     action="store_true")
-    parser.add_argument("--bn_warmup_epochs",   type=int,   default=3)
-    parser.add_argument("--bn_warmup_momentum", type=float, default=0.3)
-    # [NEW] Checkpoint-selection robustness
-    parser.add_argument("--best_metric_window", type=int,   default=1,
-                        help="Average val metric over the last N epochs before "
-                             "deciding a new best checkpoint. 1 = old behaviour "
-                             "(single noisy epoch can trigger a save).")
-    parser.add_argument("--best_metric_class",  type=int,   default=None,
-                        help="If set, use per_class_iou[this_index] (e.g. the road "
-                             "class index) instead of mean IoU to select the best "
-                             "checkpoint.")
-    # Misc
-    parser.add_argument(
-        "--use_amp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--num_workers",        type=int,   default=4)
-    parser.add_argument("--save_dir",           default="./checkpoints")
-    parser.add_argument("--resume",             type=str,   default=None)
-    parser.add_argument("--resume_mode",        type=str,   default="transfer",
-                        choices=["transfer","continue"])
-    parser.add_argument("--seed",               type=int,   default=42)
-    parser.add_argument("--save_interval",      type=int,   default=10)
-    parser.add_argument("--reset_best_metric",  action="store_true")
-    parser.add_argument("--diag_interval",      type=int,   default=1)
-    parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
-    args = parser.parse_args()
-
-    # Validate unfreeze schedule
-    unfreeze_list = []
-    if args.freeze_backbone and args.unfreeze_schedule:
-        unfreeze_list = sorted(int(e) for e in args.unfreeze_schedule.split(','))
-        if max(unfreeze_list) >= args.epochs:
-            raise ValueError("unfreeze_schedule epoch >= total epochs")
-        if args.scheduler == 'onecycle':
-            args.scheduler = 'cosine'
-            print("[INFO] scheduler auto-switched: onecycle → cosine")
-
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
-    torch.backends.cudnn.benchmark        = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32       = True
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print(f"\n{SEP}\nSEGMENTATION TRAINING  |  {args.model_variant}\n{SEP}")
-    print(f"Device: {device}  |  Image: {args.img_h}x{args.img_w}")
-    print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
-    print(f"Grad clip: {args.grad_clip}  |  AMP: {args.use_amp}")
-    if args.reset_bn_stats:
-        print(f"K1: BN Reset (warmup={args.bn_warmup_epochs} ep, mom={args.bn_warmup_momentum})")
-    print(f"{SEP}\n")
-
-    # Import backbone.
-    # [FIX] The original code only handled `model_variant == 'coming'` and
-    # left `Backbone` undefined for every other choice, which would raise a
-    # confusing `NameError` deep inside `Segmentor(Backbone(...), ...)`
-    # instead of a clear, actionable error at startup.
-    if args.model_variant == 'coming':
-        from modeling.backbone import CoMingNet as Backbone
-    else:
-        try:
-            from modeling.backbone import GCNet as Backbone
-        except ImportError as e:
-            raise ImportError(
-                f"--model_variant='{args.model_variant}' requires a GCNet-style "
-                f"backbone class (e.g. `GCNet`) in modeling/backbone.py, which "
-                f"could not be imported ({e}). Either add that class, or pass "
-                f"--model_variant coming to use CoMingNet."
-            ) from e
-
-    cfg = ModelConfig.get_config(
-        variant=args.model_variant,
-        coming_kernel_size=args.coming_kernel_size,
-        local_blocks=args.local_blocks,
-        global_blocks=args.global_blocks,
-    )
-    args.loss_config = cfg["loss"]
-    class_names = (
-        CLASS_NAMES
-        if args.num_classes == len(CLASS_NAMES)
-        else ['background', 'road']
-        if args.num_classes == 2
-        else [f'class_{index}' for index in range(args.num_classes)]
-    )
-
-    if args.best_metric_class is not None and not (0 <= args.best_metric_class < args.num_classes):
-        raise ValueError(
-            f"--best_metric_class={args.best_metric_class} is out of range for "
-            f"num_classes={args.num_classes}."
-        )
-
-    # [NEW] BCEDiceLoss operates on a binary road/background logit derived
-    # from the model's 2-channel output — it does not generalize to >2
-    # classes, so fail fast with a clear message rather than a confusing
-    # shape error deep inside the loss.
-    if args.num_classes != 2:
-        raise ValueError(
-            f"--num_classes={args.num_classes}, but the simplified BCE+Dice loss "
-            f"only supports binary segmentation (num_classes=2, e.g. "
-            f"['background','road'])."
-        )
-
-    # [FIX] `--class_weights_file` was silently ignored unless
-    # `--use_class_weights` was *also* passed, because Trainer only received
-    # weights when `args.use_class_weights` was true. Track the two sources
-    # separately and enable weighting if either is provided.
-    weights_requested = args.use_class_weights or bool(args.class_weights_file)
-
-    # DataLoaders
-    train_loader, val_loader, class_weights = create_folder_dataloaders(
-        image_dir=args.image_dir, mask_dir=args.mask_dir,
-        val_ratio=args.val_ratio, seed=args.seed,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        img_size=(args.img_h, args.img_w), num_classes=args.num_classes,
-        compute_class_weights=args.use_class_weights,
-        crop_size=args.crop_size, road_oversample_tries=args.road_oversample_tries)
-
-    if getattr(args, "class_weights_file", None):
-        cw_path = Path(args.class_weights_file)
-        if cw_path.exists():
-            class_weights = torch.load(cw_path, map_location="cpu")
-            print(f"Class weights: {cw_path}  "
-                  f"(min={class_weights.min():.3f}, max={class_weights.max():.3f})")
-        else:
-            print(f"WARNING: {cw_path} not found"); class_weights = None
-            weights_requested = args.use_class_weights and class_weights is not None
-
-    # Build model
-    model = Segmentor(Backbone(**cfg["backbone"]),
-                      GCNetHead(**cfg["head"], num_classes=args.num_classes,
-                                ignore_index=args.ignore_index)).to(device)
-    model.apply(init_weights)
-    if args.model_variant == "coming":
-        try:
-            from modeling.backbone import CoMingBlock
-        except ImportError:
-            from backbone import CoMingBlock
-    
-        num_zero_initialized = 0
-    
-        for module in model.modules():
-            if isinstance(module, CoMingBlock):
-                module.zero_init_residual()
-                num_zero_initialized += 1
-    
-        print(
-            f"Zero-initialized residual branches: "
-            f"{num_zero_initialized} CoMingBlocks"
-        )
-    transfer_ratio = None
-    if args.pretrained_weights:
-        transfer_ratio = load_pretrained_weights(
+@torch.no_grad()
+def evaluate(
+    model: Segmentor,
+    loader: DataLoader,
+    criterion: RoadLoss,
+    device: torch.device,
+    args: argparse.Namespace,
+    epoch: int,
+    forced_threshold: Optional[float] = None,
+) -> Dict[str, float]:
+    model.eval()
+    histogram = ProbabilityHistogram(args.threshold_bins)
+    total_loss = 0.0
+    samples = 0
+    progress = tqdm(loader, desc="Full-image sliding validation")
+    for images, masks in progress:
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        logits = sliding_window_inference(
             model,
-            args.pretrained_weights,
-            target_variant=args.model_variant,
-            source=args.pretrained_source,
+            images,
+            args.crop_size,
+            args.val_overlap,
+            args.val_tile_batch_size,
+            device,
+            args.use_amp,
         )
-        if (
-            args.model_variant == 'coming'
-            and args.freeze_backbone
-            and transfer_ratio < 60.0
-        ):
-            print(
-                "WARNING: less than 60% of CoMingNet backbone parameters were "
-                "transferred. Freezing the whole backbone will also freeze "
-                "randomly initialized CoMingBlocks. For GCNet -> CoMingNet, "
-                "omit --freeze_backbone and use a small backbone LR instead."
-            )
-    if args.freeze_backbone:
-        freeze_backbone(model, variant=args.model_variant)
+        losses = criterion(logits, masks, epoch)
+        probability = torch.sigmoid(road_logit(logits))[:, 0]
+        histogram.update(probability, masks)
+        total_loss += float(losses["total"])
+        samples += 1
+        progress.set_postfix(loss=f"{float(losses['total']):.4f}")
 
-    count_trainable_params(model)
-    print_backbone_structure(model)
+    fixed = histogram.at_threshold(0.5 if forced_threshold is None else forced_threshold)
+    if forced_threshold is None:
+        thresholds = np.arange(
+            args.threshold_min,
+            args.threshold_max + args.threshold_step / 2,
+            args.threshold_step,
+        )
+        candidates = [histogram.at_threshold(float(value)) for value in thresholds]
+        selected = max(candidates, key=lambda item: item["road_iou_micro"])
+    else:
+        selected = fixed
+    result = {
+        "loss": total_loss / max(samples, 1),
+        **{f"fixed_{key}": value for key, value in fixed.items()},
+        **{f"selected_{key}": value for key, value in selected.items()},
+    }
+    return result
 
-    optimizer = build_optimizer(model, args)
-    scheduler = build_scheduler(optimizer, args, train_loader)
 
-    save_path = Path(args.save_dir); save_path.mkdir(parents=True, exist_ok=True)
-    diag    = DiagnosticLogger(save_dir=save_path, class_names=class_names)
-    trainer = Trainer(model=model, optimizer=optimizer, scheduler=scheduler,
-                      device=device, args=args,
-                      class_weights=class_weights if weights_requested else None,
-                      diag=diag)
+def checkpoint_dict(
+    model, optimizer, scheduler, scaler, epoch, best_iou, threshold, args
+):
+    return {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "epoch": epoch,
+        "best_road_iou": best_iou,
+        "threshold": threshold,
+        "args": vars(args),
+    }
 
-    if args.dice_weight is not None:
-        trainer.dice_weight = args.dice_weight
-        trainer.criterion.dice_weight = args.dice_weight
-        trainer.base_loss_cfg["dice_weight"] = args.dice_weight
 
-    if args.resume:
-        trainer.load_checkpoint(
-            args.resume,
-            reset_epoch=(args.resume_mode == "transfer"),
-            load_optimizer=(args.resume_mode == "continue"),
-            reset_best_metric=args.reset_best_metric)
-
-    if args.reset_bn_stats:
-        reset_bn_stats(model, momentum=args.bn_warmup_momentum)
-
-    # Freeze stem after checkpoint load
-    if args.freeze_stem_conv:
-        freeze_stem_only(model, args.model_variant)
-        optimizer = build_optimizer(model, args)
-        scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=trainer.start_epoch)
-        trainer.optimizer = optimizer; trainer.scheduler = scheduler
-
-    # Freeze SPP
-    if args.freeze_spp_bn:
-        spp = get_context_module(model.backbone)
-        if spp:
-            frozen = sum(p.numel() for p in spp.parameters() if p.requires_grad)
-            for p in spp.parameters(): p.requires_grad = False
-            for m in spp.modules():
-                if isinstance(m, nn.BatchNorm2d): m.eval()
-            print(f"Context/SPP frozen: {frozen:,} params")
-            optimizer = build_optimizer(model, args)
-            scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=trainer.start_epoch)
-            trainer.optimizer = optimizer; trainer.scheduler = scheduler
-
-    print(f"\n{SEP}\nSTARTING TRAINING\n{SEP}\n")
-    applied_unfreeze = set()
-    unfreeze_stages = (
-        UNFREEZE_STAGES_COMING
-        if args.model_variant == 'coming'
-        else UNFREEZE_STAGES_GCNET
+def resume_training(path, model, optimizer, scheduler, scaler):
+    checkpoint = safe_torch_load(path)
+    model.load_state_dict(checkpoint["model"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    scaler.load_state_dict(checkpoint["scaler"])
+    return (
+        int(checkpoint.get("epoch", -1)) + 1,
+        float(checkpoint.get("best_road_iou", 0.0)),
+        float(checkpoint.get("threshold", 0.5)),
     )
 
-    for epoch in range(trainer.start_epoch, args.epochs):
 
-        # K1: Restore BN momentum after warmup
-        if args.reset_bn_stats and epoch == trainer.start_epoch + args.bn_warmup_epochs:
-            restore_bn_momentum(model)
+def parse_args() -> argparse.Namespace:
+    dataset_root = "/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/tiff"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_variant", default="coming", choices=["coming"])
+    parser.add_argument("--channels", type=int, default=32)
+    parser.add_argument("--decoder_channels", type=int, default=96)
+    parser.add_argument("--local_blocks", type=int, nargs=3, default=(2, 2, 2))
+    parser.add_argument("--global_blocks", type=int, nargs=2, default=(2, 3))
+    parser.add_argument("--highres_kernel_size", type=int, default=5)
+    parser.add_argument("--coming_kernel_size", type=int, default=7,
+                        help="Context-stream kernel. High-resolution blocks use --highres_kernel_size=5.")
+    parser.add_argument("--dropout", type=float, default=0.05)
 
-        # Progressive unfreeze
-        if epoch in unfreeze_list and epoch not in applied_unfreeze:
-            idx = unfreeze_list.index(epoch)
-            if idx < len(unfreeze_stages):
-                print(f"[Epoch {epoch+1}] Unfreeze stage {idx+1}/{len(unfreeze_stages)}")
-                unfreeze_backbone_progressive(model, unfreeze_stages[idx])
-                applied_unfreeze.add(epoch)
-                optimizer = build_optimizer(model, args)
-                scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
-                trainer.optimizer = optimizer; trainer.scheduler = scheduler
-                trainer.set_loss_phase('ce_only')
+    parser.add_argument("--image_dir", default=f"{dataset_root}/train")
+    parser.add_argument("--mask_dir", default=f"{dataset_root}/train_labels")
+    parser.add_argument("--val_image_dir", default=f"{dataset_root}/val")
+    parser.add_argument("--val_mask_dir", default=f"{dataset_root}/val_labels")
+    parser.add_argument("--test_image_dir", default=f"{dataset_root}/test")
+    parser.add_argument("--test_mask_dir", default=f"{dataset_root}/test_labels")
+    parser.add_argument("--val_ratio", type=float, default=0.2)
+    parser.add_argument("--crop_size", type=int, default=512)
+    parser.add_argument("--road_crop_probability", type=float, default=0.5)
+    parser.add_argument("--road_oversample_tries", type=int, default=4)
 
-        if unfreeze_list and trainer.loss_phase == 'ce_only':
-            last_un = max((e for e in unfreeze_list if e in applied_unfreeze and e <= epoch), default=None)
-            if last_un is not None and epoch >= last_un + args.ce_only_epochs_after_unfreeze:
-                trainer.set_loss_phase('full')
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--backbone_lr_factor", type=float, default=1.0)
+    parser.add_argument("--stem_lr_factor", type=float, default=0.5)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--warmup_start_factor", type=float, default=0.1)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.02)
+    parser.add_argument("--grad_clip", type=float, default=5.0)
 
-        check_spp_bn_health(model, epoch)
+    parser.add_argument("--use_class_weights", action="store_true")
+    parser.add_argument("--pos_weight", type=float, default=None)
+    parser.add_argument("--pos_weight_cap", type=float, default=3.0)
+    parser.add_argument("--dice_weight", type=float, default=0.5)
+    parser.add_argument("--boundary_weight", type=float, default=0.1)
+    parser.add_argument("--cldice_weight", type=float, default=0.05)
+    parser.add_argument("--cldice_start_epoch", type=int, default=10)
+    parser.add_argument("--cldice_downsample", type=int, default=2)
+    parser.add_argument("--aux_weight", type=float, default=0.3)
+    parser.add_argument("--aux_decay_exp", type=float, default=0.9)
 
-        train_metrics = trainer.train_epoch(train_loader, epoch)
-        val_metrics   = trainer.validate(val_loader, epoch)
+    parser.add_argument("--teacher_checkpoint", default=None)
+    parser.add_argument("--kd_weight", type=float, default=0.1)
+    parser.add_argument("--kd_temperature", type=float, default=2.0)
 
-        if epoch % args.diag_interval == 0:
-            log_dwsa_health(model, epoch, diag)
-            log_fan_health(model,  epoch, diag)
+    parser.add_argument("--val_overlap", type=int, default=128)
+    parser.add_argument("--val_tile_batch_size", type=int, default=4)
+    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--threshold_min", type=float, default=0.2)
+    parser.add_argument("--threshold_max", type=float, default=0.8)
+    parser.add_argument("--threshold_step", type=float, default=0.02)
+    parser.add_argument("--threshold_bins", type=int, default=1001)
+    parser.add_argument("--evaluate_test", action="store_true")
 
-        # Per-class IoU
-        iou_arr = val_metrics['per_class_iou']
-        print(f"\n  Per-class IoU (epoch {epoch+1}):")
-        print(f"  {'Class':<16} {'IoU':>6}  Bar")
-        print(f"  {'─'*43}")
-        for cname, ciou in zip(class_names, iou_arr):
-            mark = ' ⚠️' if ciou < 0.4 else (' ★' if ciou > 0.75 else '')
-            print(f"  {cname:<16} {ciou:>6.4f}  {'█'*int(ciou*20)}{mark}")
-        low = [n for n, v in zip(class_names, iou_arr) if v < 0.4]
-        if low: print(f"\n  ⚠️  LOW (<0.4): {low}")
+    parser.add_argument("--pretrained_weights", default=None)
+    parser.add_argument("--resume", default=None)
+    parser.add_argument("--save_dir", default="./checkpoints/coming_balanced")
+    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_amp", action=argparse.BooleanOptionalAction, default=True)
+    # Accepted only so old notebook commands do not crash.
+    parser.add_argument("--ohem_keep_ratio", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--loss_type", default=None, help=argparse.SUPPRESS)
+    return parser.parse_args()
 
-        diag.log(epoch, 'iou/best',  float(max(iou_arr)))
-        diag.log(epoch, 'iou/worst', float(min(iou_arr)))
 
-        print(f"\n{SEP}\nEpoch {epoch+1}/{args.epochs}\n{SEP}")
-        print(f"Train — Loss: {train_metrics['loss']:.4f} | "
-              f"BCE: {train_metrics['bce']:.4f} | "
-              f"Dice: {train_metrics['dice']:.4f}")
-        print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
-              f"mIoU: {val_metrics['miou']:.4f}  | "
-              f"Acc: {val_metrics['accuracy']:.4f}")
-        print(f"{SEP}\n")
+def main() -> None:
+    args = parse_args()
+    if not 0.0 <= args.road_crop_probability <= 1.0:
+        raise ValueError("road_crop_probability must be in [0, 1]")
+    if args.ohem_keep_ratio is not None:
+        print("INFO: --ohem_keep_ratio is ignored; this configuration does not use OHEM.")
+    if args.loss_type is not None:
+        print("INFO: --loss_type is deprecated; balanced BCE+Dice+boundary+clDice is used.")
 
-        diag.print_epoch_summary(epoch)
+    seed_everything(args.seed)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.use_amp = bool(args.use_amp and device.type == "cuda")
 
-        # [FIX] Checkpoint selection now optionally uses a smoothed metric
-        # and/or a specific class's IoU (e.g. road) instead of a single raw
-        # mIoU value, which was prone to picking an unlucky/lucky epoch —
-        # the earlier run's "best" epoch (33) beat epoch 20 by only 0.0017,
-        # well within normal epoch-to-epoch noise.
-        checkpoint_metric = trainer.compute_checkpoint_metric(val_metrics, epoch)
-        is_best = checkpoint_metric > trainer.best_metric_value
-        if is_best:
-            trainer.best_metric_value = checkpoint_metric
-            trainer.best_miou = val_metrics['miou']
-            metric_name = (
-                f"{class_names[args.best_metric_class]} IoU"
-                if args.best_metric_class is not None else "mIoU"
+    train_loader, val_loader, train_pairs = make_loaders(args)
+    if args.pos_weight is not None:
+        pos_weight = args.pos_weight
+        print(f"Using explicit pos_weight={pos_weight:.4f}")
+    elif args.use_class_weights:
+        raw_weight, pos_weight = compute_pos_weight(train_pairs, args.pos_weight_cap)
+        print(f"Road imbalance raw={raw_weight:.4f}, sqrt/capped pos_weight={pos_weight:.4f}")
+    else:
+        pos_weight = 1.0
+
+    model = build_model(args).to(device)
+    if args.pretrained_weights:
+        load_transfer(model, args.pretrained_weights)
+    teacher = build_teacher(args, model, device)
+
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    print(f"Parameters: {total_parameters:,} | device={device} | AMP={args.use_amp}")
+    optimizer = AdamW(
+        parameter_groups(model, args),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    updates_per_epoch = math.ceil(len(train_loader) / args.accumulation_steps)
+    scheduler = build_scheduler(optimizer, updates_per_epoch, args)
+    scaler = make_scaler(args.use_amp)
+    criterion = RoadLoss(
+        pos_weight=pos_weight,
+        dice_weight=args.dice_weight,
+        boundary_weight=args.boundary_weight,
+        cldice_weight=args.cldice_weight,
+        cldice_start_epoch=args.cldice_start_epoch,
+        cldice_downsample=args.cldice_downsample,
+    ).to(device)
+
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    with (save_dir / "config.json").open("w", encoding="utf-8") as handle:
+        json.dump(vars(args), handle, indent=2)
+
+    start_epoch, best_road_iou, best_threshold = 0, 0.0, 0.5
+    if args.resume:
+        start_epoch, best_road_iou, best_threshold = resume_training(
+            args.resume, model, optimizer, scheduler, scaler
+        )
+        print(f"Resumed at epoch {start_epoch + 1}; best road IoU={best_road_iou:.4f}")
+
+    for epoch in range(start_epoch, args.epochs):
+        train_metrics = train_one_epoch(
+            model,
+            teacher,
+            train_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            epoch,
+            args,
+        )
+        print(
+            f"Epoch {epoch + 1}: train loss={train_metrics['total']:.4f}, "
+            f"BCE={train_metrics['bce']:.4f}, DiceLoss={train_metrics['dice']:.4f}, "
+            f"boundary={train_metrics['boundary']:.4f}, clDice={train_metrics['cldice']:.4f}, "
+            f"max_grad={train_metrics['max_gradient']:.2f}"
+        )
+
+        should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
+        if should_validate:
+            validation = evaluate(model, val_loader, criterion, device, args, epoch)
+            selected_iou = validation["selected_road_iou_micro"]
+            selected_threshold = validation["selected_threshold"]
+            print(
+                f"Val full-image: fixed@0.50 road IoU={validation['fixed_road_iou_micro']:.4f}, "
+                f"mIoU={validation['fixed_miou']:.4f} | "
+                f"selected@{selected_threshold:.2f} road IoU micro={selected_iou:.4f}, "
+                f"macro={validation['selected_road_iou_macro']:.4f}"
             )
-            window_note = f" (avg of last {len(trainer.miou_window)})" if args.best_metric_window > 1 else ""
-            print(f"  ★ NEW BEST {metric_name}{window_note}: {checkpoint_metric:.4f} "
-                  f"(raw epoch mIoU: {val_metrics['miou']:.4f})")
-        trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
+            if selected_iou > best_road_iou:
+                best_road_iou, best_threshold = selected_iou, selected_threshold
+                torch.save(
+                    checkpoint_dict(
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch,
+                        best_road_iou,
+                        best_threshold,
+                        args,
+                    ),
+                    save_dir / "best_road_iou.pt",
+                )
+                print(f"New best road IoU={best_road_iou:.4f}; checkpoint saved")
 
-    diag.print_full_history()
-    diag.close()
-    trainer.writer.close()
+        if (epoch + 1) % args.save_interval == 0 or epoch + 1 == args.epochs:
+            torch.save(
+                checkpoint_dict(
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    best_road_iou,
+                    best_threshold,
+                    args,
+                ),
+                save_dir / "last.pt",
+            )
 
-    print(f"\n{SEP}\nTRAINING COMPLETED!\nBest mIoU: {trainer.best_miou:.4f}\n{SEP}\n")
+    if args.evaluate_test:
+        test_image_dir, test_mask_dir = Path(args.test_image_dir), Path(args.test_mask_dir)
+        if not test_image_dir.is_dir() or not test_mask_dir.is_dir():
+            raise FileNotFoundError("Official test folders were not found")
+        best_checkpoint = safe_torch_load(save_dir / "best_road_iou.pt")
+        model.load_state_dict(best_checkpoint["model"], strict=True)
+        best_threshold = float(best_checkpoint["threshold"])
+        test_dataset = RoadDataset(
+            build_pairs(test_image_dir, test_mask_dir),
+            crop_size=args.crop_size,
+            full_image=True,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        test_metrics = evaluate(
+            model,
+            test_loader,
+            criterion,
+            device,
+            args,
+            args.epochs - 1,
+            forced_threshold=best_threshold,
+        )
+        print(
+            f"Official test @ val threshold {best_threshold:.2f}: "
+            f"road IoU micro={test_metrics['selected_road_iou_micro']:.4f}, "
+            f"macro={test_metrics['selected_road_iou_macro']:.4f}, "
+            f"mIoU={test_metrics['selected_miou']:.4f}"
+        )
 
 
 if __name__ == "__main__":
