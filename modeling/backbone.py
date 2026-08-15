@@ -1,16 +1,15 @@
-"""CoMingNet V2 backbone for binary road extraction.
+"""CoMingNet balanced backbone for Massachusetts Roads.
 
-The public names ``CoMingBlock`` and ``CoMingNet`` are kept compatible with
-the original project.  During training each CoMingBlock uses five spatial
-branches.  ``switch_to_deploy`` fuses them into one grouped convolution.
-
-Backbone output is a feature dictionary consumed by ``coming_decoder.py``.
+Pure CNN, no attention and no transformer.  The network keeps a high-resolution
+local stream (output stride 4), a compact context stream (output stride 8/16),
+and performs exactly two bilateral fusions.  CoMingBlock is reparameterizable:
+four depthwise branches used during training become one depthwise KxK branch
+for deployment.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,342 +17,438 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-def _valid_groups(channels: int, channels_per_group: int = 32) -> int:
-    groups = max(1, channels // channels_per_group)
-    while channels % groups:
-        groups -= 1
-    return groups
+def _pair(value: int | Tuple[int, int]) -> Tuple[int, int]:
+    return value if isinstance(value, tuple) else (value, value)
 
 
 class ConvBNAct(nn.Sequential):
-    def __init__(self, in_ch: int, out_ch: int, kernel_size=3, stride=1,
-                 padding=1, groups=1, act=True):
-        layers = [
-            nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding,
-                      groups=groups, bias=False),
-            nn.BatchNorm2d(out_ch),
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int | None = None,
+        groups: int = 1,
+        activation: bool = True,
+    ) -> None:
+        if padding is None:
+            padding = kernel_size // 2
+        layers: list[nn.Module] = [
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride=stride,
+                padding=padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
         ]
-        if act:
-            layers.append(nn.SiLU(inplace=True))
+        if activation:
+            layers.append(nn.ReLU(inplace=True))
         super().__init__(*layers)
 
 
-class GroupConvBN(nn.Module):
-    def __init__(self, channels: int, kernel_size, padding, groups: int,
-                 dilation=1):
+class DWConvBN(nn.Module):
+    """Depthwise convolution followed by BN; used by CoMingBlock branches."""
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int | Tuple[int, int],
+        padding: int | Tuple[int, int],
+    ) -> None:
         super().__init__()
         self.conv = nn.Conv2d(
-            channels, channels, kernel_size, padding=padding,
-            dilation=dilation, groups=groups, bias=False
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=channels,
+            bias=False,
         )
         self.bn = nn.BatchNorm2d(channels)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.bn(self.conv(x))
 
-    def fused_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+    def equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
         weight = self.conv.weight
-        scale = self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)
-        kernel = weight * scale[:, None, None, None]
-        bias = self.bn.bias - self.bn.running_mean * scale
+        conv_bias = torch.zeros(
+            weight.shape[0], device=weight.device, dtype=weight.dtype
+        )
+        std = torch.sqrt(self.bn.running_var + self.bn.eps)
+        scale = self.bn.weight / std
+        kernel = weight * scale.reshape(-1, 1, 1, 1)
+        bias = self.bn.bias + (conv_bias - self.bn.running_mean) * scale
         return kernel, bias
 
 
-def _to_dense_kernel(kernel: Tensor, dilation: Union[int, Tuple[int, int]],
-                     target_size: int) -> Tensor:
-    """Embed a small or dilated grouped-conv kernel into KxK coordinates."""
-    dh, dw = (dilation, dilation) if isinstance(dilation, int) else dilation
-    kh, kw = kernel.shape[-2:]
-    effective_h = (kh - 1) * dh + 1
-    effective_w = (kw - 1) * dw + 1
-    if effective_h > target_size or effective_w > target_size:
-        raise ValueError("Branch effective kernel exceeds deployment kernel")
-    out = kernel.new_zeros(*kernel.shape[:-2], target_size, target_size)
-    top = (target_size - effective_h) // 2
-    left = (target_size - effective_w) // 2
-    out[..., top:top + effective_h:dh, left:left + effective_w:dw] = kernel
-    return out
+def _center_pad(kernel: Tensor, target_size: int) -> Tensor:
+    height, width = kernel.shape[-2:]
+    if height > target_size or width > target_size:
+        raise ValueError(f"Cannot pad {height}x{width} to {target_size}x{target_size}")
+    pad_h = target_size - height
+    pad_w = target_size - width
+    return F.pad(
+        kernel,
+        (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
+    )
 
 
 class CoMingBlock(nn.Module):
-    """Road-oriented, attention-free, re-parameterizable convolution block.
+    """Road-oriented reparameterizable convolution block.
 
-    Train: KxK + 3x3 + 1xK + Kx1 + dilated-3x3 grouped convolutions.
-    Deploy: one KxK grouped convolution.  A full-channel pointwise FFN follows
-    the spatial operator and prevents isolated convolution groups.
+    Training branches: 3x3, 1xK, Kx1 and KxK depthwise convolutions.
+    Deployment branch: one KxK depthwise convolution.  A shared pointwise
+    convolution mixes channels.  The public name is intentionally preserved.
     """
 
-    def __init__(self, channels: int, kernel_size: int = 7,
-                 deploy: bool = False, expansion: float = 2.0,
-                 channels_per_group: int = 32,
-                 zero_init_residual: bool = False,
-                 act_layer=None) -> None:
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 5,
+        deploy: bool = False,
+        zero_init_residual: bool = True,
+    ) -> None:
         super().__init__()
-        if kernel_size not in (5, 7, 9, 11) or kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be one of 5, 7, 9, 11")
+        if kernel_size < 3 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be an odd integer >= 3")
+
         self.channels = channels
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
-        self.dilation = self.padding
-        self.groups = _valid_groups(channels, channels_per_group)
         self.deploy = deploy
-        self.num_spatial_branches = 5
-        self.branch_scale = 1.0 / math.sqrt(self.num_spatial_branches)
 
         if deploy:
             self.reparam_spatial = nn.Conv2d(
-                channels, channels, kernel_size, padding=self.padding,
-                groups=self.groups, bias=True
+                channels,
+                channels,
+                kernel_size,
+                padding=self.padding,
+                groups=channels,
+                bias=True,
             )
         else:
-            self.branch_large = GroupConvBN(
-                channels, kernel_size, self.padding, self.groups)
-            self.branch_local = GroupConvBN(channels, 3, 1, self.groups)
-            self.branch_horizontal = GroupConvBN(
-                channels, (1, kernel_size), (0, self.padding), self.groups)
-            self.branch_vertical = GroupConvBN(
-                channels, (kernel_size, 1), (self.padding, 0), self.groups)
-            self.branch_dilated = GroupConvBN(
-                channels, 3, self.dilation, self.groups,
-                dilation=self.dilation)
+            self.branch_local = DWConvBN(channels, 3, 1)
+            self.branch_horizontal = DWConvBN(
+                channels, (1, kernel_size), (0, self.padding)
+            )
+            self.branch_vertical = DWConvBN(
+                channels, (kernel_size, 1), (self.padding, 0)
+            )
+            self.branch_context = DWConvBN(
+                channels, kernel_size, self.padding
+            )
 
-        hidden = max(channels, int(round(channels * expansion)))
-        self.spatial_act = nn.SiLU(inplace=True)
-        self.ffn = nn.Sequential(
-            nn.Conv2d(channels, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1, bias=False),
+        self.channel_mixer = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
             nn.BatchNorm2d(channels),
         )
+        self.activation = nn.ReLU(inplace=True)
         if zero_init_residual:
-            nn.init.zeros_(self.ffn[-1].weight)
-            nn.init.zeros_(self.ffn[-1].bias)
+            self.zero_init_residual()
 
     def forward(self, x: Tensor) -> Tensor:
         if self.deploy:
             spatial = self.reparam_spatial(x)
         else:
             spatial = (
-                self.branch_large(x)
-                + self.branch_local(x)
+                self.branch_local(x)
                 + self.branch_horizontal(x)
                 + self.branch_vertical(x)
-                + self.branch_dilated(x)
-            ) * self.branch_scale
-        spatial = self.spatial_act(spatial)
-        return x + self.ffn(spatial)
+                + self.branch_context(x)
+            )
+        return self.activation(x + self.channel_mixer(spatial))
+
+    def zero_init_residual(self) -> None:
+        """Start the residual path at zero without touching other BN layers."""
+        nn.init.zeros_(self.channel_mixer[1].weight)
+        nn.init.zeros_(self.channel_mixer[1].bias)
 
     def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
         if self.deploy:
             return self.reparam_spatial.weight, self.reparam_spatial.bias
-        branches = (
-            self.branch_large, self.branch_local, self.branch_horizontal,
-            self.branch_vertical, self.branch_dilated,
-        )
-        kernel_sum = None
-        bias_sum = None
-        for branch in branches:
-            kernel, bias = branch.fused_kernel_bias()
-            kernel = _to_dense_kernel(
-                kernel, branch.conv.dilation, self.kernel_size)
-            kernel_sum = kernel if kernel_sum is None else kernel_sum + kernel
-            bias_sum = bias if bias_sum is None else bias_sum + bias
-        return kernel_sum * self.branch_scale, bias_sum * self.branch_scale
 
-    def zero_init_residual(self) -> None:
-        """Start the FFN residual branch at zero (block initially identity)."""
-        last_bn = self.ffn[-1]
-        if isinstance(last_bn, nn.BatchNorm2d):
-            nn.init.zeros_(last_bn.weight)
-            nn.init.zeros_(last_bn.bias)
+        branches = (
+            self.branch_local,
+            self.branch_horizontal,
+            self.branch_vertical,
+            self.branch_context,
+        )
+        kernels, biases = zip(
+            *(branch.equivalent_kernel_bias() for branch in branches)
+        )
+        kernel = sum(_center_pad(item, self.kernel_size) for item in kernels)
+        bias = sum(biases)
+        return kernel, bias
 
     def switch_to_deploy(self) -> None:
         if self.deploy:
             return
         kernel, bias = self.get_equivalent_kernel_bias()
-        conv = nn.Conv2d(
-            self.channels, self.channels, self.kernel_size,
-            padding=self.padding, groups=self.groups, bias=True
+        reparam = nn.Conv2d(
+            self.channels,
+            self.channels,
+            self.kernel_size,
+            padding=self.padding,
+            groups=self.channels,
+            bias=True,
         ).to(device=kernel.device, dtype=kernel.dtype)
         with torch.no_grad():
-            conv.weight.copy_(kernel)
-            conv.bias.copy_(bias)
-        self.reparam_spatial = conv
-        for name in (
-            "branch_large", "branch_local", "branch_horizontal",
-            "branch_vertical", "branch_dilated"
-        ):
-            delattr(self, name)
+            reparam.weight.copy_(kernel)
+            reparam.bias.copy_(bias)
+        self.reparam_spatial = reparam
+        del self.branch_local
+        del self.branch_horizontal
+        del self.branch_vertical
+        del self.branch_context
         self.deploy = True
 
 
-class _Fusion(nn.Module):
-    """Concat-convolution residual fusion; no attention or gating."""
-    def __init__(self, channels: int, kernel_size: int):
-        super().__init__()
-        self.merge = ConvBNAct(channels * 2, channels, 1, padding=0)
-        self.refine = CoMingBlock(channels, kernel_size, expansion=2.0)
+class CompactPyramidContext(nn.Module):
+    """Small CNN pyramid context at output stride 16.
 
-    def forward(self, base: Tensor, transferred: Tensor) -> Tensor:
-        update = self.merge(torch.cat([base, transferred], dim=1))
-        return self.refine(base + update)
+    Adaptive pooling gives image-level and regional context without a
+    quadratic attention map.  Pooled branches intentionally avoid BN because
+    the 1x1 branch is unsafe for small batches.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        branch_channels: int = 32,
+        kernel_size: int = 7,
+        deploy: bool = False,
+    ) -> None:
+        super().__init__()
+        self.pool_sizes = (1, 2, 4)
+        self.pool_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_channels, branch_channels, 1, bias=True),
+                    nn.ReLU(inplace=True),
+                )
+                for _ in self.pool_sizes
+            ]
+        )
+        merged_channels = in_channels + len(self.pool_sizes) * branch_channels
+        self.fuse = ConvBNAct(merged_channels, out_channels, 1, padding=0)
+        self.shortcut = ConvBNAct(
+            in_channels, out_channels, 1, padding=0, activation=False
+        )
+        self.refine = CoMingBlock(
+            out_channels, kernel_size=kernel_size, deploy=deploy
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        height, width = x.shape[-2:]
+        features = [x]
+        for size, projection in zip(self.pool_sizes, self.pool_projections):
+            pooled = F.adaptive_avg_pool2d(x, size)
+            pooled = projection(pooled)
+            features.append(
+                F.interpolate(
+                    pooled,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            )
+        return self.refine(self.fuse(torch.cat(features, dim=1)) + self.shortcut(x))
 
 
 class CoMingNet(nn.Module):
-    """Dual geometry-context CoMingNet backbone.
+    """Balanced two-stream backbone.
 
-    Geometry stays at output stride 4. Context progresses to stride 32. Two
-    bilateral exchanges use concat-convolution fusion. A stride-2 stem feature
-    is retained for the decoder to reconstruct thin roads and boundaries.
+    Feature contract returned to the decoder:
+        s4:  local geometry, 1/4 resolution, 4C channels
+        s8:  mid-level context, 1/8 resolution, 4C channels
+        s16: pyramid context, 1/16 resolution, 4C channels
     """
 
-    def __init__(self, in_channels: int = 3, channels: int = 32,
-                 ppm_channels: int = 128,
-                 local_blocks: Sequence[int] = (2, 2, 2),
-                 global_blocks: Sequence[int] = (2, 3, 2),
-                 kernel_size: int = 7, align_corners: bool = False,
-                 deploy: bool = False, zero_init_residual: bool = False,
-                 norm_cfg=None, act_cfg=None, init_cfg=None,
-                 use_checkpoint: bool = False, **kwargs) -> None:
+    def __init__(
+        self,
+        in_channels: int = 3,
+        channels: int = 32,
+        local_blocks: Sequence[int] = (2, 2, 2),
+        global_blocks: Sequence[int] = (2, 3),
+        highres_kernel_size: int = 5,
+        context_kernel_size: int = 7,
+        kernel_size: int | None = None,
+        deploy: bool = False,
+        zero_init_residual: bool = True,
+        **_: object,
+    ) -> None:
         super().__init__()
-        if len(local_blocks) != 3 or len(global_blocks) != 3:
-            raise ValueError("local_blocks/global_blocks require three values")
-        c1, c2, c4, c8, c16 = (
-            channels, channels * 2, channels * 4,
-            channels * 8, channels * 16,
-        )
-        self.align_corners = align_corners
-        self.use_checkpoint = use_checkpoint
+        if len(local_blocks) != 3:
+            raise ValueError("local_blocks must have three integers")
+        if len(global_blocks) not in (2, 3):
+            raise ValueError("global_blocks must have two integers (three is accepted for compatibility)")
+        if kernel_size is not None:
+            context_kernel_size = kernel_size
+        global_blocks = tuple(global_blocks[:2])
+
+        c1, c2, c4, c8 = channels, channels * 2, channels * 4, channels * 8
 
         self.stem_half = nn.Sequential(
-            ConvBNAct(in_channels, c1, 3, stride=2, padding=1),
-            CoMingBlock(c1, 7, deploy, 2.0, 32, zero_init_residual),
+            ConvBNAct(in_channels, c1, 3, stride=2),
+            ConvBNAct(c1, c1, 3),
         )
-        self.stem_quarter = ConvBNAct(c1, c2, 3, stride=2, padding=1)
+        self.stem_quarter = ConvBNAct(c1, c2, 3, stride=2)
 
-        self.local_stage1 = self._stage(c2, local_blocks[0], 9, deploy)
-        self.local_stage2 = self._stage(c2, local_blocks[1], 9, deploy)
-        self.local_transition = ConvBNAct(c2, c4, 3, padding=1)
-        self.local_stage3 = self._stage(c4, local_blocks[2], 9, deploy)
+        self.local_stage1 = self._stage(
+            c2, local_blocks[0], highres_kernel_size, deploy
+        )
+        self.global_stage1 = nn.Sequential(
+            ConvBNAct(c2, c4, 3, stride=2),
+            self._stage(c4, global_blocks[0], highres_kernel_size, deploy),
+        )
 
-        self.global_stage1 = self._down_stage(c2, c4, global_blocks[0], 7, deploy)
-        self.global_stage2 = self._down_stage(c4, c8, global_blocks[1], 5, deploy)
-        self.global_stage3 = self._down_stage(c8, c16, global_blocks[2], 5, deploy)
+        # Bilateral fusion 1: s4 <-> s8.
+        self.g2l1_proj = ConvBNAct(c4, c2, 1, padding=0, activation=False)
+        self.l2g1_proj = ConvBNAct(c2, c4, 3, stride=2, activation=False)
+        self.local_fusion1 = nn.ReLU(inplace=True)
+        self.global_fusion1 = nn.ReLU(inplace=True)
 
-        self.g2l1_proj = ConvBNAct(c4, c2, 1, padding=0, act=False)
-        self.l2g1_proj = ConvBNAct(c2, c4, 3, stride=2, padding=1, act=False)
-        self.local_fusion1 = _Fusion(c2, 9)
-        self.global_fusion1 = _Fusion(c4, 7)
+        self.local_stage2 = self._stage(
+            c2, local_blocks[1], highres_kernel_size, deploy
+        )
+        self.global_stage2 = nn.Sequential(
+            ConvBNAct(c4, c8, 3, stride=2),
+            self._stage(c8, global_blocks[1], context_kernel_size, deploy),
+        )
 
-        self.g2l2_proj = ConvBNAct(c8, c2, 1, padding=0, act=False)
+        # Bilateral fusion 2: s4 <-> s16.
+        self.g2l2_proj = ConvBNAct(c8, c2, 1, padding=0, activation=False)
         self.l2g2_proj = nn.Sequential(
-            ConvBNAct(c2, c4, 3, stride=2, padding=1),
-            ConvBNAct(c4, c8, 3, stride=2, padding=1, act=False),
+            ConvBNAct(c2, c4, 3, stride=2),
+            ConvBNAct(c4, c8, 3, stride=2, activation=False),
         )
-        self.local_fusion2 = _Fusion(c2, 9)
-        self.global_fusion2 = _Fusion(c8, 5)
+        self.local_fusion2 = nn.ReLU(inplace=True)
+        self.global_fusion2 = nn.ReLU(inplace=True)
 
-        # Re-parameterizable context replaces DAPPM.
-        self.context = nn.Sequential(
-            CoMingBlock(c16, 11, deploy, 2.0, 32, zero_init_residual),
-            ConvBNAct(c16, c4, 1, padding=0),
+        self.local_transition = ConvBNAct(c2, c4, 3)
+        self.local_stage3 = self._stage(
+            c4, local_blocks[2], highres_kernel_size, deploy
         )
-        self.final_merge = ConvBNAct(c4 * 2, c4, 1, padding=0)
-        self.final_refine = nn.Sequential(
-            CoMingBlock(c4, 9, deploy, 2.0, 32, zero_init_residual),
-            CoMingBlock(c4, 9, deploy, 2.0, 32, zero_init_residual),
+        self.context = CompactPyramidContext(
+            c8,
+            c4,
+            branch_channels=channels,
+            kernel_size=context_kernel_size,
+            deploy=deploy,
         )
-        self.apply(self._init_weights)
+        self.deploy = deploy
+        self._initialize()
+        if zero_init_residual:
+            self.zero_init_residuals()
 
     @staticmethod
-    def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.BatchNorm2d):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    @staticmethod
-    def _stage(channels: int, count: int, kernel: int, deploy: bool):
-        return nn.Sequential(*[
-            CoMingBlock(channels, kernel, deploy, expansion=2.0)
-            for _ in range(count)
-        ])
-
-    @classmethod
-    def _down_stage(cls, in_ch: int, out_ch: int, count: int,
-                    kernel: int, deploy: bool):
+    def _stage(
+        channels: int, blocks: int, kernel_size: int, deploy: bool
+    ) -> nn.Sequential:
+        if blocks < 1:
+            raise ValueError("Each stage needs at least one CoMingBlock")
         return nn.Sequential(
-            ConvBNAct(in_ch, out_ch, 3, stride=2, padding=1),
-            cls._stage(out_ch, count, kernel, deploy),
+            *[
+                CoMingBlock(
+                    channels,
+                    kernel_size=kernel_size,
+                    deploy=deploy,
+                    zero_init_residual=False,
+                )
+                for _ in range(blocks)
+            ]
         )
 
-    def _resize(self, x: Tensor, ref: Tensor) -> Tensor:
-        return F.interpolate(x, ref.shape[-2:], mode="bilinear",
-                             align_corners=self.align_corners)
+    def _initialize(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
-    def forward(self, x: Tensor, return_aux: Optional[bool] = None,
-                return_features: bool = False) -> Dict[str, Tensor]:
-        stem_half = self.stem_half(x)                  # 1/2, C
-        shared = self.stem_quarter(stem_half)          # 1/4, 2C
+    def zero_init_residuals(self) -> int:
+        count = 0
+        for module in self.modules():
+            if isinstance(module, CoMingBlock):
+                module.zero_init_residual()
+                count += 1
+        return count
 
-        local1_old = self.local_stage1(shared)         # 1/4, 2C
-        global1_old = self.global_stage1(shared)       # 1/8, 4C
-        g2l1 = self._resize(self.g2l1_proj(global1_old), local1_old)
-        l2g1 = self.l2g1_proj(local1_old)
-        if l2g1.shape[-2:] != global1_old.shape[-2:]:
-            l2g1 = self._resize(l2g1, global1_old)
-        local1 = self.local_fusion1(local1_old, g2l1)
-        global1 = self.global_fusion1(global1_old, l2g1)
+    @staticmethod
+    def _resize_like(source: Tensor, target: Tensor) -> Tensor:
+        return F.interpolate(
+            source,
+            size=target.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
 
-        local2_old = self.local_stage2(local1)         # 1/4, 2C
-        global2_old = self.global_stage2(global1)      # 1/16, 8C
-        g2l2 = self._resize(self.g2l2_proj(global2_old), local2_old)
-        l2g2 = self.l2g2_proj(local2_old)
-        if l2g2.shape[-2:] != global2_old.shape[-2:]:
-            l2g2 = self._resize(l2g2, global2_old)
-        local2 = self.local_fusion2(local2_old, g2l2)
-        global2 = self.global_fusion2(global2_old, l2g2)
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        shared = self.stem_quarter(self.stem_half(x))
 
-        geometry = self.local_stage3(self.local_transition(local2))  # 1/4, 4C
-        global3 = self.global_stage3(global2)                         # 1/32,16C
-        context = self.context(global3)                               # 1/32, 4C
-        context_up = self._resize(context, geometry)
-        fused = self.final_merge(torch.cat([geometry, context_up], dim=1))
-        fused = self.final_refine(fused)                              # 1/4, 4C
+        local1_old = self.local_stage1(shared)
+        global1_old = self.global_stage1(shared)
+        local1 = self.local_fusion1(
+            local1_old + self._resize_like(self.g2l1_proj(global1_old), local1_old)
+        )
+        global1 = self.global_fusion1(global1_old + self.l2g1_proj(local1_old))
 
-        return {
-            "stem_half": stem_half,
-            "aux": local1,
-            "geometry": geometry,
-            "global8": global1,
-            "global16": global2,
-            "global32": global3,
-            "context": context,
-            "fused": fused,
-        }
+        local2_old = self.local_stage2(local1)
+        global2_old = self.global_stage2(global1)
+        local2 = self.local_fusion2(
+            local2_old + self._resize_like(self.g2l2_proj(global2_old), local2_old)
+        )
+        local_to_global2 = self.l2g2_proj(local2_old)
+        if local_to_global2.shape[-2:] != global2_old.shape[-2:]:
+            local_to_global2 = self._resize_like(local_to_global2, global2_old)
+        global2 = self.global_fusion2(global2_old + local_to_global2)
+
+        local3 = self.local_stage3(self.local_transition(local2))
+        context = self.context(global2)
+        return {"s4": local3, "s8": global1, "s16": context}
 
     def switch_to_deploy(self) -> "CoMingNet":
         for module in list(self.modules()):
             if isinstance(module, CoMingBlock):
                 module.switch_to_deploy()
+        self.deploy = True
         return self
 
 
 @torch.no_grad()
-def verify_reparameterization(model: CoMingNet,
-                              input_shape=(1, 3, 256, 256),
-                              atol: float = 2e-4):
+def verify_reparameterization(
+    model: CoMingNet,
+    input_shape: Tuple[int, int, int, int] = (1, 3, 512, 512),
+    atol: float = 2e-4,
+) -> Tuple[float, float]:
+    """Check all backbone feature maps before/after branch fusion."""
     model.eval()
-    device = next(model.parameters()).device
-    x = torch.randn(input_shape, device=device)
-    before = model(x)["fused"]
+    parameter = next(model.parameters())
+    sample = torch.randn(input_shape, device=parameter.device, dtype=parameter.dtype)
+    before = model(sample)
     model.switch_to_deploy()
-    after = model(x)["fused"]
-    error = (before - after).abs()
-    if error.max().item() > atol:
-        raise AssertionError(f"reparameterization max error={error.max().item():.6g}")
-    return error.max().item(), error.mean().item()
+    after = model(sample)
+    errors = torch.cat(
+        [(before[key] - after[key]).abs().flatten() for key in before]
+    )
+    max_error = float(errors.max())
+    mean_error = float(errors.mean())
+    if max_error > atol:
+        raise AssertionError(
+            f"Reparameterization error {max_error:.6g} exceeds atol={atol}"
+        )
+    return max_error, mean_error
+
+
+__all__ = ["CoMingBlock", "CoMingNet", "verify_reparameterization"]
