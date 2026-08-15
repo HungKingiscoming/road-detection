@@ -401,11 +401,17 @@ class RoadLoss(nn.Module):
 
         boundary = logits.sum() * 0.0
         if self.boundary_weight > 0:
-            pred_boundary = soft_boundary_map(probability)
-            target_boundary = soft_boundary_map(target_float)
-            boundary = F.binary_cross_entropy(
-                pred_boundary.clamp(1e-5, 1.0 - 1e-5), target_boundary
-            )
+            # BCELoss on probabilities is explicitly disallowed inside AMP
+            # autocast.  Boundary extraction is also more stable in FP32, so
+            # disable autocast only for this small training-only term.  The
+            # main network forward and all other losses still benefit from AMP.
+            with torch.autocast(device_type=logits.device.type, enabled=False):
+                pred_boundary = soft_boundary_map(probability.float())
+                target_boundary = soft_boundary_map(target_float.float())
+                boundary = F.binary_cross_entropy(
+                    pred_boundary.clamp(1e-5, 1.0 - 1e-5),
+                    target_boundary,
+                )
             total = total + self.boundary_weight * boundary
 
         cldice = logits.sum() * 0.0
