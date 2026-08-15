@@ -289,6 +289,8 @@ def build_model(args: argparse.Namespace) -> Segmentor:
         global_blocks=args.global_blocks,
         highres_kernel_size=args.highres_kernel_size,
         context_kernel_size=args.coming_kernel_size,
+        local_expansion=args.local_expansion,
+        global_expansion=args.global_expansion,
     )
     head = GCNetHead(
         in_channels=feature_channels,
@@ -297,6 +299,8 @@ def build_model(args: argparse.Namespace) -> Segmentor:
         feature_channels=(feature_channels, feature_channels, feature_channels),
         highres_kernel_size=args.highres_kernel_size,
         context_kernel_size=args.coming_kernel_size,
+        local_expansion=args.local_expansion,
+        global_expansion=args.global_expansion,
         dropout_ratio=args.dropout,
     )
     model = Segmentor(backbone, head)
@@ -848,13 +852,17 @@ def parse_args() -> argparse.Namespace:
     dataset_root = "/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/tiff"
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_variant", default="coming", choices=["coming"])
-    parser.add_argument("--channels", type=int, default=32)
-    parser.add_argument("--decoder_channels", type=int, default=96)
+    parser.add_argument("--channels", type=int, default=48)
+    parser.add_argument("--decoder_channels", type=int, default=128)
     parser.add_argument("--local_blocks", type=int, nargs=3, default=(2, 2, 2))
     parser.add_argument("--global_blocks", type=int, nargs=2, default=(2, 3))
     parser.add_argument("--highres_kernel_size", type=int, default=5)
     parser.add_argument("--coming_kernel_size", type=int, default=7,
                         help="Context-stream kernel. High-resolution blocks use --highres_kernel_size=5.")
+    parser.add_argument("--local_expansion", type=float, default=1.5,
+                        help="Expansion in high-resolution stages and the final decoder block.")
+    parser.add_argument("--global_expansion", type=float, default=2.0,
+                        help="Expansion in context stages and low-resolution decoder blocks.")
     parser.add_argument("--dropout", type=float, default=0.05)
 
     parser.add_argument("--image_dir", default=f"{dataset_root}/train")
