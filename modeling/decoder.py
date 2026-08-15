@@ -1,131 +1,120 @@
-"""High-resolution decoder for CoMingNet V2.
+"""Lightweight additive decoder for CoMingNet.
 
-The class name ``GCNetHead`` is intentionally retained so the existing
-``train.py`` and ``Segmentor`` wrapper can import it without structural edits.
+The decoder never concatenates full-resolution features.  It projects all
+three backbone scales to one small width and uses addition, so activation
+memory stays predictable for batch size 8 on 512x512 crops.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Sequence, Tuple, Union
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-try:
-    # Kaggle project layout: place both files in modeling/.
-    from .backbone import CoMingBlock
-except ImportError:
-    try:
-        from backbone import CoMingBlock
-    except ImportError:
-        from coming_model import CoMingBlock
-
-
-class ConvBNAct(nn.Sequential):
-    def __init__(self, in_ch, out_ch, kernel_size=3, padding=1, act=True):
-        layers = [
-            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(out_ch),
-        ]
-        if act:
-            layers.append(nn.SiLU(inplace=True))
-        super().__init__(*layers)
+from .backbone import CoMingBlock, ConvBNAct
 
 
 class GCNetHead(nn.Module):
-    """H/4 -> H/2 road decoder with shallow-detail fusion.
+    """Compatibility name retained for the existing training project.
 
-    Expected backbone dictionary (base channels C=32):
-      fused:    [B, 4C, H/4, W/4]
-      stem_half:[B,  C, H/2, W/2]
-      aux:      [B, 2C, H/4, W/4]
-
-    Training returns ``(aux_logits, main_logits)`` to remain compatible with
-    the current trainer. Inference returns main logits only.
+    During training returns ``(aux_logits_s8, main_logits_s4)``.  During
+    evaluation returns only ``main_logits_s4``.  Deep supervision therefore
+    has zero inference cost.
     """
 
-    def __init__(self, in_channels: int = 128, channels: int = 128,
-                 num_classes: int = 2, stem_channels: int = 32,
-                 aux_in_channels: Optional[int] = None,
-                 align_corners: bool = False, dropout_ratio: float = 0.1,
-                 ignore_index: int = 255, loss_weight_aux: float = 0.3,
-                 norm_cfg=None, act_cfg=None, init_cfg=None, **kwargs):
+    def __init__(
+        self,
+        in_channels: int = 128,
+        channels: int = 96,
+        num_classes: int = 2,
+        feature_channels: Sequence[int] = (128, 128, 128),
+        dropout_ratio: float = 0.05,
+        highres_kernel_size: int = 5,
+        context_kernel_size: int = 7,
+        deploy: bool = False,
+        align_corners: bool = False,
+        **_: object,
+    ) -> None:
         super().__init__()
+        if len(feature_channels) != 3:
+            raise ValueError("feature_channels must describe s4, s8 and s16")
+        s4_channels, s8_channels, s16_channels = feature_channels
         self.align_corners = align_corners
-        self.num_classes = num_classes
-        self.ignore_index = ignore_index
-        self.loss_weight_aux = loss_weight_aux
-        aux_in_channels = aux_in_channels or in_channels // 2
 
-        # Main fused feature is projected before H/2 upsampling.
-        self.main_project = ConvBNAct(in_channels, 96, 1, padding=0)
-        self.stem_project = ConvBNAct(stem_channels, 32, 1, padding=0)
-        self.detail_merge = ConvBNAct(128, 128, 1, padding=0)
-        self.detail_refine = nn.Sequential(
-            CoMingBlock(128, kernel_size=7, expansion=2.0),
-            CoMingBlock(128, kernel_size=7, expansion=2.0),
+        self.context_proj = ConvBNAct(s16_channels, channels, 1, padding=0)
+        self.context_refine = CoMingBlock(
+            channels, context_kernel_size, deploy=deploy
         )
-        self.dropout = (nn.Dropout2d(dropout_ratio)
-                        if dropout_ratio > 0 else nn.Identity())
-        self.cls_seg = nn.Conv2d(128, num_classes, 1)
 
-        # Training-only auxiliary road segmentation at H/4.
-        self.aux_head = nn.Sequential(
-            ConvBNAct(aux_in_channels, 64, 3, padding=1),
-            CoMingBlock(64, kernel_size=7, expansion=2.0),
-            nn.Conv2d(64, num_classes, 1),
+        self.mid_proj = ConvBNAct(s8_channels, channels, 1, padding=0)
+        self.mid_refine = CoMingBlock(
+            channels, highres_kernel_size, deploy=deploy
         )
-        self.apply(self._init_weights)
 
-    @staticmethod
-    def _init_weights(module):
-        if isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.BatchNorm2d):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+        self.local_proj = ConvBNAct(s4_channels, channels, 1, padding=0)
+        self.local_refine = CoMingBlock(
+            channels, highres_kernel_size, deploy=deploy
+        )
 
-    def _main_logits(self, features: Dict[str, Tensor]) -> Tensor:
-        fused = self.main_project(features["fused"])
-        stem = self.stem_project(features["stem_half"])
-        fused = F.interpolate(
-            fused, size=stem.shape[-2:], mode="bilinear",
+        aux_channels = max(channels // 2, 32)
+        main_channels = max(channels * 2 // 3, 48)
+        self.aux_classifier = nn.Sequential(
+            ConvBNAct(channels, aux_channels, 3),
+            nn.Conv2d(aux_channels, num_classes, 1),
+        )
+        self.main_classifier = nn.Sequential(
+            ConvBNAct(channels, main_channels, 3),
+            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
+            nn.Conv2d(main_channels, num_classes, 1),
+        )
+        self._initialize_classifiers()
+
+    def _initialize_classifiers(self) -> None:
+        for module in (self.aux_classifier, self.main_classifier):
+            for child in module.modules():
+                if isinstance(child, nn.Conv2d):
+                    if child.out_channels == self.main_classifier[-1].out_channels:
+                        nn.init.normal_(child.weight, mean=0.0, std=0.01)
+                    else:
+                        nn.init.kaiming_normal_(
+                            child.weight, mode="fan_out", nonlinearity="relu"
+                        )
+                    if child.bias is not None:
+                        nn.init.zeros_(child.bias)
+
+    def _resize(self, x: Tensor, size: Tuple[int, int]) -> Tensor:
+        return F.interpolate(
+            x,
+            size=size,
+            mode="bilinear",
             align_corners=self.align_corners,
         )
-        x = self.detail_merge(torch.cat([fused, stem], dim=1))
-        x = self.detail_refine(x)
-        return self.cls_seg(self.dropout(x))
 
-    def forward(self, inputs):
-        if not isinstance(inputs, dict):
+    def forward(
+        self, features: Dict[str, Tensor]
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        if not isinstance(features, dict):
             raise TypeError(
-                "CoMingNet V2 decoder expects the feature dictionary returned "
-                "by coming_model.CoMingNet"
+                "Balanced GCNetHead expects the feature dictionary returned by CoMingNet"
             )
-        main = self._main_logits(inputs)
-        if self.training:
-            aux = self.aux_head(inputs["aux"])
-            return aux, main
-        return main
 
-    def predict(self, inputs: Dict[str, Tensor],
-                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
-        logits = self.forward(inputs)
-        if isinstance(logits, (tuple, list)):
-            logits = logits[-1]
-        if img_size is not None:
-            logits = F.interpolate(
-                logits, size=img_size, mode="bilinear",
-                align_corners=self.align_corners,
-            )
-        return logits
+        s4, s8, s16 = features["s4"], features["s8"], features["s16"]
+        d16 = self.context_refine(self.context_proj(s16))
+        d8 = self.mid_refine(self._resize(d16, s8.shape[-2:]) + self.mid_proj(s8))
+        d4 = self.local_refine(self._resize(d8, s4.shape[-2:]) + self.local_proj(s4))
+        main_logits = self.main_classifier(d4)
+
+        if self.training:
+            return self.aux_classifier(d8), main_logits
+        return main_logits
 
     def switch_to_deploy(self) -> "GCNetHead":
         for module in list(self.modules()):
             if isinstance(module, CoMingBlock):
                 module.switch_to_deploy()
         return self
+
+
+__all__ = ["GCNetHead"]
