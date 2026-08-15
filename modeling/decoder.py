@@ -27,12 +27,14 @@ class GCNetHead(nn.Module):
     def __init__(
         self,
         in_channels: int = 128,
-        channels: int = 96,
+        channels: int = 128,
         num_classes: int = 2,
         feature_channels: Sequence[int] = (128, 128, 128),
         dropout_ratio: float = 0.05,
         highres_kernel_size: int = 5,
         context_kernel_size: int = 7,
+        local_expansion: float = 1.5,
+        global_expansion: float = 2.0,
         deploy: bool = False,
         align_corners: bool = False,
         **_: object,
@@ -45,17 +47,26 @@ class GCNetHead(nn.Module):
 
         self.context_proj = ConvBNAct(s16_channels, channels, 1, padding=0)
         self.context_refine = CoMingBlock(
-            channels, context_kernel_size, deploy=deploy
+            channels,
+            context_kernel_size,
+            expansion=global_expansion,
+            deploy=deploy,
         )
 
         self.mid_proj = ConvBNAct(s8_channels, channels, 1, padding=0)
         self.mid_refine = CoMingBlock(
-            channels, highres_kernel_size, deploy=deploy
+            channels,
+            highres_kernel_size,
+            expansion=global_expansion,
+            deploy=deploy,
         )
 
         self.local_proj = ConvBNAct(s4_channels, channels, 1, padding=0)
         self.local_refine = CoMingBlock(
-            channels, highres_kernel_size, deploy=deploy
+            channels,
+            highres_kernel_size,
+            expansion=local_expansion,
+            deploy=deploy,
         )
 
         aux_channels = max(channels // 2, 32)
