@@ -19,9 +19,9 @@ from .backbone import CoMingBlock, ConvBNAct
 class GCNetHead(nn.Module):
     """Compatibility name retained for the existing training project.
 
-    During training returns ``(aux_logits_s8, main_logits_s4)``.  During
-    evaluation returns only ``main_logits_s4``.  Deep supervision therefore
-    has zero inference cost.
+    During training returns ``(aux_logits_s8, centerline_logits_s4,
+    main_logits_s4)``. During evaluation it returns only ``main_logits_s4``.
+    Both auxiliary classifiers therefore have zero inference cost.
     """
 
     def __init__(
@@ -75,6 +75,10 @@ class GCNetHead(nn.Module):
             ConvBNAct(channels, aux_channels, 3),
             nn.Conv2d(aux_channels, num_classes, 1),
         )
+        self.centerline_classifier = nn.Sequential(
+            ConvBNAct(channels, aux_channels, 3),
+            nn.Conv2d(aux_channels, 1, 1),
+        )
         self.main_classifier = nn.Sequential(
             ConvBNAct(channels, main_channels, 3),
             nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
@@ -83,10 +87,14 @@ class GCNetHead(nn.Module):
         self._initialize_classifiers()
 
     def _initialize_classifiers(self) -> None:
-        for module in (self.aux_classifier, self.main_classifier):
+        for module in (
+            self.aux_classifier,
+            self.centerline_classifier,
+            self.main_classifier,
+        ):
             for child in module.modules():
                 if isinstance(child, nn.Conv2d):
-                    if child.out_channels == self.main_classifier[-1].out_channels:
+                    if child is module[-1]:
                         nn.init.normal_(child.weight, mean=0.0, std=0.01)
                     else:
                         nn.init.kaiming_normal_(
@@ -118,7 +126,11 @@ class GCNetHead(nn.Module):
         main_logits = self.main_classifier(d4)
 
         if self.training:
-            return self.aux_classifier(d8), main_logits
+            return (
+                self.aux_classifier(d8),
+                self.centerline_classifier(d4),
+                main_logits,
+            )
         return main_logits
 
     def switch_to_deploy(self) -> "GCNetHead":
