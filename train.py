@@ -1,4 +1,4 @@
-"""Train the balanced CoMingNet on Massachusetts Roads.
+"""Train the balanced CoMingNet on Massachusetts Roads or DeepGlobe Roads.
 
 Key choices:
   * 512x512 crops for training; no multi-scale augmentation.
@@ -6,6 +6,7 @@ Key choices:
   * Sliding-window validation on complete 1500x1500 images.
   * BCE + Dice + lightweight boundary + scheduled soft-clDice.
   * Training-only deep supervision and optional logit distillation.
+  * Training-only centerline/connectivity auxiliary supervision at stride 4.
   * Threshold calibration and both micro/macro road IoU.
 
 Place this file at ``road-detection/train.py`` and the accompanying backbone
@@ -40,6 +41,7 @@ from modeling.decoder import GCNetHead
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
 
@@ -60,13 +62,21 @@ def sample_key(path: Path) -> str:
     return key
 
 
-def index_files(folder: str | Path) -> Dict[str, Path]:
+def index_files(folder: str | Path, role: Optional[str] = None) -> Dict[str, Path]:
     folder = Path(folder)
     if not folder.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {folder}")
     files = sorted(
         path for path in folder.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS
     )
+    if role is not None:
+        if role not in {"image", "mask"}:
+            raise ValueError("role must be 'image', 'mask' or None")
+        files = [
+            path for path in files
+            if any(path.stem.lower().endswith(suffix) for suffix in MASK_SUFFIXES)
+            == (role == "mask")
+        ]
     if not files:
         raise RuntimeError(f"No images found in {folder}")
     result: Dict[str, Path] = {}
@@ -79,7 +89,10 @@ def index_files(folder: str | Path) -> Dict[str, Path]:
 
 
 def build_pairs(image_dir: str | Path, mask_dir: str | Path) -> List[Tuple[Path, Path]]:
-    images, masks = index_files(image_dir), index_files(mask_dir)
+    image_dir, mask_dir = Path(image_dir), Path(mask_dir)
+    same_folder = image_dir.resolve() == mask_dir.resolve()
+    images = index_files(image_dir, role="image" if same_folder else None)
+    masks = index_files(mask_dir, role="mask" if same_folder else None)
     keys = sorted(images.keys() & masks.keys())
     if len(keys) != len(images) or len(keys) != len(masks):
         raise RuntimeError(
@@ -204,8 +217,14 @@ class RoadDataset(Dataset):
 
 def split_or_official_pairs(args: argparse.Namespace) -> Tuple[List, List]:
     train_pairs = build_pairs(args.image_dir, args.mask_dir)
-    val_image_dir, val_mask_dir = Path(args.val_image_dir), Path(args.val_mask_dir)
-    if val_image_dir.is_dir() and val_mask_dir.is_dir():
+    val_image_dir = Path(args.val_image_dir) if args.val_image_dir else None
+    val_mask_dir = Path(args.val_mask_dir) if args.val_mask_dir else None
+    if (
+        val_image_dir is not None
+        and val_mask_dir is not None
+        and val_image_dir.is_dir()
+        and val_mask_dir.is_dir()
+    ):
         val_pairs = build_pairs(val_image_dir, val_mask_dir)
         print(f"Official split: train={len(train_pairs)}, val={len(val_pairs)}")
         return train_pairs, val_pairs
@@ -221,6 +240,26 @@ def split_or_official_pairs(args: argparse.Namespace) -> Tuple[List, List]:
         f"train={len(train_pairs)}, val={len(val_pairs)}"
     )
     return train_pairs, val_pairs
+
+
+def configure_dataset_paths(args: argparse.Namespace) -> None:
+    """Fill dataset defaults without mixing DeepGlobe and Massachusetts."""
+    if args.dataset == "massachusetts":
+        root = Path("/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/tiff")
+        args.image_dir = args.image_dir or str(root / "train")
+        args.mask_dir = args.mask_dir or str(root / "train_labels")
+        args.val_image_dir = args.val_image_dir or str(root / "val")
+        args.val_mask_dir = args.val_mask_dir or str(root / "val_labels")
+        args.test_image_dir = args.test_image_dir or str(root / "test")
+        args.test_mask_dir = args.test_mask_dir or str(root / "test_labels")
+    else:
+        root = Path(
+            "/kaggle/input/datasets/balraj98/"
+            "deepglobe-road-extraction-dataset/train"
+        )
+        # DeepGlobe *_sat.jpg and *_mask.png files share this directory.
+        args.image_dir = args.image_dir or str(root)
+        args.mask_dir = args.mask_dir or str(root)
 
 
 def make_loaders(args: argparse.Namespace):
@@ -369,6 +408,64 @@ def soft_cldice_loss(probability: Tensor, target: Tensor, iterations: int = 5) -
         / (topology_precision + topology_sensitivity + smooth)
     )
     return (1.0 - cldice).mean()
+
+
+def centerline_auxiliary_loss(
+    centerline_logits: Tensor,
+    segmentation_logits: Tensor,
+    target: Tensor,
+    iterations: int = 5,
+    pos_weight_cap: float = 8.0,
+    dice_weight: float = 0.5,
+    cldice_weight: float = 0.25,
+    containment_weight: float = 0.1,
+) -> Dict[str, Tensor]:
+    """Supervise a training-only centerline head at output stride four.
+
+    The skeleton target is generated online from the binary road mask.  This
+    keeps Massachusetts and DeepGlobe compatible without extra label files.
+    """
+    size = centerline_logits.shape[-2:]
+    with torch.no_grad():
+        road_target = F.interpolate(
+            target[:, None].float(), size=size, mode="nearest"
+        )
+        centerline_target = soft_skeleton(
+            road_target.float(), iterations=max(1, iterations)
+        ).clamp(0.0, 1.0)
+
+    positive = centerline_target.sum()
+    negative = centerline_target.numel() - positive
+    dynamic_pos_weight = (negative / positive.clamp_min(1.0)).clamp(
+        min=1.0, max=pos_weight_cap
+    ).reshape(1)
+    bce = F.binary_cross_entropy_with_logits(
+        centerline_logits,
+        centerline_target.to(centerline_logits.dtype),
+        pos_weight=dynamic_pos_weight.to(centerline_logits.dtype),
+    )
+    probability = torch.sigmoid(centerline_logits)
+    dice = soft_dice_loss(probability, centerline_target)
+    topology = soft_cldice_loss(probability, centerline_target, iterations=3)
+
+    road_probability = torch.sigmoid(road_logit(segmentation_logits))
+    road_probability = F.interpolate(
+        road_probability, size=size, mode="bilinear", align_corners=False
+    )
+    containment = (probability * (1.0 - road_probability)).mean()
+    total = (
+        bce
+        + dice_weight * dice
+        + cldice_weight * topology
+        + containment_weight * containment
+    )
+    return {
+        "total": total,
+        "bce": bce,
+        "dice": dice,
+        "cldice": topology,
+        "containment": containment,
+    }
 
 
 class RoadLoss(nn.Module):
@@ -555,7 +652,13 @@ def train_one_epoch(
 ) -> Dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    totals = {key: 0.0 for key in ("total", "bce", "dice", "boundary", "cldice", "aux", "kd")}
+    totals = {
+        key: 0.0
+        for key in (
+            "total", "bce", "dice", "boundary", "cldice", "aux",
+            "centerline", "centerline_dice", "centerline_cldice", "kd",
+        )
+    }
     updates = 0
     max_gradient = 0.0
     progress = tqdm(loader, desc=f"Train {epoch + 1}/{args.epochs}")
@@ -570,7 +673,7 @@ def train_one_epoch(
                 teacher_logits = teacher(images)
 
         with autocast_context(device, args.use_amp):
-            aux_logits, main_logits = model(images)
+            aux_logits, centerline_logits, main_logits = model(images)
             main_logits = F.interpolate(
                 main_logits, masks.shape[-2:], mode="bilinear", align_corners=False
             )
@@ -581,6 +684,26 @@ def train_one_epoch(
             aux_base, _, _, _ = criterion.base(aux_logits, masks)
             aux_weight = args.aux_weight * (1.0 - epoch / args.epochs) ** args.aux_decay_exp
             total_loss = losses["total"] + aux_weight * aux_base
+
+            centerline_losses = {
+                "total": main_logits.sum() * 0.0,
+                "dice": main_logits.sum() * 0.0,
+                "cldice": main_logits.sum() * 0.0,
+            }
+            if args.centerline_weight > 0 and epoch >= args.centerline_start_epoch:
+                centerline_losses = centerline_auxiliary_loss(
+                    centerline_logits,
+                    main_logits,
+                    masks,
+                    iterations=args.centerline_iterations,
+                    pos_weight_cap=args.centerline_pos_weight_cap,
+                    dice_weight=args.centerline_dice_weight,
+                    cldice_weight=args.centerline_cldice_weight,
+                    containment_weight=args.centerline_containment_weight,
+                )
+                total_loss = total_loss + (
+                    args.centerline_weight * centerline_losses["total"]
+                )
 
             kd = main_logits.sum() * 0.0
             if teacher_logits is not None:
@@ -625,6 +748,9 @@ def train_one_epoch(
         for key in ("bce", "dice", "boundary", "cldice"):
             totals[key] += float(losses[key].detach())
         totals["aux"] += float(aux_base.detach())
+        totals["centerline"] += float(centerline_losses["total"].detach())
+        totals["centerline_dice"] += float(centerline_losses["dice"].detach())
+        totals["centerline_cldice"] += float(centerline_losses["cldice"].detach())
         totals["kd"] += float(kd.detach())
         progress.set_postfix(
             loss=f"{float(total_loss.detach()):.4f}",
@@ -837,7 +963,13 @@ def checkpoint_dict(
 
 def resume_training(path, model, optimizer, scheduler, scaler):
     checkpoint = safe_torch_load(path)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    try:
+        model.load_state_dict(checkpoint["model"], strict=True)
+    except RuntimeError as error:
+        raise RuntimeError(
+            "Strict resume failed. If this checkpoint predates the centerline "
+            "head or comes from another dataset, use --resume_mode transfer."
+        ) from error
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     scaler.load_state_dict(checkpoint["scaler"])
@@ -848,9 +980,22 @@ def resume_training(path, model, optimizer, scheduler, scaler):
     )
 
 
+def transfer_resume(path: str | Path, model: nn.Module) -> Tuple[int, float, float]:
+    """Load compatible model tensors but restart optimization and metrics."""
+    load_transfer(model, path)
+    print(
+        "Transfer resume: optimizer/scheduler/scaler reset; "
+        "new auxiliary heads start from fresh initialization"
+    )
+    return 0, 0.0, 0.5
+
+
 def parse_args() -> argparse.Namespace:
-    dataset_root = "/kaggle/input/datasets/balraj98/massachusetts-roads-dataset/tiff"
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset", default="massachusetts",
+        choices=["massachusetts", "deepglobe"],
+    )
     parser.add_argument("--model_variant", default="coming", choices=["coming"])
     parser.add_argument("--channels", type=int, default=48)
     parser.add_argument("--decoder_channels", type=int, default=128)
@@ -865,12 +1010,12 @@ def parse_args() -> argparse.Namespace:
                         help="Expansion in context stages and low-resolution decoder blocks.")
     parser.add_argument("--dropout", type=float, default=0.05)
 
-    parser.add_argument("--image_dir", default=f"{dataset_root}/train")
-    parser.add_argument("--mask_dir", default=f"{dataset_root}/train_labels")
-    parser.add_argument("--val_image_dir", default=f"{dataset_root}/val")
-    parser.add_argument("--val_mask_dir", default=f"{dataset_root}/val_labels")
-    parser.add_argument("--test_image_dir", default=f"{dataset_root}/test")
-    parser.add_argument("--test_mask_dir", default=f"{dataset_root}/test_labels")
+    parser.add_argument("--image_dir", default=None)
+    parser.add_argument("--mask_dir", default=None)
+    parser.add_argument("--val_image_dir", default=None)
+    parser.add_argument("--val_mask_dir", default=None)
+    parser.add_argument("--test_image_dir", default=None)
+    parser.add_argument("--test_mask_dir", default=None)
     parser.add_argument("--val_ratio", type=float, default=0.2)
     parser.add_argument("--crop_size", type=int, default=512)
     parser.add_argument("--road_crop_probability", type=float, default=0.5)
@@ -898,6 +1043,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cldice_downsample", type=int, default=2)
     parser.add_argument("--aux_weight", type=float, default=0.3)
     parser.add_argument("--aux_decay_exp", type=float, default=0.9)
+    parser.add_argument("--centerline_weight", type=float, default=0.15)
+    parser.add_argument("--centerline_start_epoch", type=int, default=0)
+    parser.add_argument("--centerline_iterations", type=int, default=5)
+    parser.add_argument("--centerline_pos_weight_cap", type=float, default=8.0)
+    parser.add_argument("--centerline_dice_weight", type=float, default=0.5)
+    parser.add_argument("--centerline_cldice_weight", type=float, default=0.25)
+    parser.add_argument("--centerline_containment_weight", type=float, default=0.1)
 
     parser.add_argument("--teacher_checkpoint", default=None)
     parser.add_argument("--kd_weight", type=float, default=0.1)
@@ -914,6 +1066,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--pretrained_weights", default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--resume_mode", default="continue", choices=["continue", "transfer"],
+        help="continue restores all states; transfer loads compatible model weights only.",
+    )
     parser.add_argument("--save_dir", default="./checkpoints/coming_balanced")
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -927,8 +1083,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    configure_dataset_paths(args)
+    if args.pretrained_weights and args.resume:
+        raise ValueError("Use only one of --pretrained_weights and --resume")
     if not 0.0 <= args.road_crop_probability <= 1.0:
         raise ValueError("road_crop_probability must be in [0, 1]")
+    if args.centerline_weight < 0:
+        raise ValueError("centerline_weight must be non-negative")
+    if args.centerline_iterations < 1:
+        raise ValueError("centerline_iterations must be >= 1")
     if args.ohem_keep_ratio is not None:
         print("INFO: --ohem_keep_ratio is ignored; this configuration does not use OHEM.")
     if args.loss_type is not None:
@@ -984,10 +1147,18 @@ def main() -> None:
 
     start_epoch, best_road_iou, best_threshold = 0, 0.0, 0.5
     if args.resume:
-        start_epoch, best_road_iou, best_threshold = resume_training(
-            args.resume, model, optimizer, scheduler, scaler
-        )
-        print(f"Resumed at epoch {start_epoch + 1}; best road IoU={best_road_iou:.4f}")
+        if args.resume_mode == "continue":
+            start_epoch, best_road_iou, best_threshold = resume_training(
+                args.resume, model, optimizer, scheduler, scaler
+            )
+            print(
+                f"Continued at epoch {start_epoch + 1}; "
+                f"best road IoU={best_road_iou:.4f}"
+            )
+        else:
+            start_epoch, best_road_iou, best_threshold = transfer_resume(
+                args.resume, model
+            )
 
     for epoch in range(start_epoch, args.epochs):
         train_metrics = train_one_epoch(
@@ -1006,6 +1177,8 @@ def main() -> None:
             f"Epoch {epoch + 1}: train loss={train_metrics['total']:.4f}, "
             f"BCE={train_metrics['bce']:.4f}, DiceLoss={train_metrics['dice']:.4f}, "
             f"boundary={train_metrics['boundary']:.4f}, clDice={train_metrics['cldice']:.4f}, "
+            f"centerline={train_metrics['centerline']:.4f}, "
+            f"centerlineDice={train_metrics['centerline_dice']:.4f}, "
             f"max_grad={train_metrics['max_gradient']:.2f}"
         )
 
@@ -1053,6 +1226,8 @@ def main() -> None:
             )
 
     if args.evaluate_test:
+        if not args.test_image_dir or not args.test_mask_dir:
+            raise FileNotFoundError("Test directories were not configured")
         test_image_dir, test_mask_dir = Path(args.test_image_dir), Path(args.test_mask_dir)
         if not test_image_dir.is_dir() or not test_mask_dir.is_dir():
             raise FileNotFoundError("Official test folders were not found")
