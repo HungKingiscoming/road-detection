@@ -4,9 +4,8 @@ Key choices:
   * 512x512 crops for training; no multi-scale augmentation.
   * Official train/val/test folders when available.
   * Sliding-window validation on complete 1500x1500 images.
-  * BCE + Dice + lightweight boundary + scheduled soft-clDice.
-  * Training-only deep supervision and optional logit distillation.
-  * Training-only centerline/connectivity auxiliary supervision at stride 4.
+  * BCE + Dice baseline; every extra objective is explicitly opt-in.
+  * Training-only optional deep supervision, centerline head and distillation.
   * Threshold calibration and both micro/macro road IoU.
 
 Place this file at ``road-detection/train.py`` and the accompanying backbone
@@ -330,6 +329,8 @@ def build_model(args: argparse.Namespace) -> Segmentor:
         context_kernel_size=args.coming_kernel_size,
         local_expansion=args.local_expansion,
         global_expansion=args.global_expansion,
+        local_spatial_ratio=args.local_spatial_ratio,
+        global_spatial_ratio=args.global_spatial_ratio,
     )
     head = GCNetHead(
         in_channels=feature_channels,
@@ -340,6 +341,10 @@ def build_model(args: argparse.Namespace) -> Segmentor:
         context_kernel_size=args.coming_kernel_size,
         local_expansion=args.local_expansion,
         global_expansion=args.global_expansion,
+        local_spatial_ratio=args.local_spatial_ratio,
+        global_spatial_ratio=args.global_spatial_ratio,
+        enable_seg_aux=args.aux_weight > 0,
+        enable_centerline_aux=args.centerline_weight > 0,
         dropout_ratio=args.dropout,
     )
     model = Segmentor(backbone, head)
@@ -548,7 +553,42 @@ def distillation_loss(student: Tensor, teacher: Tensor, temperature: float) -> T
     ) * (temperature**2) / (student.shape[-2] * student.shape[-1])
 
 
+def resolve_checkpoint_path(path: str | Path) -> Path:
+    """Resolve a Kaggle dataset folder or a direct checkpoint file."""
+    path = Path(path)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+
+    preferred_names = (
+        "best_road_iou.pt", "best_road_iou.pth", "best.pt", "best.pth",
+        "last.pt", "last.pth", "checkpoint.pt", "checkpoint.pth",
+    )
+    files = [candidate for candidate in path.rglob("*") if candidate.is_file()]
+    by_name = {candidate.name.lower(): candidate for candidate in files}
+    for name in preferred_names:
+        if name in by_name:
+            resolved = by_name[name]
+            print(f"Resolved checkpoint directory to: {resolved}")
+            return resolved
+    candidates = [
+        candidate for candidate in files
+        if candidate.suffix.lower() in {".pt", ".pth", ".ckpt"}
+    ]
+    if len(candidates) == 1:
+        print(f"Resolved checkpoint directory to: {candidates[0]}")
+        return candidates[0]
+    if not candidates:
+        raise FileNotFoundError(f"No .pt/.pth/.ckpt checkpoint found below: {path}")
+    names = "\n".join(f"  - {candidate}" for candidate in sorted(candidates))
+    raise RuntimeError(
+        "Checkpoint directory is ambiguous; pass the exact file path:\n" + names
+    )
+
+
 def safe_torch_load(path: str | Path):
+    path = resolve_checkpoint_path(path)
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:  # PyTorch < 2.6 has no weights_only argument.
@@ -677,12 +717,21 @@ def train_one_epoch(
             main_logits = F.interpolate(
                 main_logits, masks.shape[-2:], mode="bilinear", align_corners=False
             )
-            aux_logits = F.interpolate(
-                aux_logits, masks.shape[-2:], mode="bilinear", align_corners=False
-            )
             losses = criterion(main_logits, masks, epoch)
-            aux_base, _, _, _ = criterion.base(aux_logits, masks)
-            aux_weight = args.aux_weight * (1.0 - epoch / args.epochs) ** args.aux_decay_exp
+            aux_base = main_logits.sum() * 0.0
+            aux_weight = 0.0
+            if aux_logits is not None and args.aux_weight > 0:
+                aux_logits = F.interpolate(
+                    aux_logits,
+                    masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                aux_base, _, _, _ = criterion.base(aux_logits, masks)
+                aux_weight = (
+                    args.aux_weight
+                    * (1.0 - epoch / args.epochs) ** args.aux_decay_exp
+                )
             total_loss = losses["total"] + aux_weight * aux_base
 
             centerline_losses = {
@@ -690,7 +739,11 @@ def train_one_epoch(
                 "dice": main_logits.sum() * 0.0,
                 "cldice": main_logits.sum() * 0.0,
             }
-            if args.centerline_weight > 0 and epoch >= args.centerline_start_epoch:
+            if (
+                centerline_logits is not None
+                and args.centerline_weight > 0
+                and epoch >= args.centerline_start_epoch
+            ):
                 centerline_losses = centerline_auxiliary_loss(
                     centerline_logits,
                     main_logits,
@@ -997,10 +1050,10 @@ def parse_args() -> argparse.Namespace:
         choices=["massachusetts", "deepglobe"],
     )
     parser.add_argument("--model_variant", default="coming", choices=["coming"])
-    parser.add_argument("--channels", type=int, default=48)
-    parser.add_argument("--decoder_channels", type=int, default=128)
+    parser.add_argument("--channels", type=int, default=40)
+    parser.add_argument("--decoder_channels", type=int, default=96)
     parser.add_argument("--local_blocks", type=int, nargs=3, default=(2, 2, 2))
-    parser.add_argument("--global_blocks", type=int, nargs=2, default=(2, 3))
+    parser.add_argument("--global_blocks", type=int, nargs=2, default=(3, 4))
     parser.add_argument("--highres_kernel_size", type=int, default=5)
     parser.add_argument("--coming_kernel_size", type=int, default=7,
                         help="Context-stream kernel. High-resolution blocks use --highres_kernel_size=5.")
@@ -1008,6 +1061,10 @@ def parse_args() -> argparse.Namespace:
                         help="Expansion in high-resolution stages and the final decoder block.")
     parser.add_argument("--global_expansion", type=float, default=2.0,
                         help="Expansion in context stages and low-resolution decoder blocks.")
+    parser.add_argument("--local_spatial_ratio", type=float, default=0.25,
+                        help="Fraction of local-block channels processed by dense spatial convs.")
+    parser.add_argument("--global_spatial_ratio", type=float, default=0.5,
+                        help="Fraction of global-block channels processed by dense spatial convs.")
     parser.add_argument("--dropout", type=float, default=0.05)
 
     parser.add_argument("--image_dir", default=None)
@@ -1037,13 +1094,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pos_weight", type=float, default=None)
     parser.add_argument("--pos_weight_cap", type=float, default=3.0)
     parser.add_argument("--dice_weight", type=float, default=0.5)
-    parser.add_argument("--boundary_weight", type=float, default=0.1)
-    parser.add_argument("--cldice_weight", type=float, default=0.05)
+    parser.add_argument("--boundary_weight", type=float, default=0.0)
+    parser.add_argument("--cldice_weight", type=float, default=0.0)
     parser.add_argument("--cldice_start_epoch", type=int, default=10)
     parser.add_argument("--cldice_downsample", type=int, default=2)
-    parser.add_argument("--aux_weight", type=float, default=0.3)
+    parser.add_argument("--aux_weight", type=float, default=0.0)
     parser.add_argument("--aux_decay_exp", type=float, default=0.9)
-    parser.add_argument("--centerline_weight", type=float, default=0.15)
+    parser.add_argument("--centerline_weight", type=float, default=0.0)
     parser.add_argument("--centerline_start_epoch", type=int, default=0)
     parser.add_argument("--centerline_iterations", type=int, default=5)
     parser.add_argument("--centerline_pos_weight_cap", type=float, default=8.0)
@@ -1090,12 +1147,16 @@ def main() -> None:
         raise ValueError("road_crop_probability must be in [0, 1]")
     if args.centerline_weight < 0:
         raise ValueError("centerline_weight must be non-negative")
+    if not 0.0 < args.local_spatial_ratio <= 1.0:
+        raise ValueError("local_spatial_ratio must be in (0, 1]")
+    if not 0.0 < args.global_spatial_ratio <= 1.0:
+        raise ValueError("global_spatial_ratio must be in (0, 1]")
     if args.centerline_iterations < 1:
         raise ValueError("centerline_iterations must be >= 1")
     if args.ohem_keep_ratio is not None:
         print("INFO: --ohem_keep_ratio is ignored; this configuration does not use OHEM.")
     if args.loss_type is not None:
-        print("INFO: --loss_type is deprecated; balanced BCE+Dice+boundary+clDice is used.")
+        print("INFO: --loss_type is deprecated; loss weights are controlled explicitly.")
 
     seed_everything(args.seed)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
