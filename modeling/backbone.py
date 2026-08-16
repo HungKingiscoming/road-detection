@@ -1,24 +1,21 @@
-"""CoMingNet balanced backbone for Massachusetts Roads.
+"""Two-stream CoMingNet backbone for road extraction.
 
-Pure CNN, no attention and no transformer.  The network keeps a high-resolution
-local stream (output stride 4), a compact context stream (output stride 8/16),
-and performs exactly two bilateral fusions.  CoMingBlock is reparameterizable:
-four depthwise branches used during training become one depthwise KxK branch
-for deployment.
+The local stream stays at output stride 4 while the global stream reaches
+stride 8/16. Exactly two additive bilateral fusions exchange geometry and
+context. ``CoMingBlock`` is a partial standard-convolution block: only a
+fraction of channels enters its multi-branch spatial operator, and all spatial
+branches are fused exactly into one dense KxK convolution for deployment.
+There is no attention or transformer operation.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-
-
-def _pair(value: int | Tuple[int, int]) -> Tuple[int, int]:
-    return value if isinstance(value, tuple) else (value, value)
 
 
 class ConvBNAct(nn.Sequential):
@@ -51,14 +48,15 @@ class ConvBNAct(nn.Sequential):
         super().__init__(*layers)
 
 
-class DWConvBN(nn.Module):
-    """Depthwise convolution followed by BN; used by CoMingBlock branches."""
+class RepConvBN(nn.Module):
+    """Dense convolution followed by BN for a reparameterizable branch."""
 
     def __init__(
         self,
         channels: int,
         kernel_size: int | Tuple[int, int],
         padding: int | Tuple[int, int],
+        dilation: int | Tuple[int, int] = 1,
     ) -> None:
         super().__init__()
         self.conv = nn.Conv2d(
@@ -66,7 +64,8 @@ class DWConvBN(nn.Module):
             channels,
             kernel_size=kernel_size,
             padding=padding,
-            groups=channels,
+            dilation=dilation,
+            groups=1,
             bias=False,
         )
         self.bn = nn.BatchNorm2d(channels)
@@ -86,6 +85,32 @@ class DWConvBN(nn.Module):
         return kernel, bias
 
 
+class IdentityBN(nn.Module):
+    """Identity branch with BN, convertible to a dense 1x1 convolution."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.channels = channels
+        self.bn = nn.BatchNorm2d(channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.bn(x)
+
+    def equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        dtype = self.bn.weight.dtype
+        device = self.bn.weight.device
+        kernel = torch.zeros(
+            self.channels, self.channels, 1, 1, dtype=dtype, device=device
+        )
+        index = torch.arange(self.channels, device=device)
+        kernel[index, index, 0, 0] = 1.0
+        std = torch.sqrt(self.bn.running_var + self.bn.eps)
+        scale = self.bn.weight / std
+        kernel = kernel * scale.reshape(-1, 1, 1, 1)
+        bias = self.bn.bias - self.bn.running_mean * scale
+        return kernel, bias
+
+
 def _center_pad(kernel: Tensor, target_size: int) -> Tensor:
     height, width = kernel.shape[-2:]
     if height > target_size or width > target_size:
@@ -98,13 +123,45 @@ def _center_pad(kernel: Tensor, target_size: int) -> Tensor:
     )
 
 
-class CoMingBlock(nn.Module):
-    """Road-oriented reparameterizable convolution block.
+def _expand_dilated_kernel(
+    kernel: Tensor,
+    dilation: int,
+    target_size: int,
+) -> Tensor:
+    """Materialize a dilated kernel as a dense target-size kernel."""
+    height, width = kernel.shape[-2:]
+    effective_h = (height - 1) * dilation + 1
+    effective_w = (width - 1) * dilation + 1
+    if effective_h > target_size or effective_w > target_size:
+        raise ValueError("Dilated branch is larger than the deploy kernel")
+    expanded = kernel.new_zeros(
+        kernel.shape[0], kernel.shape[1], target_size, target_size
+    )
+    offset_h = (target_size - effective_h) // 2
+    offset_w = (target_size - effective_w) // 2
+    expanded[
+        :, :, offset_h : offset_h + effective_h : dilation,
+        offset_w : offset_w + effective_w : dilation,
+    ] = kernel
+    return expanded
 
-    Training branches: 3x3, 1xK, Kx1 and KxK depthwise convolutions.
-    Deployment branch: one KxK depthwise convolution.  An inverted pointwise
-    MLP expands channels, applies a non-linearity, then projects back to C.
-    The public name is intentionally preserved.
+
+def _channel_shuffle(x: Tensor, groups: int) -> Tensor:
+    batch, channels, height, width = x.shape
+    if groups <= 1 or channels % groups != 0:
+        return x
+    x = x.reshape(batch, groups, channels // groups, height, width)
+    return x.transpose(1, 2).contiguous().reshape(batch, channels, height, width)
+
+
+class CoMingBlock(nn.Module):
+    """Partial reparameterized spatial block; public name is preserved.
+
+    Only ``spatial_ratio`` of the channels is processed by dense convolutions.
+    Training uses local 3x3, dilated 3x3, horizontal 1xK, vertical Kx1 and
+    identity-BN branches. At deployment they become one standard KxK conv.
+    Bypass channels preserve cheap detail; shuffle and pointwise expansion mix
+    processed and bypass channels.
     """
 
     def __init__(
@@ -112,20 +169,29 @@ class CoMingBlock(nn.Module):
         channels: int,
         kernel_size: int = 5,
         expansion: float = 1.0,
+        spatial_ratio: float = 0.25,
+        shuffle_groups: int = 4,
         deploy: bool = False,
         zero_init_residual: bool = True,
     ) -> None:
         super().__init__()
-        if kernel_size < 3 or kernel_size % 2 == 0:
-            raise ValueError("kernel_size must be an odd integer >= 3")
+        if kernel_size < 5 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be an odd integer >= 5")
         if expansion < 1.0:
             raise ValueError("expansion must be >= 1.0")
+        if not 0.0 < spatial_ratio <= 1.0:
+            raise ValueError("spatial_ratio must be in (0, 1]")
 
         self.channels = channels
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
         self.expansion = float(expansion)
+        self.spatial_ratio = float(spatial_ratio)
+        self.shuffle_groups = int(shuffle_groups)
         self.deploy = deploy
+        processed = int(round(channels * self.spatial_ratio))
+        self.processed_channels = min(channels, max(1, processed))
+        self.context_dilation = (kernel_size - 1) // 2
         hidden_channels = max(
             channels,
             int(round(channels * self.expansion / 8.0)) * 8,
@@ -134,24 +200,26 @@ class CoMingBlock(nn.Module):
 
         if deploy:
             self.reparam_spatial = nn.Conv2d(
-                channels,
-                channels,
+                self.processed_channels,
+                self.processed_channels,
                 kernel_size,
                 padding=self.padding,
-                groups=channels,
+                groups=1,
                 bias=True,
             )
         else:
-            self.branch_local = DWConvBN(channels, 3, 1)
-            self.branch_horizontal = DWConvBN(
-                channels, (1, kernel_size), (0, self.padding)
+            p = self.processed_channels
+            self.branch_local = RepConvBN(p, 3, 1)
+            self.branch_dilated = RepConvBN(
+                p, 3, self.context_dilation, dilation=self.context_dilation
             )
-            self.branch_vertical = DWConvBN(
-                channels, (kernel_size, 1), (self.padding, 0)
+            self.branch_horizontal = RepConvBN(
+                p, (1, kernel_size), (0, self.padding)
             )
-            self.branch_context = DWConvBN(
-                channels, kernel_size, self.padding
+            self.branch_vertical = RepConvBN(
+                p, (kernel_size, 1), (self.padding, 0)
             )
+            self.branch_identity = IdentityBN(p)
 
         self.channel_mixer = nn.Sequential(
             nn.Conv2d(channels, hidden_channels, 1, bias=False),
@@ -165,16 +233,22 @@ class CoMingBlock(nn.Module):
             self.zero_init_residual()
 
     def forward(self, x: Tensor) -> Tensor:
+        spatial_input = x[:, : self.processed_channels]
+        bypass = x[:, self.processed_channels :]
         if self.deploy:
-            spatial = self.reparam_spatial(x)
+            spatial = self.reparam_spatial(spatial_input)
         else:
             spatial = (
-                self.branch_local(x)
-                + self.branch_horizontal(x)
-                + self.branch_vertical(x)
-                + self.branch_context(x)
+                self.branch_local(spatial_input)
+                + self.branch_dilated(spatial_input)
+                + self.branch_horizontal(spatial_input)
+                + self.branch_vertical(spatial_input)
+                + self.branch_identity(spatial_input)
             )
-        return self.activation(x + self.channel_mixer(spatial))
+        spatial = self.activation(spatial)
+        mixed_input = torch.cat((spatial, bypass), dim=1) if bypass.numel() else spatial
+        mixed_input = _channel_shuffle(mixed_input, self.shuffle_groups)
+        return self.activation(x + self.channel_mixer(mixed_input))
 
     def zero_init_residual(self) -> None:
         """Start the residual path at zero without touching other BN layers."""
@@ -190,14 +264,23 @@ class CoMingBlock(nn.Module):
 
         branches = (
             self.branch_local,
+            self.branch_dilated,
             self.branch_horizontal,
             self.branch_vertical,
-            self.branch_context,
+            self.branch_identity,
         )
         kernels, biases = zip(
             *(branch.equivalent_kernel_bias() for branch in branches)
         )
-        kernel = sum(_center_pad(item, self.kernel_size) for item in kernels)
+        kernel = (
+            _center_pad(kernels[0], self.kernel_size)
+            + _expand_dilated_kernel(
+                kernels[1], self.context_dilation, self.kernel_size
+            )
+            + _center_pad(kernels[2], self.kernel_size)
+            + _center_pad(kernels[3], self.kernel_size)
+            + _center_pad(kernels[4], self.kernel_size)
+        )
         bias = sum(biases)
         return kernel, bias
 
@@ -206,11 +289,11 @@ class CoMingBlock(nn.Module):
             return
         kernel, bias = self.get_equivalent_kernel_bias()
         reparam = nn.Conv2d(
-            self.channels,
-            self.channels,
+            self.processed_channels,
+            self.processed_channels,
             self.kernel_size,
             padding=self.padding,
-            groups=self.channels,
+            groups=1,
             bias=True,
         ).to(device=kernel.device, dtype=kernel.dtype)
         with torch.no_grad():
@@ -218,9 +301,10 @@ class CoMingBlock(nn.Module):
             reparam.bias.copy_(bias)
         self.reparam_spatial = reparam
         del self.branch_local
+        del self.branch_dilated
         del self.branch_horizontal
         del self.branch_vertical
-        del self.branch_context
+        del self.branch_identity
         self.deploy = True
 
 
@@ -239,6 +323,7 @@ class CompactPyramidContext(nn.Module):
         branch_channels: int = 32,
         kernel_size: int = 7,
         expansion: float = 2.0,
+        spatial_ratio: float = 0.5,
         deploy: bool = False,
     ) -> None:
         super().__init__()
@@ -261,6 +346,7 @@ class CompactPyramidContext(nn.Module):
             out_channels,
             kernel_size=kernel_size,
             expansion=expansion,
+            spatial_ratio=spatial_ratio,
             deploy=deploy,
         )
 
@@ -293,13 +379,15 @@ class CoMingNet(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        channels: int = 48,
+        channels: int = 40,
         local_blocks: Sequence[int] = (2, 2, 2),
-        global_blocks: Sequence[int] = (2, 3),
+        global_blocks: Sequence[int] = (3, 4),
         highres_kernel_size: int = 5,
         context_kernel_size: int = 7,
         local_expansion: float = 1.5,
         global_expansion: float = 2.0,
+        local_spatial_ratio: float = 0.25,
+        global_spatial_ratio: float = 0.5,
         kernel_size: int | None = None,
         deploy: bool = False,
         zero_init_residual: bool = True,
@@ -323,12 +411,14 @@ class CoMingNet(nn.Module):
         self.stem_quarter = ConvBNAct(c1, c2, 3, stride=2)
 
         self.local_stage1 = self._stage(
-            c2, local_blocks[0], highres_kernel_size, local_expansion, deploy
+            c2, local_blocks[0], highres_kernel_size, local_expansion,
+            local_spatial_ratio, deploy
         )
         self.global_stage1 = nn.Sequential(
             ConvBNAct(c2, c4, 3, stride=2),
             self._stage(
-                c4, global_blocks[0], highres_kernel_size, global_expansion, deploy
+                c4, global_blocks[0], highres_kernel_size, global_expansion,
+                global_spatial_ratio, deploy
             ),
         )
 
@@ -339,12 +429,14 @@ class CoMingNet(nn.Module):
         self.global_fusion1 = nn.ReLU(inplace=True)
 
         self.local_stage2 = self._stage(
-            c2, local_blocks[1], highres_kernel_size, local_expansion, deploy
+            c2, local_blocks[1], highres_kernel_size, local_expansion,
+            local_spatial_ratio, deploy
         )
         self.global_stage2 = nn.Sequential(
             ConvBNAct(c4, c8, 3, stride=2),
             self._stage(
-                c8, global_blocks[1], context_kernel_size, global_expansion, deploy
+                c8, global_blocks[1], context_kernel_size, global_expansion,
+                global_spatial_ratio, deploy
             ),
         )
 
@@ -359,7 +451,8 @@ class CoMingNet(nn.Module):
 
         self.local_transition = ConvBNAct(c2, c4, 3)
         self.local_stage3 = self._stage(
-            c4, local_blocks[2], highres_kernel_size, local_expansion, deploy
+            c4, local_blocks[2], highres_kernel_size, local_expansion,
+            local_spatial_ratio, deploy
         )
         self.context = CompactPyramidContext(
             c8,
@@ -367,6 +460,7 @@ class CoMingNet(nn.Module):
             branch_channels=channels,
             kernel_size=context_kernel_size,
             expansion=global_expansion,
+            spatial_ratio=global_spatial_ratio,
             deploy=deploy,
         )
         self.deploy = deploy
@@ -380,6 +474,7 @@ class CoMingNet(nn.Module):
         blocks: int,
         kernel_size: int,
         expansion: float,
+        spatial_ratio: float,
         deploy: bool,
     ) -> nn.Sequential:
         if blocks < 1:
@@ -390,6 +485,7 @@ class CoMingNet(nn.Module):
                     channels,
                     kernel_size=kernel_size,
                     expansion=expansion,
+                    spatial_ratio=spatial_ratio,
                     deploy=deploy,
                     zero_init_residual=False,
                 )
