@@ -483,4 +483,4 @@ def verify_reparameterization(
     return max_error, mean_error
 
 
-__all__ = ["CoMingBlock", "CoMingNet", "verify_reparameterization"]
+__all__ = ["CoMingBlock", "CoMingNet", "verify_reparamete
