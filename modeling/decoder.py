@@ -7,7 +7,7 @@ memory stays predictable for batch size 8 on 512x512 crops.
 
 from __future__ import annotations
 
-from typing import Dict, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,14 +20,14 @@ class GCNetHead(nn.Module):
     """Compatibility name retained for the existing training project.
 
     During training returns ``(aux_logits_s8, centerline_logits_s4,
-    main_logits_s4)``. During evaluation it returns only ``main_logits_s4``.
-    Both auxiliary classifiers therefore have zero inference cost.
+    main_logits_s4)``; a disabled auxiliary is returned as ``None`` and is not
+    executed. During evaluation only ``main_logits_s4`` is returned.
     """
 
     def __init__(
         self,
         in_channels: int = 128,
-        channels: int = 128,
+        channels: int = 96,
         num_classes: int = 2,
         feature_channels: Sequence[int] = (128, 128, 128),
         dropout_ratio: float = 0.05,
@@ -35,6 +35,10 @@ class GCNetHead(nn.Module):
         context_kernel_size: int = 7,
         local_expansion: float = 1.5,
         global_expansion: float = 2.0,
+        local_spatial_ratio: float = 0.25,
+        global_spatial_ratio: float = 0.5,
+        enable_seg_aux: bool = False,
+        enable_centerline_aux: bool = False,
         deploy: bool = False,
         align_corners: bool = False,
         **_: object,
@@ -44,12 +48,15 @@ class GCNetHead(nn.Module):
             raise ValueError("feature_channels must describe s4, s8 and s16")
         s4_channels, s8_channels, s16_channels = feature_channels
         self.align_corners = align_corners
+        self.enable_seg_aux = bool(enable_seg_aux)
+        self.enable_centerline_aux = bool(enable_centerline_aux)
 
         self.context_proj = ConvBNAct(s16_channels, channels, 1, padding=0)
         self.context_refine = CoMingBlock(
             channels,
             context_kernel_size,
             expansion=global_expansion,
+            spatial_ratio=global_spatial_ratio,
             deploy=deploy,
         )
 
@@ -58,6 +65,7 @@ class GCNetHead(nn.Module):
             channels,
             highres_kernel_size,
             expansion=global_expansion,
+            spatial_ratio=global_spatial_ratio,
             deploy=deploy,
         )
 
@@ -66,6 +74,7 @@ class GCNetHead(nn.Module):
             channels,
             highres_kernel_size,
             expansion=local_expansion,
+            spatial_ratio=local_spatial_ratio,
             deploy=deploy,
         )
 
@@ -113,7 +122,10 @@ class GCNetHead(nn.Module):
 
     def forward(
         self, features: Dict[str, Tensor]
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> Union[
+        Tensor,
+        Tuple[Optional[Tensor], Optional[Tensor], Tensor],
+    ]:
         if not isinstance(features, dict):
             raise TypeError(
                 "Balanced GCNetHead expects the feature dictionary returned by CoMingNet"
@@ -127,8 +139,10 @@ class GCNetHead(nn.Module):
 
         if self.training:
             return (
-                self.aux_classifier(d8),
-                self.centerline_classifier(d4),
+                self.aux_classifier(d8) if self.enable_seg_aux else None,
+                self.centerline_classifier(d4)
+                if self.enable_centerline_aux
+                else None,
                 main_logits,
             )
         return main_logits
