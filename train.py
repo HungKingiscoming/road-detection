@@ -337,6 +337,7 @@ def build_model(args: argparse.Namespace) -> Segmentor:
         channels=args.decoder_channels,
         num_classes=2,
         feature_channels=(feature_channels, feature_channels, feature_channels),
+        stem_channels=args.channels,
         highres_kernel_size=args.highres_kernel_size,
         context_kernel_size=args.coming_kernel_size,
         local_expansion=args.local_expansion,
@@ -345,6 +346,8 @@ def build_model(args: argparse.Namespace) -> Segmentor:
         global_spatial_ratio=args.global_spatial_ratio,
         enable_seg_aux=args.aux_weight > 0,
         enable_centerline_aux=args.centerline_weight > 0,
+        enable_half_refine=args.use_half_refine,
+        half_refine_channels=args.half_refine_channels,
         dropout_ratio=args.dropout,
     )
     model = Segmentor(backbone, head)
@@ -813,6 +816,12 @@ def train_one_epoch(
 
     count = max(len(loader), 1)
     metrics = {key: value / count for key, value in totals.items()}
+    metrics["aux_weight"] = (
+        args.aux_weight
+        * (1.0 - epoch / args.epochs) ** args.aux_decay_exp
+        if args.aux_weight > 0
+        else 0.0
+    )
     metrics["max_gradient"] = max_gradient
     metrics["updates"] = float(updates)
     return metrics
@@ -1052,6 +1061,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_variant", default="coming", choices=["coming"])
     parser.add_argument("--channels", type=int, default=40)
     parser.add_argument("--decoder_channels", type=int, default=96)
+    parser.add_argument(
+        "--use_half_refine",
+        action="store_true",
+        help="Add an additive stem skip and one learned dense 3x3 refinement at H/2.",
+    )
+    parser.add_argument(
+        "--half_refine_channels",
+        type=int,
+        default=32,
+        help="Width of the optional H/2 refinement path.",
+    )
     parser.add_argument("--local_blocks", type=int, nargs=3, default=(2, 2, 2))
     parser.add_argument("--global_blocks", type=int, nargs=2, default=(3, 4))
     parser.add_argument("--highres_kernel_size", type=int, default=5)
@@ -1238,6 +1258,7 @@ def main() -> None:
             f"Epoch {epoch + 1}: train loss={train_metrics['total']:.4f}, "
             f"BCE={train_metrics['bce']:.4f}, DiceLoss={train_metrics['dice']:.4f}, "
             f"boundary={train_metrics['boundary']:.4f}, clDice={train_metrics['cldice']:.4f}, "
+            f"aux={train_metrics['aux']:.4f} (w={train_metrics['aux_weight']:.4f}), "
             f"centerline={train_metrics['centerline']:.4f}, "
             f"centerlineDice={train_metrics['centerline_dice']:.4f}, "
             f"max_grad={train_metrics['max_gradient']:.2f}"
@@ -1246,6 +1267,9 @@ def main() -> None:
         should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
         if should_validate:
             validation = evaluate(model, val_loader, criterion, device, args, epoch)
+            # Select checkpoints with the fixed operating point. Threshold
+            # search remains a reporting/calibration metric only.
+            checkpoint_iou = validation["fixed_road_iou_micro"]
             selected_iou = validation["selected_road_iou_micro"]
             selected_threshold = validation["selected_threshold"]
             print(
@@ -1254,8 +1278,8 @@ def main() -> None:
                 f"selected@{selected_threshold:.2f} road IoU micro={selected_iou:.4f}, "
                 f"macro={validation['selected_road_iou_macro']:.4f}"
             )
-            if selected_iou > best_road_iou:
-                best_road_iou, best_threshold = selected_iou, selected_threshold
+            if checkpoint_iou > best_road_iou:
+                best_road_iou, best_threshold = checkpoint_iou, 0.5
                 torch.save(
                     checkpoint_dict(
                         model,
@@ -1269,7 +1293,10 @@ def main() -> None:
                     ),
                     save_dir / "best_road_iou.pt",
                 )
-                print(f"New best road IoU={best_road_iou:.4f}; checkpoint saved")
+                print(
+                    f"New best fixed@0.50 road IoU={best_road_iou:.4f}; "
+                    "checkpoint saved"
+                )
 
         if (epoch + 1) % args.save_interval == 0 or epoch + 1 == args.epochs:
             torch.save(
