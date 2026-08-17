@@ -111,6 +111,46 @@ def read_binary_mask(path: Path) -> np.ndarray:
     return (mask > 0).astype(np.uint8)
 
 
+def dump_alignment_check(
+    pairs: Sequence[Tuple[Path, Path]],
+    output_dir: str | Path,
+    n_samples: int = 6,
+) -> None:
+    """Write red road-mask overlays for a one-time image/mask sanity check."""
+    if n_samples <= 0 or not pairs:
+        return
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sample_count = min(int(n_samples), len(pairs))
+    # Spread samples over the sorted dataset instead of inspecting only one area.
+    indices = np.linspace(0, len(pairs) - 1, sample_count, dtype=np.int64)
+    for output_index, pair_index in enumerate(indices.tolist()):
+        image_path, mask_path = pairs[pair_index]
+        image = read_rgb(image_path)
+        mask = read_binary_mask(mask_path)
+        if image.shape[:2] != mask.shape:
+            raise RuntimeError(
+                f"Image/mask shape mismatch for {image_path.name}: "
+                f"image={image.shape[:2]}, mask={mask.shape}"
+            )
+        overlay = image.copy()
+        overlay[mask > 0] = np.asarray((255, 0, 0), dtype=np.uint8)
+        blended = np.clip(
+            0.60 * image.astype(np.float32)
+            + 0.40 * overlay.astype(np.float32),
+            0,
+            255,
+        ).astype(np.uint8)
+        output_path = output_dir / (
+            f"check_{output_index:02d}_{image_path.stem}.png"
+        )
+        Image.fromarray(blended).save(output_path)
+    print(
+        f"Saved {sample_count} alignment-check overlays to "
+        f"{output_dir.resolve()}"
+    )
+
+
 class RoadDataset(Dataset):
     def __init__(
         self,
@@ -704,11 +744,26 @@ def train_one_epoch(
     }
     updates = 0
     max_gradient = 0.0
+    road_fraction_sum = 0.0
+    road_fraction_min = 1.0
+    road_fraction_max = 0.0
     progress = tqdm(loader, desc=f"Train {epoch + 1}/{args.epochs}")
 
     for batch_index, (images, masks) in enumerate(progress):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        road_fraction = float((masks > 0).float().mean())
+        road_fraction_sum += road_fraction
+        road_fraction_min = min(road_fraction_min, road_fraction)
+        road_fraction_max = max(road_fraction_max, road_fraction)
+        if (
+            args.road_density_log_interval > 0
+            and batch_index % args.road_density_log_interval == 0
+        ):
+            progress.write(
+                f"  [road-density] epoch={epoch + 1} batch={batch_index:03d} "
+                f"road_fraction={road_fraction:.4f}"
+            )
 
         teacher_logits = None
         if teacher is not None:
@@ -824,6 +879,9 @@ def train_one_epoch(
     )
     metrics["max_gradient"] = max_gradient
     metrics["updates"] = float(updates)
+    metrics["road_fraction_mean"] = road_fraction_sum / count
+    metrics["road_fraction_min"] = road_fraction_min if len(loader) else 0.0
+    metrics["road_fraction_max"] = road_fraction_max if len(loader) else 0.0
     return metrics
 
 
@@ -903,6 +961,90 @@ def sliding_window_inference(
     return logits[:, :, :original_h, :original_w]
 
 
+def relaxed_overlap_components(
+    prediction: Tensor,
+    target: Tensor,
+    buffer_px: int,
+) -> Tuple[float, float, float, float]:
+    """Return tolerance-based matched pixels for diagnostic use only.
+
+    This is a symmetric relaxed overlap/Dice-style diagnostic, not strict
+    Jaccard IoU. A predicted road pixel is accepted when it lies within
+    ``buffer_px`` of ground truth, and vice versa.
+    """
+    prediction = prediction.bool()
+    target = target.bool()
+    if buffer_px > 0:
+        kernel = 2 * int(buffer_px) + 1
+        pred_dilated = F.max_pool2d(
+            prediction[:, None].float(), kernel, stride=1, padding=buffer_px
+        )[:, 0].bool()
+        target_dilated = F.max_pool2d(
+            target[:, None].float(), kernel, stride=1, padding=buffer_px
+        )[:, 0].bool()
+    else:
+        pred_dilated, target_dilated = prediction, target
+    prediction_hits = float((prediction & target_dilated).sum())
+    target_hits = float((target & pred_dilated).sum())
+    prediction_count = float(prediction.sum())
+    target_count = float(target.sum())
+    return prediction_hits, target_hits, prediction_count, target_count
+
+
+@torch.no_grad()
+def quick_train_iou(
+    model: Segmentor,
+    train_pairs: Sequence[Tuple[Path, Path]],
+    device: torch.device,
+    args: argparse.Namespace,
+) -> float:
+    """Measure strict full-image train IoU on a deterministic unaugmented subset."""
+    sample_count = min(int(args.train_iou_samples), len(train_pairs))
+    if sample_count <= 0:
+        return float("nan")
+    generator = np.random.default_rng(args.seed)
+    indices = np.sort(
+        generator.choice(len(train_pairs), size=sample_count, replace=False)
+    )
+    subset = [train_pairs[int(index)] for index in indices]
+    dataset = RoadDataset(
+        subset,
+        crop_size=args.crop_size,
+        training=False,
+        full_image=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=min(2, args.num_workers),
+        pin_memory=True,
+    )
+    was_training = model.training
+    model.eval()
+    intersection_sum = 0.0
+    union_sum = 0.0
+    progress = tqdm(loader, desc=f"Quick train IoU ({sample_count} full images)")
+    for images, masks in progress:
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        logits = sliding_window_inference(
+            model,
+            images,
+            args.crop_size,
+            args.val_overlap,
+            args.val_tile_batch_size,
+            device,
+            args.use_amp,
+        )
+        prediction = torch.sigmoid(road_logit(logits))[:, 0] >= 0.5
+        target = masks > 0
+        intersection_sum += float((prediction & target).sum())
+        union_sum += float((prediction | target).sum())
+    model.train(was_training)
+    return intersection_sum / max(union_sum, 1.0)
+
+
 class ProbabilityHistogram:
     """Threshold metrics without storing all 1500x1500 probability maps."""
 
@@ -969,8 +1111,14 @@ def evaluate(
     histogram = ProbabilityHistogram(args.threshold_bins)
     total_loss = 0.0
     samples = 0
+    per_image: List[Dict[str, float | str]] = []
+    relaxed_prediction_hits = 0.0
+    relaxed_target_hits = 0.0
+    relaxed_prediction_count = 0.0
+    relaxed_target_count = 0.0
+    dataset_pairs = getattr(loader.dataset, "pairs", [])
     progress = tqdm(loader, desc="Full-image sliding validation")
-    for images, masks in progress:
+    for batch_index, (images, masks) in enumerate(progress):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         logits = sliding_window_inference(
@@ -984,10 +1132,59 @@ def evaluate(
         )
         losses = criterion(logits, masks, epoch)
         probability = torch.sigmoid(road_logit(logits))[:, 0]
+        prediction = probability >= 0.5
+        target = masks > 0
+        intersection = float((prediction & target).sum())
+        union = float((prediction | target).sum())
+        image_iou = intersection / max(union, 1.0)
+        image_name = (
+            dataset_pairs[batch_index][0].name
+            if batch_index < len(dataset_pairs)
+            else f"image_{batch_index:03d}"
+        )
+        per_image.append(
+            {
+                "name": image_name,
+                "iou": image_iou,
+                "gt_fraction": float(target.float().mean()),
+                "pred_fraction": float(prediction.float().mean()),
+            }
+        )
+        relaxed = relaxed_overlap_components(
+            prediction,
+            target,
+            args.relaxed_buffer_px,
+        )
+        relaxed_prediction_hits += relaxed[0]
+        relaxed_target_hits += relaxed[1]
+        relaxed_prediction_count += relaxed[2]
+        relaxed_target_count += relaxed[3]
         histogram.update(probability, masks)
         total_loss += float(losses["total"])
         samples += 1
         progress.set_postfix(loss=f"{float(losses['total']):.4f}")
+
+    diagnostic_epoch = (
+        args.per_image_iou_interval > 0
+        and (
+            (epoch + 1) % args.per_image_iou_interval == 0
+            or epoch + 1 == args.epochs
+        )
+    )
+    if diagnostic_epoch and per_image:
+        values = np.asarray([float(item["iou"]) for item in per_image])
+        print("Per-image val IoU@0.50 (lowest first):")
+        for item in sorted(per_image, key=lambda value: float(value["iou"])):
+            print(
+                f"  {str(item['name']):28s} IoU={float(item['iou']):.4f} "
+                f"GT={100.0 * float(item['gt_fraction']):5.2f}% "
+                f"Pred={100.0 * float(item['pred_fraction']):5.2f}%"
+            )
+        print(
+            f"  distribution: min={values.min():.4f} "
+            f"median={np.median(values):.4f} max={values.max():.4f} "
+            f"std={values.std():.4f}"
+        )
 
     fixed = histogram.at_threshold(0.5 if forced_threshold is None else forced_threshold)
     if forced_threshold is None:
@@ -1000,8 +1197,28 @@ def evaluate(
         selected = max(candidates, key=lambda item: item["road_iou_micro"])
     else:
         selected = fixed
+    relaxed_precision = relaxed_prediction_hits / max(
+        relaxed_prediction_count, 1.0
+    )
+    relaxed_recall = relaxed_target_hits / max(relaxed_target_count, 1.0)
+    relaxed_f1 = (
+        2.0 * relaxed_precision * relaxed_recall
+        / max(relaxed_precision + relaxed_recall, 1e-12)
+    )
     result = {
         "loss": total_loss / max(samples, 1),
+        "relaxed_precision": relaxed_precision,
+        "relaxed_recall": relaxed_recall,
+        "relaxed_f1": relaxed_f1,
+        "per_image_iou_min": min(
+            (float(item["iou"]) for item in per_image), default=0.0
+        ),
+        "per_image_iou_max": max(
+            (float(item["iou"]) for item in per_image), default=0.0
+        ),
+        "per_image_iou_std": float(
+            np.std([float(item["iou"]) for item in per_image])
+        ) if per_image else 0.0,
         **{f"fixed_{key}": value for key, value in fixed.items()},
         **{f"selected_{key}": value for key, value in selected.items()},
     }
@@ -1140,6 +1357,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold_step", type=float, default=0.02)
     parser.add_argument("--threshold_bins", type=int, default=1001)
     parser.add_argument("--evaluate_test", action="store_true")
+    parser.add_argument(
+        "--alignment_samples", type=int, default=6,
+        help="Number of one-time train image/mask overlays; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--per_image_iou_interval", type=int, default=5,
+        help="Print named per-image val IoU every N epochs; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--train_iou_interval", type=int, default=10,
+        help="Run full-image train-subset IoU every N epochs; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--train_iou_samples", type=int, default=64,
+        help="Deterministic unaugmented train images used by quick train IoU.",
+    )
+    parser.add_argument(
+        "--relaxed_buffer_px", type=int, default=3,
+        help="Pixel tolerance for diagnostic relaxed precision/recall/F1.",
+    )
+    parser.add_argument(
+        "--road_density_log_interval", type=int, default=20,
+        help="Print road-pixel fraction every N training batches; use 0 to disable.",
+    )
 
     parser.add_argument("--pretrained_weights", default=None)
     parser.add_argument("--resume", default=None)
@@ -1188,6 +1429,11 @@ def main() -> None:
     args.use_amp = bool(args.use_amp and device.type == "cuda")
 
     train_loader, val_loader, train_pairs = make_loaders(args)
+    dump_alignment_check(
+        train_pairs,
+        Path(args.save_dir) / "sanity_check",
+        args.alignment_samples,
+    )
     if args.pos_weight is not None:
         pos_weight = args.pos_weight
         print(f"Using explicit pos_weight={pos_weight:.4f}")
@@ -1263,9 +1509,29 @@ def main() -> None:
             f"centerlineDice={train_metrics['centerline_dice']:.4f}, "
             f"max_grad={train_metrics['max_gradient']:.2f}"
         )
+        print(
+            "  Train crop road fraction: "
+            f"mean={train_metrics['road_fraction_mean']:.4f}, "
+            f"min={train_metrics['road_fraction_min']:.4f}, "
+            f"max={train_metrics['road_fraction_max']:.4f}"
+        )
 
         should_validate = (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs
         if should_validate:
+            train_iou = None
+            if (
+                args.train_iou_interval > 0
+                and (
+                    (epoch + 1) % args.train_iou_interval == 0
+                    or epoch + 1 == args.epochs
+                )
+            ):
+                train_iou = quick_train_iou(
+                    model,
+                    train_pairs,
+                    device,
+                    args,
+                )
             validation = evaluate(model, val_loader, criterion, device, args, epoch)
             # Select checkpoints with the fixed operating point. Threshold
             # search remains a reporting/calibration metric only.
@@ -1278,6 +1544,19 @@ def main() -> None:
                 f"selected@{selected_threshold:.2f} road IoU micro={selected_iou:.4f}, "
                 f"macro={validation['selected_road_iou_macro']:.4f}"
             )
+            print(
+                f"  Relaxed overlap ±{args.relaxed_buffer_px}px: "
+                f"P={validation['relaxed_precision']:.4f}, "
+                f"R={validation['relaxed_recall']:.4f}, "
+                f"F1={validation['relaxed_f1']:.4f} "
+                "(diagnostic; not strict IoU)"
+            )
+            if train_iou is not None:
+                print(
+                    f"  Generalization check: train IoU@0.50={train_iou:.4f} "
+                    f"vs val IoU@0.50={checkpoint_iou:.4f}, "
+                    f"gap={train_iou - checkpoint_iou:+.4f}"
+                )
             if checkpoint_iou > best_road_iou:
                 best_road_iou, best_threshold = checkpoint_iou, 0.5
                 torch.save(
