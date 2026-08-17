@@ -371,6 +371,7 @@ class CoMingNet(nn.Module):
     """Balanced two-stream backbone.
 
     Feature contract returned to the decoder:
+        s2:  shallow edge/detail feature, 1/2 resolution, C channels
         s4:  local geometry, 1/4 resolution, 4C channels
         s8:  mid-level context, 1/8 resolution, 4C channels
         s16: pyramid context, 1/16 resolution, 4C channels
@@ -523,7 +524,8 @@ class CoMingNet(nn.Module):
         )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        shared = self.stem_quarter(self.stem_half(x))
+        stem_half = self.stem_half(x)
+        shared = self.stem_quarter(stem_half)
 
         local1_old = self.local_stage1(shared)
         global1_old = self.global_stage1(shared)
@@ -544,7 +546,12 @@ class CoMingNet(nn.Module):
 
         local3 = self.local_stage3(self.local_transition(local2))
         context = self.context(global2)
-        return {"s4": local3, "s8": global1, "s16": context}
+        return {
+            "s2": stem_half,
+            "s4": local3,
+            "s8": global1,
+            "s16": context,
+        }
 
     def switch_to_deploy(self) -> "CoMingNet":
         for module in list(self.modules()):
