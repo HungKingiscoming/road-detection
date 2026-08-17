@@ -160,6 +160,10 @@ class RoadDataset(Dataset):
         full_image: bool = False,
         road_crop_probability: float = 0.5,
         road_oversample_tries: int = 4,
+        use_multiscale: bool = False,
+        multiscale_min: float = 0.75,
+        multiscale_max: float = 1.50,
+        multiscale_probability: float = 1.0,
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = crop_size
@@ -167,6 +171,10 @@ class RoadDataset(Dataset):
         self.full_image = full_image
         self.road_crop_probability = road_crop_probability
         self.road_oversample_tries = max(1, road_oversample_tries)
+        self.use_multiscale = use_multiscale
+        self.multiscale_min = multiscale_min
+        self.multiscale_max = multiscale_max
+        self.multiscale_probability = multiscale_probability
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -181,9 +189,21 @@ class RoadDataset(Dataset):
         return image, mask
 
     def _crop(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        image, mask = self._pad(image, mask, self.crop_size)
+        # Crop a variable-size source window, then resize only that window back
+        # to crop_size. This is equivalent to resize-then-crop augmentation but
+        # avoids resizing the complete 1500x1500 Massachusetts image.
+        scale = 1.0
+        if (
+            self.training
+            and self.use_multiscale
+            and random.random() < self.multiscale_probability
+        ):
+            scale = random.uniform(self.multiscale_min, self.multiscale_max)
+        source_size = max(32, int(round(self.crop_size / scale)))
+
+        image, mask = self._pad(image, mask, source_size)
         height, width = mask.shape
-        max_y, max_x = height - self.crop_size, width - self.crop_size
+        max_y, max_x = height - source_size, width - source_size
 
         def uniform_position() -> Tuple[int, int]:
             return random.randint(0, max_y), random.randint(0, max_x)
@@ -196,30 +216,40 @@ class RoadDataset(Dataset):
             candidates: List[Tuple[int, int]] = []
             for _ in range(self.road_oversample_tries):
                 index = random.randrange(len(road_y))
-                jitter = self.crop_size // 4
+                jitter = source_size // 4
                 center_y = int(road_y[index]) + random.randint(-jitter, jitter)
                 center_x = int(road_x[index]) + random.randint(-jitter, jitter)
-                top = min(max(center_y - self.crop_size // 2, 0), max_y)
-                left = min(max(center_x - self.crop_size // 2, 0), max_x)
+                top = min(max(center_y - source_size // 2, 0), max_y)
+                left = min(max(center_x - source_size // 2, 0), max_x)
                 candidates.append((top, left))
             top, left = max(
                 candidates,
                 key=lambda position: int(
                     mask[
-                        position[0] : position[0] + self.crop_size,
-                        position[1] : position[1] + self.crop_size,
+                        position[0] : position[0] + source_size,
+                        position[1] : position[1] + source_size,
                     ].sum()
                 ),
             )
 
-        return (
-            image[top : top + self.crop_size, left : left + self.crop_size],
-            mask[top : top + self.crop_size, left : left + self.crop_size],
-        )
+        image_crop = image[top : top + source_size, left : left + source_size]
+        mask_crop = mask[top : top + source_size, left : left + source_size]
+        if source_size != self.crop_size:
+            image_crop = np.asarray(
+                Image.fromarray(image_crop).resize(
+                    (self.crop_size, self.crop_size), Image.Resampling.BILINEAR
+                )
+            )
+            mask_crop = np.asarray(
+                Image.fromarray(mask_crop.astype(np.uint8)).resize(
+                    (self.crop_size, self.crop_size), Image.Resampling.NEAREST
+                )
+            )
+            mask_crop = (mask_crop > 0).astype(np.uint8)
+        return image_crop, mask_crop
 
     @staticmethod
     def _augment(image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        # Spatial scale never changes: item 12 (multi-scale augmentation) is omitted.
         if random.random() < 0.5:
             image, mask = image[:, ::-1], mask[:, ::-1]
         if random.random() < 0.5:
@@ -309,6 +339,10 @@ def make_loaders(args: argparse.Namespace):
         training=True,
         road_crop_probability=args.road_crop_probability,
         road_oversample_tries=args.road_oversample_tries,
+        use_multiscale=args.use_multiscale,
+        multiscale_min=args.multiscale_min,
+        multiscale_max=args.multiscale_max,
+        multiscale_probability=args.multiscale_probability,
     )
     val_dataset = RoadDataset(
         val_pairs, crop_size=args.crop_size, training=False, full_image=True
@@ -1314,6 +1348,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop_size", type=int, default=512)
     parser.add_argument("--road_crop_probability", type=float, default=0.5)
     parser.add_argument("--road_oversample_tries", type=int, default=4)
+    parser.add_argument("--use_multiscale", action="store_true")
+    parser.add_argument("--multiscale_min", type=float, default=0.75)
+    parser.add_argument("--multiscale_max", type=float, default=1.50)
+    parser.add_argument("--multiscale_probability", type=float, default=1.0)
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -1406,6 +1444,12 @@ def main() -> None:
         raise ValueError("Use only one of --pretrained_weights and --resume")
     if not 0.0 <= args.road_crop_probability <= 1.0:
         raise ValueError("road_crop_probability must be in [0, 1]")
+    if args.multiscale_min <= 0 or args.multiscale_max <= 0:
+        raise ValueError("multiscale_min and multiscale_max must be positive")
+    if args.multiscale_min > args.multiscale_max:
+        raise ValueError("multiscale_min must be <= multiscale_max")
+    if not 0.0 <= args.multiscale_probability <= 1.0:
+        raise ValueError("multiscale_probability must be in [0, 1]")
     if args.centerline_weight < 0:
         raise ValueError("centerline_weight must be non-negative")
     if not 0.0 < args.local_spatial_ratio <= 1.0:
@@ -1429,6 +1473,14 @@ def main() -> None:
     args.use_amp = bool(args.use_amp and device.type == "cuda")
 
     train_loader, val_loader, train_pairs = make_loaders(args)
+    if args.use_multiscale:
+        print(
+            "Multi-scale crop: enabled "
+            f"scale=[{args.multiscale_min:.2f}, {args.multiscale_max:.2f}], "
+            f"probability={args.multiscale_probability:.2f}"
+        )
+    else:
+        print("Multi-scale crop: disabled")
     dump_alignment_check(
         train_pairs,
         Path(args.save_dir) / "sanity_check",
