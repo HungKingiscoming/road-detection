@@ -1,17 +1,3 @@
-"""Semantic-controlled additive decoder for CoMingNet.
-
-This version keeps the lightweight additive FPN path at s16 -> s8 -> s4,
-then performs a learned refinement at output stride 2.  The s4 semantic
-feature remains the main signal; the shallow s2 detail feature is introduced
-through a small learnable per-channel scale initialized to 0.1.
-
-Training output:
-    (aux_logits_s8 | None, centerline_logits_s4 | None, main_logits_s2)
-
-Evaluation output:
-    main_logits_s2
-"""
-
 from __future__ import annotations
 
 from typing import Dict, Optional, Sequence, Tuple, Union
@@ -88,6 +74,81 @@ class HalfResolutionRefine(nn.Module):
         return self.refine(fused)
 
 
+class FullResolutionResidualHead(nn.Module):
+    """Learn a cheap full-resolution correction to coarse H/2 logits."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        num_classes: int,
+    ) -> None:
+        super().__init__()
+        if hidden_channels < 8:
+            raise ValueError("fullres_channels must be >= 8")
+
+        # Produce four sub-pixel groups at H/2 and rearrange them to H.
+        self.subpixel_projection = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                hidden_channels * 4,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(hidden_channels * 4),
+            nn.ReLU(inplace=True),
+            nn.PixelShuffle(upscale_factor=2),
+        )
+        self.refine = nn.Sequential(
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                groups=hidden_channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.correction = nn.Conv2d(hidden_channels, num_classes, 1)
+
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        # Exact function-preserving start: initially output only the resized
+        # old classifier logits. Gradients first train this final layer, then
+        # flow into the preceding full-resolution refinement layers.
+        nn.init.zeros_(self.correction.weight)
+        nn.init.zeros_(self.correction.bias)
+
+    def forward(self, d2: Tensor, coarse_logits: Tensor) -> Tensor:
+        detail = self.refine(self.subpixel_projection(d2))
+        coarse_full = F.interpolate(
+            coarse_logits,
+            size=detail.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return coarse_full + self.correction(detail)
+
+
 class GCNetHead(nn.Module):
     """Additive CoMingNet decoder with optional semantic-controlled H/2 head."""
 
@@ -109,6 +170,8 @@ class GCNetHead(nn.Module):
         enable_centerline_aux: bool = False,
         enable_half_refine: bool = False,
         half_refine_channels: int = 48,
+        enable_fullres_head: bool = False,
+        fullres_channels: int = 16,
         half_refine_kernel_size: int = 5,
         half_refine_expansion: float = 1.5,
         half_refine_spatial_ratio: float = 0.25,
@@ -129,6 +192,9 @@ class GCNetHead(nn.Module):
         self.enable_seg_aux = bool(enable_seg_aux)
         self.enable_centerline_aux = bool(enable_centerline_aux)
         self.enable_half_refine = bool(enable_half_refine)
+        self.enable_fullres_head = bool(enable_fullres_head)
+        if self.enable_fullres_head and not self.enable_half_refine:
+            raise ValueError("Full-resolution head requires H/2 refinement")
 
         self.context_proj = ConvBNAct(s16_channels, channels, 1, padding=0)
         self.context_refine = CoMingBlock(
@@ -197,6 +263,15 @@ class GCNetHead(nn.Module):
                 if dropout_ratio > 0
                 else nn.Identity(),
                 nn.Conv2d(half_refine_channels, num_classes, 1),
+            )
+            self.fullres_head = (
+                FullResolutionResidualHead(
+                    in_channels=half_refine_channels,
+                    hidden_channels=fullres_channels,
+                    num_classes=num_classes,
+                )
+                if self.enable_fullres_head
+                else None
             )
         else:
             self.main_classifier = nn.Sequential(
@@ -276,7 +351,12 @@ class GCNetHead(nn.Module):
             )
             detail = self.s2_proj(s2)
             d2 = self.half_refine(semantic, detail)
-            main_logits = self.main_classifier(d2)
+            coarse_logits = self.main_classifier(d2)
+            main_logits = (
+                self.fullres_head(d2, coarse_logits)
+                if self.fullres_head is not None
+                else coarse_logits
+            )
         else:
             main_logits = self.main_classifier(d4)
 
@@ -297,4 +377,8 @@ class GCNetHead(nn.Module):
         return self
 
 
-__all__ = ["GCNetHead", "HalfResolutionRefine"]
+__all__ = [
+    "GCNetHead",
+    "HalfResolutionRefine",
+    "FullResolutionResidualHead",
+]
