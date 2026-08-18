@@ -367,7 +367,7 @@ class CompactPyramidContext(nn.Module):
         return self.refine(self.fuse(torch.cat(features, dim=1)) + self.shortcut(x))
 
 
-class CoMingNet(nn.Module):
+class _CoMingNetBase(nn.Module):
     """Balanced two-stream backbone.
 
     Feature contract returned to the decoder:
@@ -559,6 +559,178 @@ class CoMingNet(nn.Module):
                 module.switch_to_deploy()
         self.deploy = True
         return self
+
+
+class DeepPyramidContext(nn.Module):
+    """Cascaded CNN pyramid context used on the new output-stride-32 stage."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        branch_channels: int,
+        kernel_size: int,
+        expansion: float,
+        spatial_ratio: float,
+        deploy: bool = False,
+    ) -> None:
+        super().__init__()
+        self.pool_sizes = (1, 2, 4, 8)
+        self.shortcut = ConvBNAct(
+            in_channels, out_channels, 1, padding=0, activation=False
+        )
+        self.seed = nn.Sequential(
+            nn.Conv2d(in_channels, branch_channels, 1, bias=True),
+            nn.ReLU(inplace=True),
+        )
+        self.pool_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(in_channels, branch_channels, 1, bias=True),
+                    nn.ReLU(inplace=True),
+                )
+                for _ in self.pool_sizes
+            ]
+        )
+        self.process = nn.ModuleList(
+            [ConvBNAct(branch_channels, branch_channels, 3) for _ in self.pool_sizes]
+        )
+        merged_channels = out_channels + len(self.pool_sizes) * branch_channels
+        self.fuse = ConvBNAct(merged_channels, out_channels, 1, padding=0)
+        self.refine = CoMingBlock(
+            out_channels,
+            kernel_size=kernel_size,
+            expansion=expansion,
+            spatial_ratio=spatial_ratio,
+            deploy=deploy,
+            zero_init_residual=True,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        size = x.shape[-2:]
+        previous = self.seed(x)
+        pyramid = []
+        for pool_size, projection, process in zip(
+            self.pool_sizes, self.pool_projections, self.process
+        ):
+            pooled = projection(F.adaptive_avg_pool2d(x, pool_size))
+            pooled = F.interpolate(
+                pooled, size=size, mode="bilinear", align_corners=False
+            )
+            previous = process(pooled + previous)
+            pyramid.append(previous)
+        shortcut = self.shortcut(x)
+        fused = self.fuse(torch.cat([shortcut, *pyramid], dim=1))
+        return self.refine(shortcut + fused)
+
+
+class CoMingNet(_CoMingNetBase):
+    """CNN-only CoMingNet with local OS4 and semantic OS8/16/32 streams.
+
+    Existing stage names and public class name are preserved so checkpoints
+    from the earlier OS16 model can initialize all compatible backbone layers
+    with ``--resume_mode transfer``.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        channels: int = 40,
+        local_blocks: Sequence[int] = (2, 2, 2),
+        global_blocks: Sequence[int] = (3, 4),
+        highres_kernel_size: int = 5,
+        context_kernel_size: int = 7,
+        local_expansion: float = 1.5,
+        global_expansion: float = 2.0,
+        local_spatial_ratio: float = 0.5,
+        global_spatial_ratio: float = 0.5,
+        deep_blocks: int = 2,
+        deep_spatial_ratio: float = 0.75,
+        kernel_size: int | None = None,
+        deploy: bool = False,
+        zero_init_residual: bool = True,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            channels=channels,
+            local_blocks=local_blocks,
+            global_blocks=global_blocks,
+            highres_kernel_size=highres_kernel_size,
+            context_kernel_size=context_kernel_size,
+            local_expansion=local_expansion,
+            global_expansion=global_expansion,
+            local_spatial_ratio=local_spatial_ratio,
+            global_spatial_ratio=global_spatial_ratio,
+            kernel_size=kernel_size,
+            deploy=deploy,
+            zero_init_residual=False,
+            **kwargs,
+        )
+        if deep_blocks < 1:
+            raise ValueError("deep_blocks must be >= 1")
+        if kernel_size is not None:
+            context_kernel_size = kernel_size
+
+        c4, c8 = channels * 4, channels * 8
+        # The old context module is replaced by deeper semantic processing.
+        del self.context
+        self.s16_proj = ConvBNAct(c8, c4, 1, padding=0)
+        self.deep_downsample = ConvBNAct(c8, c8, 3, stride=2)
+        self.deep_stage = self._stage(
+            c8,
+            deep_blocks,
+            context_kernel_size,
+            global_expansion,
+            deep_spatial_ratio,
+            deploy,
+        )
+        self.deep_context = DeepPyramidContext(
+            c8,
+            c4,
+            branch_channels=channels,
+            kernel_size=context_kernel_size,
+            expansion=global_expansion,
+            spatial_ratio=max(0.5, global_spatial_ratio),
+            deploy=deploy,
+        )
+        self._initialize()
+        if zero_init_residual:
+            self.zero_init_residuals()
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        stem_half = self.stem_half(x)
+        shared = self.stem_quarter(stem_half)
+
+        local1_old = self.local_stage1(shared)
+        global1_old = self.global_stage1(shared)
+        local1 = self.local_fusion1(
+            local1_old + self._resize_like(self.g2l1_proj(global1_old), local1_old)
+        )
+        global1 = self.global_fusion1(global1_old + self.l2g1_proj(local1_old))
+
+        local2_old = self.local_stage2(local1)
+        global2_old = self.global_stage2(global1)
+        local2 = self.local_fusion2(
+            local2_old + self._resize_like(self.g2l2_proj(global2_old), local2_old)
+        )
+        local_to_global2 = self.l2g2_proj(local2_old)
+        if local_to_global2.shape[-2:] != global2_old.shape[-2:]:
+            local_to_global2 = self._resize_like(local_to_global2, global2_old)
+        global2 = self.global_fusion2(global2_old + local_to_global2)
+
+        local3 = self.local_stage3(self.local_transition(local2))
+        semantic16 = self.s16_proj(global2)
+        semantic32 = self.deep_context(
+            self.deep_stage(self.deep_downsample(global2))
+        )
+        return {
+            "s2": stem_half,
+            "s4": local3,
+            "s8": global1,
+            "s16": semantic16,
+            "s32": semantic32,
+        }
 
 
 @torch.no_grad()
