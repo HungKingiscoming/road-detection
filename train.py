@@ -42,7 +42,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling import CompactRoadNet, RoadSegCenterlineLoss, build_model
+from modeling.decoder import RoadSegCenterlineLoss
+from modeling.model import CompactRoadNet, build_model
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -89,6 +90,7 @@ def is_main_process() -> bool:
 
 def rank_zero_print(*values, **kwargs) -> None:
     if is_main_process():
+        kwargs.setdefault("flush", True)
         print(*values, **kwargs)
 
 
@@ -211,6 +213,25 @@ def _first_existing_pair(
     return candidates[0]
 
 
+def _first_labeled_pair(
+    candidates: Sequence[Tuple[Path, Path]],
+) -> Optional[Tuple[Path, Path]]:
+    """Return the first directory pair that contains matched masks.
+
+    DeepGlobe mirrors commonly ship ``valid`` images without public masks.  A
+    directory existing is therefore not enough to call it a validation split.
+    """
+    for image_dir, mask_dir in candidates:
+        if not image_dir.is_dir() or not mask_dir.is_dir():
+            continue
+        try:
+            if build_pairs(image_dir, mask_dir):
+                return image_dir, mask_dir
+        except RuntimeError:
+            continue
+    return None
+
+
 def configure_dataset_paths(args: argparse.Namespace) -> None:
     """Resolve common Kaggle layouts while keeping explicit CLI paths final."""
     if args.dataset == "massachusetts":
@@ -241,14 +262,15 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
     args.train_image_dir = args.train_image_dir or str(train_images)
     args.train_mask_dir = args.train_mask_dir or str(train_masks)
     if args.val_image_dir is None and args.val_mask_dir is None:
-        val_images, val_masks = _first_existing_pair(
+        labeled_validation = _first_labeled_pair(
             (
                 (root / "valid" / "images", root / "valid" / "gt"),
                 (root / "val" / "images", root / "val" / "gt"),
                 (root / "valid", root / "valid"),
             )
         )
-        if val_images.is_dir() and val_masks.is_dir():
+        if labeled_validation is not None:
+            val_images, val_masks = labeled_validation
             args.val_image_dir = str(val_images)
             args.val_mask_dir = str(val_masks)
 
@@ -428,34 +450,71 @@ class RoadNativeValidationDataset(Dataset):
 
 def resolve_splits(
     args: argparse.Namespace,
-) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
+) -> Tuple[
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+]:
     all_pairs = build_pairs(args.train_image_dir, args.train_mask_dir)
     if args.val_image_dir and args.val_mask_dir:
         val_images, val_masks = Path(args.val_image_dir), Path(args.val_mask_dir)
         if val_images.is_dir() and val_masks.is_dir():
-            val_pairs = build_pairs(val_images, val_masks)
-            rank_zero_print(
-                f"Official/provided split: train={len(all_pairs)}, val={len(val_pairs)}"
-            )
-            return all_pairs, val_pairs
+            try:
+                val_pairs = build_pairs(val_images, val_masks)
+            except RuntimeError:
+                if args.dataset != "deepglobe":
+                    raise
+                rank_zero_print(
+                    "DeepGlobe validation directory has no matched masks; "
+                    "using a labeled deterministic holdout from train instead."
+                )
+            else:
+                rank_zero_print(
+                    f"Official/provided split: train={len(all_pairs)}, "
+                    f"val={len(val_pairs)}"
+                )
+                return all_pairs, val_pairs, []
 
     generator = np.random.default_rng(args.split_seed)
     indices = generator.permutation(len(all_pairs))
     val_count = max(1, round(len(all_pairs) * args.val_ratio))
-    val_indices = set(indices[:val_count].tolist())
-    train_pairs = [p for i, p in enumerate(all_pairs) if i not in val_indices]
-    val_pairs = [p for i, p in enumerate(all_pairs) if i in val_indices]
-    rank_zero_print(
-        "Deterministic holdout: "
-        f"train={len(train_pairs)}, val={len(val_pairs)}, seed={args.split_seed}"
+    test_count = (
+        max(1, round(len(all_pairs) * args.test_ratio))
+        if args.test_ratio > 0.0
+        else 0
     )
-    return train_pairs, val_pairs
+    test_indices = set(indices[:test_count].tolist())
+    val_indices = set(indices[test_count : test_count + val_count].tolist())
+    train_pairs = [
+        pair
+        for index, pair in enumerate(all_pairs)
+        if index not in val_indices and index not in test_indices
+    ]
+    val_pairs = [
+        pair for index, pair in enumerate(all_pairs) if index in val_indices
+    ]
+    test_pairs = [
+        pair for index, pair in enumerate(all_pairs) if index in test_indices
+    ]
+    rank_zero_print(
+        "Deterministic labeled split: "
+        f"train={len(train_pairs)}, val={len(val_pairs)}, "
+        f"test={len(test_pairs)}, seed={args.split_seed}"
+    )
+    return train_pairs, val_pairs, test_pairs
 
 
 def make_loaders(
     args: argparse.Namespace,
-) -> Tuple[DataLoader, DataLoader, List[Tuple[Path, Path]], Optional[DistributedSampler]]:
-    train_pairs, val_pairs = resolve_splits(args)
+) -> Tuple[
+    DataLoader,
+    DataLoader,
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+    List[Tuple[Path, Path]],
+    Optional[DistributedSampler],
+]:
+    train_pairs, val_pairs, test_pairs = resolve_splits(args)
     train_dataset = RoadCropDataset(
         train_pairs,
         crop_size=args.crop_size,
@@ -505,19 +564,32 @@ def make_loaders(
         drop_last=False,
         **common,
     )
-    return train_loader, val_loader, train_pairs, train_sampler
+    return (
+        train_loader,
+        val_loader,
+        train_pairs,
+        val_pairs,
+        test_pairs,
+        train_sampler,
+    )
 
 
 def compute_road_weight(
     pairs: Sequence[Tuple[Path, Path]], cap: float
 ) -> Tuple[float, float]:
     positive, total = 0, 0
-    for _, mask_path in tqdm(
-        pairs, desc="Computing road imbalance", disable=not is_main_process()
-    ):
+    report_every = max(1, len(pairs) // 10)
+    for index, (_, mask_path) in enumerate(pairs, start=1):
         mask = read_binary_mask(mask_path)
         positive += int(mask.sum())
         total += int(mask.size)
+        if is_main_process() and (
+            index == 1 or index % report_every == 0 or index == len(pairs)
+        ):
+            print(
+                f"[startup] class-weight scan {index}/{len(pairs)} masks",
+                flush=True,
+            )
     imbalance = (total - positive) / max(positive, 1)
     return imbalance, min(math.sqrt(imbalance), cap)
 
@@ -1124,7 +1196,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_mask_dir", default=None)
     parser.add_argument("--val_image_dir", default=None)
     parser.add_argument("--val_mask_dir", default=None)
-    parser.add_argument("--val_ratio", type=float, default=0.05)
+    parser.add_argument("--val_ratio", type=float, default=0.10)
+    parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.10,
+        help="Held out and never evaluated during training when no labeled val exists",
+    )
     parser.add_argument("--split_seed", type=int, default=3407)
 
     parser.add_argument("--crop_size", type=int, default=1024)
@@ -1164,6 +1242,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ema_decay", type=float, default=0.999)
 
     parser.add_argument("--road_weight_cap", type=float, default=2.0)
+    parser.add_argument(
+        "--fixed_road_weight",
+        type=float,
+        default=None,
+        help="Positive value skips the startup mask scan and uses this CE weight",
+    )
     parser.add_argument("--main_dice_weight", type=float, default=1.0)
     parser.add_argument("--aux_weight", type=float, default=0.20)
     parser.add_argument("--aux_warmup_epochs", type=int, default=5)
@@ -1223,8 +1307,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
+    if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
+        raise ValueError("fixed_road_weight must be positive")
     if not 0.0 < args.val_ratio < 1.0:
         raise ValueError("val_ratio must be in (0, 1)")
+    if not 0.0 <= args.test_ratio < 1.0:
+        raise ValueError("test_ratio must be in [0, 1)")
+    if args.val_ratio + args.test_ratio >= 1.0:
+        raise ValueError("val_ratio + test_ratio must be smaller than 1")
     if args.resume and args.pretrained_checkpoint:
         raise ValueError("Use either --resume or --pretrained_checkpoint, not both")
     if not args.global_pool_sizes or min(args.global_pool_sizes) < 1:
@@ -1245,10 +1335,19 @@ def save_split_manifest(
     save_dir: Path,
     train_pairs: Sequence[Tuple[Path, Path]],
     val_pairs: Sequence[Tuple[Path, Path]],
+    test_pairs: Sequence[Tuple[Path, Path]],
+    split_seed: int,
 ) -> None:
     manifest = {
+        "split_seed": int(split_seed),
+        "counts": {
+            "train": len(train_pairs),
+            "val": len(val_pairs),
+            "test": len(test_pairs),
+        },
         "train": [[str(image), str(mask)] for image, mask in train_pairs],
         "val": [[str(image), str(mask)] for image, mask in val_pairs],
+        "test": [[str(image), str(mask)] for image, mask in test_pairs],
     }
     with (save_dir / "split_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -1276,6 +1375,9 @@ def main() -> None:
             args.progressive_unfreeze = args.pretrained_checkpoint is not None
     configure_dataset_paths(args)
     validate_args(args)
+    rank_zero_print(
+        f"[startup 1/5] DDP initialized: world_size={world_size}, device={device}"
+    )
     seed_everything(args.seed + rank)
     args.use_amp = bool(args.use_amp and device.type == "cuda")
     if device.type == "cuda":
@@ -1289,13 +1391,38 @@ def main() -> None:
     save_dir = Path(args.save_dir)
     if is_main_process():
         save_dir.mkdir(parents=True, exist_ok=True)
-    train_loader, val_loader, train_pairs, train_sampler = make_loaders(args)
-    val_pairs = val_loader.dataset.pairs  # type: ignore[attr-defined]
+    rank_zero_print("[startup 2/5] Resolving image/mask pairs and DataLoaders...")
+    (
+        train_loader,
+        val_loader,
+        train_pairs,
+        val_pairs,
+        test_pairs,
+        train_sampler,
+    ) = make_loaders(args)
     if is_main_process():
-        save_split_manifest(save_dir, train_pairs, val_pairs)
-    imbalance, road_weight = distributed_road_weight(
-        train_pairs, args.road_weight_cap, device
-    )
+        save_split_manifest(
+            save_dir,
+            train_pairs,
+            val_pairs,
+            test_pairs,
+            args.split_seed,
+        )
+    if args.fixed_road_weight is None:
+        rank_zero_print(
+            f"[startup 3/5] Scanning {len(train_pairs)} training masks "
+            "to estimate the road class weight..."
+        )
+        imbalance, road_weight = distributed_road_weight(
+            train_pairs, args.road_weight_cap, device
+        )
+    else:
+        imbalance = float("nan")
+        road_weight = float(args.fixed_road_weight)
+        rank_zero_print(
+            f"[startup 3/5] Skipping mask scan; fixed road CE weight="
+            f"{road_weight:.3f}"
+        )
 
     # A full road checkpoint replaces every weight, so do not require an
     # unnecessary ImageNet download for transfer/resume runs.
@@ -1307,6 +1434,14 @@ def main() -> None:
     # from racing while downloading ImageNet weights on a fresh Kaggle session.
     needs_imagenet_cache = bool(
         build_args.imagenet_pretrained and not build_args.encoder_weights_path
+    )
+    rank_zero_print(
+        "[startup 4/5] Building CompactRoadNet"
+        + (
+            " and loading/downloading ImageNet ResNet-34 weights..."
+            if needs_imagenet_cache
+            else "..."
+        )
     )
     if distributed and rank != 0 and needs_imagenet_cache:
         dist.barrier()
@@ -1320,6 +1455,7 @@ def main() -> None:
             model, args.pretrained_checkpoint, args.transfer_weights, device
         )
         rank_zero_print(f"Transferred {args.transfer_weights} weights from {loaded}")
+    rank_zero_print("[startup 5/5] Building optimizer, EMA, loss, and DDP reducer...")
 
     # Build the optimizer and DDP reducer while every parameter is trainable.
     # Later phase changes therefore retain optimizer groups and DDP hooks.
@@ -1476,4 +1612,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed()
