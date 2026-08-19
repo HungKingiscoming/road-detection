@@ -67,12 +67,19 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x: Tensor) -> Tensor:
-        normalized = self.norm1(x)
-        attention, _ = self.attention(
-            normalized, normalized, normalized, need_weights=False
-        )
-        x = x + self.dropout(attention)
-        return x + self.dropout(self.feed_forward(self.norm2(x)))
+        # P100 FP16 attention can overflow for a few high-contrast aerial
+        # tiles. Keep this small stride-32 operation in FP32; the convolutional
+        # encoder/decoder still runs under AMP.
+        output_dtype = x.dtype
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            normalized = self.norm1(x)
+            attention, _ = self.attention(
+                normalized, normalized, normalized, need_weights=False
+            )
+            x = x + self.dropout(attention)
+            x = x + self.dropout(self.feed_forward(self.norm2(x)))
+        return x.to(output_dtype)
 
 
 class AxialTransformer(nn.Module):
@@ -143,10 +150,21 @@ class SpatialRelation(nn.Module):
 
     def forward(self, source: Tensor, target: Tensor) -> Tensor:
         # source/target: [B*patches, 1, elements]
-        source = self.projection(source)
-        attention = torch.bmm(target.transpose(1, 2), source)
-        attention = F.softmax(attention, dim=-1)
-        return torch.bmm(target, attention)
+        output_dtype = target.dtype
+        with torch.autocast(device_type=source.device.type, enabled=False):
+            source = self.projection(source.float())
+            target = target.float()
+            # The supplied implementation used an unbounded outer product in
+            # FP16. L2-normalized scores preserve directional relation while
+            # preventing inf -> NaN inside softmax.
+            source_normalized = F.normalize(source, p=2, dim=-1, eps=1e-6)
+            target_normalized = F.normalize(target, p=2, dim=-1, eps=1e-6)
+            attention = torch.bmm(
+                target_normalized.transpose(1, 2), source_normalized
+            )
+            attention = F.softmax(attention, dim=-1)
+            output = torch.bmm(target, attention)
+        return output.to(output_dtype)
 
 
 def _grid_to_batch(feature: Tensor, groups: int) -> Tuple[Tensor, Tuple[int, ...]]:
@@ -211,33 +229,43 @@ class RelationRefine(nn.Module):
         deep_group = deep_channels // groups
         skip_group = skip_channels // groups
 
-        deep_descriptor = F.adaptive_avg_pool2d(deep, 1).reshape(
-            batch * groups, deep_group, 1
-        )
-        skip_descriptor = F.adaptive_avg_pool2d(skip, 1).reshape(
-            batch * groups, skip_group, 1
-        )
-        deep_descriptor = self.deep_mlp(deep_descriptor)
-        skip_descriptor = self.skip_mlp(skip_descriptor)
-        relation = torch.bmm(deep_descriptor, skip_descriptor.transpose(1, 2))
-        channel_weight = F.softmax(
-            torch.bmm(relation, skip_descriptor), dim=1
-        ).reshape(batch, skip_channels, 1, 1)
-        return skip * channel_weight
+        with torch.autocast(device_type=deep.device.type, enabled=False):
+            deep_descriptor = F.adaptive_avg_pool2d(deep.float(), 1).reshape(
+                batch * groups, deep_group, 1
+            )
+            skip_descriptor = F.adaptive_avg_pool2d(skip.float(), 1).reshape(
+                batch * groups, skip_group, 1
+            )
+            deep_descriptor = self.deep_mlp(deep_descriptor)
+            skip_descriptor = self.skip_mlp(skip_descriptor)
+            deep_descriptor = F.normalize(
+                deep_descriptor, p=2, dim=1, eps=1e-6
+            )
+            skip_descriptor = F.normalize(
+                skip_descriptor, p=2, dim=1, eps=1e-6
+            )
+            relation = torch.bmm(
+                deep_descriptor, skip_descriptor.transpose(1, 2)
+            )
+            channel_weight = F.softmax(
+                torch.bmm(relation, skip_descriptor), dim=1
+            ).reshape(batch, skip_channels, 1, 1)
+        return skip * channel_weight.to(skip.dtype)
 
     def _spatial_refine(self, deep: Tensor, skip: Tensor, grid: int) -> Tensor:
         deep_patches, deep_meta = _grid_to_batch(deep, grid)
         skip_patches, skip_meta = _grid_to_batch(skip, grid)
-        deep_position = self.deep_position(deep_patches).flatten(2)
-        skip_position = self.skip_position(skip_patches).flatten(2)
-        spatial = self.spatial_relation(deep_position, skip_position)
+        with torch.autocast(device_type=deep.device.type, enabled=False):
+            deep_position = self.deep_position(deep_patches.float()).flatten(2)
+            skip_position = self.skip_position(skip_patches.float()).flatten(2)
+            spatial = self.spatial_relation(deep_position, skip_position)
         spatial = spatial.reshape(
             skip_patches.shape[0], 1, skip_patches.shape[2], skip_patches.shape[3]
         )
         spatial_meta = (
             skip_meta[0], skip_meta[1], 1, skip_meta[3], skip_meta[4]
         )
-        return _batch_to_grid(spatial, spatial_meta)
+        return _batch_to_grid(spatial, spatial_meta).to(skip.dtype)
 
     def forward(self, deep: Tensor, skip: Tensor, grid: int) -> Tensor:
         semantic = self._semantic_refine(deep, skip)
