@@ -24,6 +24,7 @@ import os
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -67,12 +68,22 @@ def init_distributed() -> Tuple[bool, int, int, int, torch.device]:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
-        try:
-            dist.init_process_group(
-                backend="nccl", init_method="env://", device_id=device
-            )
-        except TypeError:
-            dist.init_process_group(backend="nccl", init_method="env://")
+        # Print before process-group creation so a NCCL rendezvous problem is
+        # visible immediately in notebook environments.  Passing device_id
+        # eagerly creates the NCCL communicator on recent PyTorch releases and
+        # has been observed to stall on Kaggle T4x2; the classic call is more
+        # portable and torch.cuda.set_device above already pins each rank.
+        print(
+            f"[rank {rank}] Initializing NCCL on cuda:{local_rank} "
+            f"(world_size={world_size})...",
+            flush=True,
+        )
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=timedelta(minutes=3),
+        )
+        print(f"[rank {rank}] NCCL process group ready", flush=True)
     else:
         rank = 0
         local_rank = 0
