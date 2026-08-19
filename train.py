@@ -13,9 +13,10 @@ root.
 
 Design goals
 ------------
-* Train the complete Massachusetts image after resizing it to 1024x1024.
+* Train native-resolution 1024x1024 crops without shrinking thin roads.
+* Prefer road-containing crops while retaining some random background crops.
 * Keep exactly one road-specific auxiliary: OS4 centerline prediction.
-* Validate against the original-resolution mask, not the resized mask.
+* Validate the native image with overlap-tiled inference and weighted blending.
 * AMP, channels-last, gradient accumulation, gradient clipping, model EMA.
 * AdamW with no weight decay on normalization and bias parameters.
 * Per-update linear warmup followed by cosine decay.
@@ -26,7 +27,10 @@ Recommended Kaggle P100 command
 -------------------------------
 python train_repvgg_roadaux.py \
     --dataset massachusetts \
-    --image_size 1024 \
+    --crop_size 1024 \
+    --road_crop_probability 0.70 \
+    --val_tile_size 1024 \
+    --val_overlap 256 \
     --batch_size 2 \
     --accumulation_steps 4 \
     --epochs 120 \
@@ -162,18 +166,113 @@ def read_binary_mask(path: Path) -> np.ndarray:
     return (mask > 0).astype(np.uint8)
 
 
-def resize_pair(
+def pad_pair_to_size(
     image: np.ndarray,
     mask: np.ndarray,
     size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    image = np.asarray(
-        Image.fromarray(image).resize((size, size), Image.Resampling.BILINEAR)
+    """Pad only when an image side is smaller than the requested crop."""
+    height, width = mask.shape
+    pad_height = max(0, size - height)
+    pad_width = max(0, size - width)
+    if pad_height == 0 and pad_width == 0:
+        return image, mask
+
+    top = pad_height // 2
+    bottom = pad_height - top
+    left = pad_width // 2
+    right = pad_width - left
+    image_mode = "reflect" if height > 1 and width > 1 else "edge"
+    image = np.pad(
+        image,
+        ((top, bottom), (left, right), (0, 0)),
+        mode=image_mode,
     )
-    mask = np.asarray(
-        Image.fromarray(mask).resize((size, size), Image.Resampling.NEAREST)
+    mask = np.pad(
+        mask,
+        ((top, bottom), (left, right)),
+        mode="constant",
+        constant_values=0,
     )
-    return image, (mask > 0).astype(np.uint8)
+    return image, mask
+
+
+def coarse_max_mask(mask: np.ndarray, factor: int = 8) -> np.ndarray:
+    """Cheap max-pooled mask used only to choose road-aware crop locations."""
+    height, width = mask.shape
+    pooled_height = math.ceil(height / factor)
+    pooled_width = math.ceil(width / factor)
+    pad_height = pooled_height * factor - height
+    pad_width = pooled_width * factor - width
+    padded = np.pad(
+        mask,
+        ((0, pad_height), (0, pad_width)),
+        mode="constant",
+        constant_values=0,
+    )
+    return padded.reshape(
+        pooled_height, factor, pooled_width, factor
+    ).max(axis=(1, 3))
+
+
+def random_crop_pair(
+    image: np.ndarray,
+    mask: np.ndarray,
+    crop_size: int,
+    road_probability: float,
+    min_road_fraction: float,
+    tries: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Take a native-resolution crop, optionally centred around road pixels.
+
+    Crop quality is estimated on an 8x max-pooled mask. This avoids repeatedly
+    summing million-pixel candidate crops inside every DataLoader worker.
+    """
+    image, mask = pad_pair_to_size(image, mask, crop_size)
+    height, width = mask.shape
+    max_y = height - crop_size
+    max_x = width - crop_size
+
+    def random_origin() -> Tuple[int, int]:
+        y = random.randint(0, max_y) if max_y > 0 else 0
+        x = random.randint(0, max_x) if max_x > 0 else 0
+        return y, x
+
+    y0, x0 = random_origin()
+    use_road_crop = road_probability > 0 and random.random() < road_probability
+    if use_road_crop and mask.any():
+        factor = 8
+        coarse = coarse_max_mask(mask, factor=factor)
+        road_cells = np.flatnonzero(coarse)
+        coarse_crop = max(1, math.ceil(crop_size / factor))
+        best_score = -1.0
+        for _ in range(max(1, tries)):
+            flat_index = int(road_cells[random.randrange(len(road_cells))])
+            coarse_y, coarse_x = np.unravel_index(flat_index, coarse.shape)
+            road_y = min(height - 1, coarse_y * factor + random.randrange(factor))
+            road_x = min(width - 1, coarse_x * factor + random.randrange(factor))
+
+            # Keep the selected road point away from a fixed crop position.
+            # This prevents a centre bias while still guaranteeing road support.
+            y0 = min(max(road_y - random.randrange(crop_size), 0), max_y)
+            x0 = min(max(road_x - random.randrange(crop_size), 0), max_x)
+            cy0 = y0 // factor
+            cx0 = x0 // factor
+            region = coarse[
+                cy0 : min(coarse.shape[0], cy0 + coarse_crop),
+                cx0 : min(coarse.shape[1], cx0 + coarse_crop),
+            ]
+            score = float(region.mean()) if region.size else 0.0
+            if score > best_score:
+                best_score = score
+                best_origin = (y0, x0)
+            if score >= min_road_fraction:
+                break
+        y0, x0 = best_origin
+
+    image_crop = image[y0 : y0 + crop_size, x0 : x0 + crop_size]
+    mask_crop = mask[y0 : y0 + crop_size, x0 : x0 + crop_size]
+    return np.ascontiguousarray(image_crop), np.ascontiguousarray(mask_crop)
 
 
 def augment_pair(
@@ -211,24 +310,24 @@ def image_to_tensor(image: np.ndarray) -> Tensor:
     return torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
 
-class RoadResizeDataset(Dataset):
-    """Full-image resize dataset.
-
-    Training returns a resized image and resized mask. Validation returns a
-    resized network input but keeps the original mask for honest metrics.
-    """
+class RoadCropDataset(Dataset):
+    """Native-resolution random crops for training."""
 
     def __init__(
         self,
         pairs: Sequence[Tuple[Path, Path]],
-        image_size: int = 1024,
-        training: bool = False,
+        crop_size: int = 1024,
+        road_crop_probability: float = 0.70,
+        road_crop_min_fraction: float = 0.002,
+        road_crop_tries: int = 8,
     ) -> None:
         self.pairs = list(pairs)
-        self.image_size = int(image_size)
-        self.training = bool(training)
-        if self.image_size < 32 or self.image_size % 32 != 0:
-            raise ValueError("image_size must be >= 32 and divisible by 32")
+        self.crop_size = int(crop_size)
+        self.road_crop_probability = float(road_crop_probability)
+        self.road_crop_min_fraction = float(road_crop_min_fraction)
+        self.road_crop_tries = int(road_crop_tries)
+        if self.crop_size < 32 or self.crop_size % 32 != 0:
+            raise ValueError("crop_size must be >= 32 and divisible by 32")
 
     def __len__(self) -> int:
         return len(self.pairs)
@@ -242,16 +341,41 @@ class RoadResizeDataset(Dataset):
                 f"Image/mask mismatch for {image_path.name}: "
                 f"image={image.shape[:2]}, mask={mask.shape}"
             )
-        original_mask = mask
-        image, mask = resize_pair(image, mask, self.image_size)
-        if self.training:
-            image, mask = augment_pair(image, mask)
-            return image_to_tensor(image), torch.from_numpy(
-                np.ascontiguousarray(mask)
-            ).long()
+        image, mask = random_crop_pair(
+            image,
+            mask,
+            crop_size=self.crop_size,
+            road_probability=self.road_crop_probability,
+            min_road_fraction=self.road_crop_min_fraction,
+            tries=self.road_crop_tries,
+        )
+        image, mask = augment_pair(image, mask)
+        return image_to_tensor(image), torch.from_numpy(
+            np.ascontiguousarray(mask)
+        ).long()
+
+
+class RoadNativeValidationDataset(Dataset):
+    """Return untouched native-resolution images and masks for tiled validation."""
+
+    def __init__(self, pairs: Sequence[Tuple[Path, Path]]) -> None:
+        self.pairs = list(pairs)
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, index: int):
+        image_path, mask_path = self.pairs[index]
+        image = read_rgb(image_path)
+        mask = read_binary_mask(mask_path)
+        if image.shape[:2] != mask.shape:
+            raise RuntimeError(
+                f"Image/mask mismatch for {image_path.name}: "
+                f"image={image.shape[:2]}, mask={mask.shape}"
+            )
         return (
             image_to_tensor(image),
-            torch.from_numpy(np.ascontiguousarray(original_mask)).long(),
+            torch.from_numpy(np.ascontiguousarray(mask)).long(),
             image_path.stem,
         )
 
@@ -316,12 +440,14 @@ def make_loaders(
     args: argparse.Namespace,
 ) -> Tuple[DataLoader, DataLoader, List[Tuple[Path, Path]]]:
     train_pairs, val_pairs = resolve_splits(args)
-    train_dataset = RoadResizeDataset(
-        train_pairs, image_size=args.image_size, training=True
+    train_dataset = RoadCropDataset(
+        train_pairs,
+        crop_size=args.crop_size,
+        road_crop_probability=args.road_crop_probability,
+        road_crop_min_fraction=args.road_crop_min_fraction,
+        road_crop_tries=args.road_crop_tries,
     )
-    val_dataset = RoadResizeDataset(
-        val_pairs, image_size=args.image_size, training=False
-    )
+    val_dataset = RoadNativeValidationDataset(val_pairs)
     generator = torch.Generator()
     generator.manual_seed(args.seed)
     common = {
@@ -611,6 +737,113 @@ def metrics_from_counts(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
     }
 
 
+def sliding_positions(length: int, tile_size: int, overlap: int) -> List[int]:
+    """Cover a dimension completely and always anchor the final border tile."""
+    if length <= tile_size:
+        return [0]
+    stride = tile_size - overlap
+    positions = list(range(0, length - tile_size + 1, stride))
+    final_position = length - tile_size
+    if positions[-1] != final_position:
+        positions.append(final_position)
+    return positions
+
+
+def hann_blend_weight(tile_size: int, device: torch.device) -> Tensor:
+    """Smooth overlap blending with non-zero image-border support."""
+    window = torch.hann_window(
+        tile_size,
+        periodic=False,
+        dtype=torch.float32,
+        device=device,
+    )
+    weight = window[:, None] * window[None, :]
+    weight = 0.05 + 0.95 * weight
+    return weight[None, None]
+
+
+@torch.inference_mode()
+def sliding_window_logits(
+    model: nn.Module,
+    image: Tensor,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> Tensor:
+    """Infer one native-resolution image using batched overlapping tiles."""
+    if image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError("sliding_window_logits expects a BCHW tensor with B=1")
+
+    tile_size = args.val_tile_size
+    _, _, original_height, original_width = image.shape
+    padded_height = max(original_height, tile_size)
+    padded_width = max(original_width, tile_size)
+    pad_height = padded_height - original_height
+    pad_width = padded_width - original_width
+    if pad_height or pad_width:
+        image = F.pad(
+            image,
+            (0, pad_width, 0, pad_height),
+            mode="replicate",
+        )
+
+    y_positions = sliding_positions(
+        padded_height, tile_size, args.val_overlap
+    )
+    x_positions = sliding_positions(
+        padded_width, tile_size, args.val_overlap
+    )
+    positions = [(y, x) for y in y_positions for x in x_positions]
+    blend = hann_blend_weight(tile_size, device)
+    logits_sum = torch.zeros(
+        (1, 2, padded_height, padded_width),
+        dtype=torch.float32,
+        device=device,
+    )
+    weight_sum = torch.zeros(
+        (1, 1, padded_height, padded_width),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    for start in range(0, len(positions), args.val_tile_batch_size):
+        batch_positions = positions[start : start + args.val_tile_batch_size]
+        tiles = torch.cat(
+            [
+                image[:, :, y : y + tile_size, x : x + tile_size]
+                for y, x in batch_positions
+            ],
+            dim=0,
+        )
+        if args.channels_last:
+            tiles = tiles.contiguous(memory_format=torch.channels_last)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=args.use_amp,
+        ):
+            tile_logits = model(tiles)
+            if isinstance(tile_logits, (tuple, list)):
+                tile_logits = tile_logits[-1]
+            if tile_logits.shape[-2:] != (tile_size, tile_size):
+                tile_logits = F.interpolate(
+                    tile_logits,
+                    size=(tile_size, tile_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        tile_logits = tile_logits.float()
+        for batch_index, (y, x) in enumerate(batch_positions):
+            logits_sum[
+                :, :, y : y + tile_size, x : x + tile_size
+            ].add_(tile_logits[batch_index : batch_index + 1] * blend)
+            weight_sum[
+                :, :, y : y + tile_size, x : x + tile_size
+            ].add_(blend)
+
+    logits = logits_sum / weight_sum.clamp_min_(1e-6)
+    return logits[:, :, :original_height, :original_width]
+
+
 @torch.inference_mode()
 def validate(
     model: nn.Module,
@@ -630,22 +863,9 @@ def validate(
     for images, original_masks, names in progress:
         del names
         images = images.to(device, non_blocking=True)
-        if args.channels_last:
-            images = images.contiguous(memory_format=torch.channels_last)
         original_masks = original_masks.to(device, non_blocking=True)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=args.use_amp,
-        ):
-            logits = model(images)
-            logits = F.interpolate(
-                logits,
-                size=original_masks.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            probability = torch.softmax(logits.float(), dim=1)[:, 1]
+        logits = sliding_window_logits(model, images, device, args)
+        probability = torch.softmax(logits, dim=1)[:, 1]
 
         target_bool = original_masks > 0
         probability_np = probability[0].cpu().numpy()
@@ -823,7 +1043,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_mask_dir", default=None)
     parser.add_argument("--val_ratio", type=float, default=0.05)
 
-    parser.add_argument("--image_size", type=int, default=1024)
+    parser.add_argument(
+        "--crop_size",
+        "--image_size",
+        dest="crop_size",
+        type=int,
+        default=1024,
+        help="Native-resolution training crop size; --image_size is an alias",
+    )
+    parser.add_argument("--road_crop_probability", type=float, default=0.70)
+    parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
+    parser.add_argument("--road_crop_tries", type=int, default=8)
     parser.add_argument("--channels", type=int, default=40)
     parser.add_argument("--decoder_channels", type=int, default=128)
     parser.add_argument("--local_blocks", nargs=3, type=int, default=(2, 2, 2))
@@ -859,6 +1089,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold_bins", type=int, default=1001)
     parser.add_argument("--relaxed_buffer_px", type=int, default=3)
     parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_tile_size", type=int, default=1024)
+    parser.add_argument("--val_overlap", type=int, default=256)
+    parser.add_argument("--val_tile_batch_size", type=int, default=2)
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=2)
@@ -875,8 +1108,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.image_size % 32 != 0:
-        raise ValueError("image_size must be divisible by 32")
+    if args.crop_size < 32 or args.crop_size % 32 != 0:
+        raise ValueError("crop_size must be >= 32 and divisible by 32")
+    if args.val_tile_size < 32 or args.val_tile_size % 32 != 0:
+        raise ValueError("val_tile_size must be >= 32 and divisible by 32")
+    if not 0 <= args.val_overlap < args.val_tile_size:
+        raise ValueError("val_overlap must be in [0, val_tile_size)")
+    if args.val_tile_batch_size < 1:
+        raise ValueError("val_tile_batch_size must be >= 1")
+    if not 0.0 <= args.road_crop_probability <= 1.0:
+        raise ValueError("road_crop_probability must be in [0, 1]")
+    if not 0.0 <= args.road_crop_min_fraction <= 1.0:
+        raise ValueError("road_crop_min_fraction must be in [0, 1]")
+    if args.road_crop_tries < 1:
+        raise ValueError("road_crop_tries must be >= 1")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be >= 1")
     if args.epochs < 1:
@@ -950,12 +1195,21 @@ def main() -> None:
     print("RepVGG two-stream road training")
     print(f"Device={device} | AMP={args.use_amp} | channels_last={args.channels_last}")
     print(
-        f"Input={args.image_size}x{args.image_size} | physical batch={args.batch_size} "
+        f"Native crop={args.crop_size}x{args.crop_size} | "
+        f"physical batch={args.batch_size} "
         f"| accumulation={args.accumulation_steps} | effective batch={effective_batch}"
+    )
+    print(
+        f"Road-aware crop probability={args.road_crop_probability:.2f} | "
+        f"minimum coarse road fraction={args.road_crop_min_fraction:.4f}"
     )
     print(f"Parameters={parameter_count:,} | epochs={args.epochs} | LR={args.lr:.2e}")
     print("Main loss=weighted CE + Dice | auxiliary=centerline BCE + Dice")
-    print("Validation logits are resized back to each original mask size")
+    print(
+        f"Native validation: tile={args.val_tile_size}, "
+        f"overlap={args.val_overlap}, tile batch={args.val_tile_batch_size}, "
+        "Hann blending"
+    )
     print("=" * 76)
 
     save_dir = Path(args.save_dir)
