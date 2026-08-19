@@ -81,7 +81,10 @@ def init_distributed() -> Tuple[bool, int, int, int, torch.device]:
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
-            timeout=timedelta(minutes=3),
+            # Rank 0 may scan several thousand masks before the first NCCL
+            # collective while the other ranks wait to receive the result.
+            # DeepGlobe can take more than three minutes on Kaggle storage.
+            timeout=timedelta(minutes=15),
         )
         print(f"[rank {rank}] NCCL process group ready", flush=True)
     else:
