@@ -17,6 +17,7 @@ Design goals
 * Prefer road-containing crops while retaining some random background crops.
 * Keep exactly one road-specific auxiliary: OS4 centerline prediction.
 * Validate the native image with overlap-tiled inference and weighted blending.
+* Native PyTorch DDP for one process per GPU; distributed train and validation.
 * AMP, channels-last, gradient accumulation, gradient clipping, model EMA.
 * AdamW with no weight decay on normalization and bias parameters.
 * Per-update linear warmup followed by cosine decay.
@@ -25,14 +26,14 @@ Design goals
 
 Recommended Kaggle P100 command
 -------------------------------
-python train_repvgg_roadaux.py \
+torchrun --standalone --nproc_per_node=2 train_repvgg_roadaux.py \
     --dataset massachusetts \
     --crop_size 1024 \
     --road_crop_probability 0.70 \
     --val_tile_size 1024 \
     --val_overlap 256 \
     --batch_size 2 \
-    --accumulation_steps 4 \
+    --accumulation_steps 2 \
     --epochs 120 \
     --lr 2e-4 \
     --channels 40 \
@@ -49,21 +50,25 @@ import json
 import math
 import os
 import random
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageEnhance
 from tqdm import tqdm
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data.distributed import DistributedSampler
 
 from modeling.model import RoadRepVGGNet, RoadSegCenterlineLoss
 
@@ -72,6 +77,72 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 MASK_SUFFIXES = ("_mask", "_masks", "_gt", "_label", "_labels")
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
 IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
+
+
+def init_distributed() -> Tuple[bool, int, int, int, torch.device]:
+    """Initialize torchrun DDP, while preserving ordinary one-GPU execution."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL DDP requires CUDA GPUs")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        device = torch.device("cuda", local_rank)
+    else:
+        rank = 0
+        local_rank = 0
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    return distributed, rank, local_rank, world_size, device
+
+
+def distributed_active() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process() -> bool:
+    return not distributed_active() or dist.get_rank() == 0
+
+
+def rank_zero_print(*values, **kwargs) -> None:
+    if is_main_process():
+        print(*values, **kwargs)
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+
+@torch.no_grad()
+def broadcast_module(module: nn.Module, source: int = 0) -> None:
+    """Make EMA parameters and buffers bit-identical before distributed eval."""
+    if not distributed_active():
+        return
+    for tensor in module.state_dict().values():
+        dist.broadcast(tensor, src=source)
+
+
+def cleanup_distributed() -> None:
+    if distributed_active():
+        dist.destroy_process_group()
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard validation without padding or duplicated evaluation samples."""
+
+    def __init__(self, dataset: Dataset, rank: int, world_size: int) -> None:
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, math.ceil(remaining / self.world_size))
 
 
 def seed_everything(seed: int) -> None:
@@ -416,7 +487,9 @@ def resolve_splits(
         and val_mask_dir.is_dir()
     ):
         val_pairs = build_pairs(val_image_dir, val_mask_dir)
-        print(f"Official split: train={len(all_train_pairs)}, val={len(val_pairs)}")
+        rank_zero_print(
+            f"Official split: train={len(all_train_pairs)}, val={len(val_pairs)}"
+        )
         return all_train_pairs, val_pairs
 
     generator = np.random.default_rng(args.seed)
@@ -429,7 +502,7 @@ def resolve_splits(
     val_pairs = [
         pair for index, pair in enumerate(all_train_pairs) if index in val_indices
     ]
-    print(
+    rank_zero_print(
         "WARNING: official validation folders not found; using deterministic "
         f"random split train={len(train_pairs)}, val={len(val_pairs)}"
     )
@@ -438,7 +511,12 @@ def resolve_splits(
 
 def make_loaders(
     args: argparse.Namespace,
-) -> Tuple[DataLoader, DataLoader, List[Tuple[Path, Path]]]:
+) -> Tuple[
+    DataLoader,
+    DataLoader,
+    List[Tuple[Path, Path]],
+    Optional[DistributedSampler],
+]:
     train_pairs, val_pairs = resolve_splits(args)
     train_dataset = RoadCropDataset(
         train_pairs,
@@ -449,7 +527,26 @@ def make_loaders(
     )
     val_dataset = RoadNativeValidationDataset(val_pairs)
     generator = torch.Generator()
-    generator.manual_seed(args.seed)
+    generator.manual_seed(args.seed + args.rank)
+    train_sampler: Optional[DistributedSampler]
+    val_sampler: Optional[DistributedEvalSampler]
+    if args.distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+        val_sampler = DistributedEvalSampler(
+            val_dataset,
+            rank=args.rank,
+            world_size=args.world_size,
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
     common = {
         "num_workers": args.num_workers,
         "pin_memory": True,
@@ -462,7 +559,8 @@ def make_loaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=True,
         **common,
     )
@@ -470,10 +568,11 @@ def make_loaders(
         val_dataset,
         batch_size=1,
         shuffle=False,
+        sampler=val_sampler,
         drop_last=False,
         **common,
     )
-    return train_loader, val_loader, train_pairs
+    return train_loader, val_loader, train_pairs, train_sampler
 
 
 def compute_road_weight(
@@ -488,6 +587,24 @@ def compute_road_weight(
         total += int(mask.size)
     raw_ratio = (total - positive) / max(positive, 1)
     return raw_ratio, min(math.sqrt(raw_ratio), cap)
+
+
+def distributed_road_weight(
+    pairs: Sequence[Tuple[Path, Path]],
+    cap: float,
+    device: torch.device,
+) -> Tuple[float, float]:
+    """Compute dataset statistics once on rank 0 and broadcast the result."""
+    if is_main_process():
+        raw_ratio, class_weight = compute_road_weight(pairs, cap)
+    else:
+        raw_ratio, class_weight = 0.0, 0.0
+    statistics = torch.tensor(
+        [raw_ratio, class_weight], dtype=torch.float64, device=device
+    )
+    if distributed_active():
+        dist.broadcast(statistics, src=0)
+    return float(statistics[0].item()), float(statistics[1].item())
 
 
 def parameter_groups(model: nn.Module, weight_decay: float):
@@ -611,7 +728,12 @@ def train_one_epoch(
     successful_updates = 0
     skipped_nonfinite = 0
     max_gradient = 0.0
-    progress = tqdm(loader, desc=f"Train {epoch + 1:03d}", leave=False)
+    progress = tqdm(
+        loader,
+        desc=f"Train {epoch + 1:03d}",
+        leave=False,
+        disable=not is_main_process(),
+    )
 
     for step, (images, masks) in enumerate(progress):
         images = images.to(device, non_blocking=True)
@@ -624,25 +746,38 @@ def train_one_epoch(
             args.accumulation_steps,
             len(loader) - group_start,
         )
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=args.use_amp,
-        ):
-            outputs = model(images)
-            losses = criterion(outputs, masks)
-            scaled_loss = losses["loss_total"] / group_size
-
-        if not torch.isfinite(scaled_loss):
-            skipped_nonfinite += 1
-            optimizer.zero_grad(set_to_none=True)
-            continue
-        scaler.scale(scaled_loss).backward()
-
         do_update = (
             (step + 1) % args.accumulation_steps == 0
             or step + 1 == len(loader)
         )
+        sync_context = (
+            model.no_sync()
+            if isinstance(model, DDP) and not do_update
+            else nullcontext()
+        )
+        with sync_context:
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=args.use_amp,
+            ):
+                outputs = model(images)
+                losses = criterion(outputs, masks)
+                scaled_loss = losses["loss_total"] / group_size
+
+            finite_flag = torch.tensor(
+                int(bool(torch.isfinite(scaled_loss).item())),
+                dtype=torch.int32,
+                device=device,
+            )
+            if distributed_active():
+                dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+            if not bool(finite_flag.item()):
+                skipped_nonfinite += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            scaler.scale(scaled_loss).backward()
+
         if do_update:
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -658,7 +793,7 @@ def train_one_epoch(
             step_succeeded = float(scaler.get_scale()) >= previous_scale
             if step_succeeded:
                 scheduler.step()
-                ema.update(model)
+                ema.update(unwrap_model(model))
                 successful_updates += 1
 
         batch_size = images.shape[0]
@@ -678,6 +813,28 @@ def train_one_epoch(
             lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             aux=f"{criterion.aux_weight:.3f}",
         )
+
+    if distributed_active():
+        for meter in meters.values():
+            statistics = torch.tensor(
+                [meter.total, float(meter.count)],
+                dtype=torch.float64,
+                device=device,
+            )
+            dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+            meter.total = float(statistics[0].item())
+            meter.count = int(statistics[1].item())
+        counters = torch.tensor(
+            [successful_updates, skipped_nonfinite],
+            dtype=torch.int64,
+            device=device,
+        )
+        dist.all_reduce(counters, op=dist.ReduceOp.MAX)
+        successful_updates = int(counters[0].item())
+        skipped_nonfinite = int(counters[1].item())
+        maximum = torch.tensor(max_gradient, dtype=torch.float32, device=device)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        max_gradient = float(maximum.item())
 
     return {
         key: meter.mean for key, meter in meters.items()
@@ -859,7 +1016,12 @@ def validate(
     relaxed_supported_targets = 0
     relaxed_targets = 0
 
-    progress = tqdm(loader, desc="Validate", leave=False)
+    progress = tqdm(
+        loader,
+        desc="Validate",
+        leave=False,
+        disable=not is_main_process(),
+    )
     for images, original_masks, names in progress:
         del names
         images = images.to(device, non_blocking=True)
@@ -896,10 +1058,41 @@ def validate(
         relaxed_supported_targets += int((target_bool & dilated_prediction).sum())
         relaxed_targets += int(target_bool.sum())
 
-    positive_array = np.stack(positive_hists)
-    negative_array = np.stack(negative_hists)
-    positive_total = positive_array.sum(axis=0)
-    negative_total = negative_array.sum(axis=0)
+    positive_total = (
+        np.stack(positive_hists).sum(axis=0)
+        if positive_hists
+        else np.zeros(args.threshold_bins, dtype=np.int64)
+    )
+    negative_total = (
+        np.stack(negative_hists).sum(axis=0)
+        if negative_hists
+        else np.zeros(args.threshold_bins, dtype=np.int64)
+    )
+    if distributed_active():
+        global_hists = torch.from_numpy(
+            np.stack((positive_total, negative_total))
+        ).to(device=device, dtype=torch.int64)
+        dist.all_reduce(global_hists, op=dist.ReduceOp.SUM)
+        positive_total = global_hists[0].cpu().numpy()
+        negative_total = global_hists[1].cpu().numpy()
+
+        relaxed_counts = torch.tensor(
+            [
+                relaxed_supported_predictions,
+                relaxed_predictions,
+                relaxed_supported_targets,
+                relaxed_targets,
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        dist.all_reduce(relaxed_counts, op=dist.ReduceOp.SUM)
+        (
+            relaxed_supported_predictions,
+            relaxed_predictions,
+            relaxed_supported_targets,
+            relaxed_targets,
+        ) = [int(value) for value in relaxed_counts.cpu().tolist()]
 
     fixed_counts = counts_at_threshold(positive_total, negative_total, 0.5)
     fixed = metrics_from_counts(*fixed_counts)
@@ -921,11 +1114,22 @@ def validate(
             selected_counts = counts
 
     per_image_ious = []
-    for positive_hist, negative_hist in zip(positive_array, negative_array):
+    for positive_hist, negative_hist in zip(positive_hists, negative_hists):
         counts = counts_at_threshold(
             positive_hist, negative_hist, selected_threshold
         )
         per_image_ious.append(metrics_from_counts(*counts)["road_iou"])
+    macro_sum = float(sum(per_image_ious))
+    macro_count = len(per_image_ious)
+    if distributed_active():
+        macro_statistics = torch.tensor(
+            [macro_sum, float(macro_count)],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(macro_statistics, op=dist.ReduceOp.SUM)
+        macro_sum = float(macro_statistics[0].item())
+        macro_count = int(macro_statistics[1].item())
 
     relaxed_precision = relaxed_supported_predictions / max(
         relaxed_predictions, 1
@@ -943,7 +1147,7 @@ def validate(
         "fixed_recall": fixed["recall"],
         "selected_threshold": selected_threshold,
         "selected_road_iou_micro": selected["road_iou"],
-        "selected_road_iou_macro": float(np.mean(per_image_ious)),
+        "selected_road_iou_macro": macro_sum / max(macro_count, 1),
         "selected_miou": selected["miou"],
         "selected_f1": selected["f1"],
         "selected_precision": selected["precision"],
@@ -975,7 +1179,7 @@ def checkpoint_state(
 ) -> Dict:
     return {
         "epoch": epoch,
-        "model": model.state_dict(),
+        "model": unwrap_model(model).state_dict(),
         "ema": ema.module.state_dict(),
         "ema_updates": ema.updates,
         "optimizer": optimizer.state_dict(),
@@ -1029,7 +1233,10 @@ def append_jsonl(path: str | Path, record: Dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train RepVGG two-stream road segmentation with centerline auxiliary"
+        description=(
+            "Train RepVGG road segmentation with centerline auxiliary and "
+            "optional torchrun DDP"
+        )
     )
     parser.add_argument(
         "--dataset", choices=("massachusetts", "deepglobe"), default="massachusetts"
@@ -1066,7 +1273,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--accumulation_steps", type=int, default=4)
+    parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--warmup_epochs", type=int, default=5)
@@ -1093,7 +1300,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_overlap", type=int, default=256)
     parser.add_argument("--val_tile_batch_size", type=int, default=2)
 
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=2,
+        help="Workers per GPU process; T4x2 therefore uses four workers total",
+    )
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1136,218 +1348,292 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    configure_dataset_paths(args)
-    validate_args(args)
-    seed_everything(args.seed)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    (
+        args.distributed,
+        args.rank,
+        args.local_rank,
+        args.world_size,
+        device,
+    ) = init_distributed()
 
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.use_amp = bool(args.use_amp and device.type == "cuda")
+    try:
+        configure_dataset_paths(args)
+        validate_args(args)
+        seed_everything(args.seed + args.rank)
 
-    train_loader, val_loader, train_pairs = make_loaders(args)
-    raw_imbalance, road_class_weight = compute_road_weight(
-        train_pairs, args.road_weight_cap
-    )
-    print(
-        f"Road imbalance={raw_imbalance:.4f}; "
-        f"two-class road weight={road_class_weight:.4f}"
-    )
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if not args.distributed and torch.cuda.device_count() > 1:
+                rank_zero_print(
+                    "WARNING: multiple GPUs are visible but DDP is inactive. "
+                    "Launch with torchrun --standalone --nproc_per_node=2."
+                )
+        args.use_amp = bool(args.use_amp and device.type == "cuda")
 
-    model = RoadRepVGGNet(
-        channels=args.channels,
-        decoder_channels=args.decoder_channels,
-        local_blocks=args.local_blocks,
-        global_blocks=args.global_blocks,
-        deep_blocks=args.deep_blocks,
-        half_refine_channels=args.half_refine_channels,
-        enable_fullres_head=args.use_fullres_head,
-    ).to(device)
-    if args.channels_last:
-        model = model.to(memory_format=torch.channels_last)
-    ema = ModelEMA(model, args.ema_decay)
-    criterion = RoadSegCenterlineLoss(
-        aux_weight=args.aux_weight,
-        main_dice_weight=args.main_dice_weight,
-        centerline_dice_weight=args.centerline_dice_weight,
-        centerline_pos_weight=args.centerline_pos_weight,
-        skeleton_iterations=args.skeleton_iterations,
-        road_class_weight=road_class_weight,
-    ).to(device)
-    optimizer = AdamW(
-        parameter_groups(model, args.weight_decay),
-        lr=args.lr,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-    )
-    updates_per_epoch = math.ceil(
-        len(train_loader) / args.accumulation_steps
-    )
-    scheduler = build_scheduler(optimizer, updates_per_epoch, args)
-    scaler = make_grad_scaler(args.use_amp)
-
-    parameter_count = sum(parameter.numel() for parameter in model.parameters())
-    effective_batch = args.batch_size * args.accumulation_steps
-    print("=" * 76)
-    print("RepVGG two-stream road training")
-    print(f"Device={device} | AMP={args.use_amp} | channels_last={args.channels_last}")
-    print(
-        f"Native crop={args.crop_size}x{args.crop_size} | "
-        f"physical batch={args.batch_size} "
-        f"| accumulation={args.accumulation_steps} | effective batch={effective_batch}"
-    )
-    print(
-        f"Road-aware crop probability={args.road_crop_probability:.2f} | "
-        f"minimum coarse road fraction={args.road_crop_min_fraction:.4f}"
-    )
-    print(f"Parameters={parameter_count:,} | epochs={args.epochs} | LR={args.lr:.2e}")
-    print("Main loss=weighted CE + Dice | auxiliary=centerline BCE + Dice")
-    print(
-        f"Native validation: tile={args.val_tile_size}, "
-        f"overlap={args.val_overlap}, tile batch={args.val_tile_batch_size}, "
-        "Hann blending"
-    )
-    print("=" * 76)
-
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    with (save_dir / "config.json").open("w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2, ensure_ascii=False)
-    log_path = save_dir / "metrics.jsonl"
-
-    start_epoch = 0
-    best_fixed_iou = 0.0
-    best_selected_iou = 0.0
-    best_threshold = 0.5
-    if args.resume:
         (
-            start_epoch,
-            best_fixed_iou,
-            best_selected_iou,
-            best_threshold,
-        ) = resume_training(
-            args.resume,
-            model,
-            ema,
-            optimizer,
-            scheduler,
-            scaler,
-            device,
-        )
-        print(
-            f"Resumed from epoch {start_epoch + 1}; "
-            f"best fixed IoU={best_fixed_iou:.4f}"
-        )
-
-    for epoch in range(start_epoch, args.epochs):
-        train_metrics = train_one_epoch(
-            model,
-            ema,
             train_loader,
-            criterion,
-            optimizer,
-            scheduler,
-            scaler,
-            device,
-            epoch,
-            args,
+            val_loader,
+            train_pairs,
+            train_sampler,
+        ) = make_loaders(args)
+        raw_imbalance, road_class_weight = distributed_road_weight(
+            train_pairs, args.road_weight_cap, device
         )
-        print(
-            f"Epoch {epoch + 1:03d}/{args.epochs}: "
-            f"loss={train_metrics['total']:.4f}, "
-            f"CE={train_metrics['main_ce']:.4f}, "
-            f"Dice={train_metrics['main_dice']:.4f}, "
-            f"center={train_metrics['aux']:.4f} "
-            f"(w={train_metrics['aux_weight']:.3f}), "
-            f"road_fraction={train_metrics['road_fraction']:.4f}, "
-            f"lr={train_metrics['lr']:.2e}, "
-            f"grad={train_metrics['max_gradient']:.2f}, "
-            f"skipped={int(train_metrics['skipped_nonfinite'])}"
+        rank_zero_print(
+            f"Road imbalance={raw_imbalance:.4f}; "
+            f"two-class road weight={road_class_weight:.4f}"
         )
 
-        validation: Optional[Dict[str, float]] = None
-        if (epoch + 1) % args.val_interval == 0 or epoch + 1 == args.epochs:
-            validation = validate(ema.module, val_loader, device, args)
-            print(
-                f"  Val EMA fixed@0.50: road IoU={validation['fixed_road_iou']:.4f}, "
-                f"mIoU={validation['fixed_miou']:.4f}, "
-                f"F1={validation['fixed_f1']:.4f}"
+        base_model = RoadRepVGGNet(
+            channels=args.channels,
+            decoder_channels=args.decoder_channels,
+            local_blocks=args.local_blocks,
+            global_blocks=args.global_blocks,
+            deep_blocks=args.deep_blocks,
+            half_refine_channels=args.half_refine_channels,
+            enable_fullres_head=args.use_fullres_head,
+        ).to(device)
+        if args.channels_last:
+            base_model = base_model.to(memory_format=torch.channels_last)
+        if args.distributed:
+            model: nn.Module = DDP(
+                base_model,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+                broadcast_buffers=True,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+                static_graph=True,
             )
-            print(
-                f"  Calibrated@{validation['selected_threshold']:.2f}: "
-                f"IoU micro={validation['selected_road_iou_micro']:.4f}, "
-                f"macro={validation['selected_road_iou_macro']:.4f}, "
-                f"P={validation['selected_precision']:.4f}, "
-                f"R={validation['selected_recall']:.4f}"
-            )
-            print(
-                f"  Relaxed ±{args.relaxed_buffer_px}px: "
-                f"P={validation['relaxed_precision']:.4f}, "
-                f"R={validation['relaxed_recall']:.4f}, "
-                f"F1={validation['relaxed_f1']:.4f}"
-            )
+        else:
+            model = base_model
 
-            fixed_improved = validation["fixed_road_iou"] > best_fixed_iou
-            selected_improved = (
-                validation["selected_road_iou_micro"] > best_selected_iou
-            )
-            if fixed_improved:
-                best_fixed_iou = validation["fixed_road_iou"]
-                best_threshold = 0.5
-            if selected_improved:
-                best_selected_iou = validation["selected_road_iou_micro"]
+        # DDP construction first broadcasts rank-0 initialization. Copying EMA
+        # afterwards guarantees every rank starts from the identical model.
+        ema = ModelEMA(base_model, args.ema_decay)
+        criterion = RoadSegCenterlineLoss(
+            aux_weight=args.aux_weight,
+            main_dice_weight=args.main_dice_weight,
+            centerline_dice_weight=args.centerline_dice_weight,
+            centerline_pos_weight=args.centerline_pos_weight,
+            skeleton_iterations=args.skeleton_iterations,
+            road_class_weight=road_class_weight,
+        ).to(device)
+        optimizer = AdamW(
+            parameter_groups(model, args.weight_decay),
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+        updates_per_epoch = math.ceil(
+            len(train_loader) / args.accumulation_steps
+        )
+        scheduler = build_scheduler(optimizer, updates_per_epoch, args)
+        scaler = make_grad_scaler(args.use_amp)
 
-            state = checkpoint_state(
-                model,
+        parameter_count = sum(
+            parameter.numel() for parameter in base_model.parameters()
+        )
+        effective_batch = (
+            args.batch_size * args.accumulation_steps * args.world_size
+        )
+        rank_zero_print("=" * 76)
+        rank_zero_print("RepVGG two-stream road training")
+        rank_zero_print(
+            f"DDP={args.distributed} | GPUs={args.world_size} | "
+            f"backend={'NCCL' if args.distributed else 'none'} | "
+            f"AMP={args.use_amp} | channels_last={args.channels_last}"
+        )
+        rank_zero_print(
+            f"Native crop={args.crop_size}x{args.crop_size} | "
+            f"batch/GPU={args.batch_size} | accumulation={args.accumulation_steps} "
+            f"| global effective batch={effective_batch}"
+        )
+        rank_zero_print(
+            f"Road-aware crop probability={args.road_crop_probability:.2f} | "
+            f"minimum coarse road fraction={args.road_crop_min_fraction:.4f}"
+        )
+        rank_zero_print(
+            f"Parameters={parameter_count:,} | epochs={args.epochs} "
+            f"| LR={args.lr:.2e}"
+        )
+        rank_zero_print(
+            "Main loss=weighted CE + Dice | auxiliary=centerline BCE + Dice"
+        )
+        rank_zero_print(
+            f"Distributed native validation: tile={args.val_tile_size}, "
+            f"overlap={args.val_overlap}, tile batch/GPU="
+            f"{args.val_tile_batch_size}, Hann blending"
+        )
+        rank_zero_print("=" * 76)
+
+        save_dir = Path(args.save_dir)
+        if is_main_process():
+            save_dir.mkdir(parents=True, exist_ok=True)
+            with (save_dir / "config.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(vars(args), handle, indent=2, ensure_ascii=False)
+        if distributed_active():
+            dist.barrier()
+        log_path = save_dir / "metrics.jsonl"
+
+        start_epoch = 0
+        best_fixed_iou = 0.0
+        best_selected_iou = 0.0
+        best_threshold = 0.5
+        if args.resume:
+            (
+                start_epoch,
+                best_fixed_iou,
+                best_selected_iou,
+                best_threshold,
+            ) = resume_training(
+                args.resume,
+                base_model,
                 ema,
                 optimizer,
                 scheduler,
                 scaler,
+                device,
+            )
+            rank_zero_print(
+                f"Resumed from epoch {start_epoch + 1}; "
+                f"best fixed IoU={best_fixed_iou:.4f}"
+            )
+
+        for epoch in range(start_epoch, args.epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_metrics = train_one_epoch(
+                model,
+                ema,
+                train_loader,
+                criterion,
+                optimizer,
+                scheduler,
+                scaler,
+                device,
                 epoch,
-                best_fixed_iou,
-                best_selected_iou,
-                validation["selected_threshold"],
                 args,
             )
-            if fixed_improved:
-                atomic_torch_save(state, save_dir / "best_fixed_iou.pt")
-                print(f"  Saved new best fixed IoU={best_fixed_iou:.4f}")
-            if selected_improved:
-                atomic_torch_save(state, save_dir / "best_selected_iou.pt")
-                print(
-                    "  Saved new best calibrated IoU="
-                    f"{best_selected_iou:.4f}"
+            rank_zero_print(
+                f"Epoch {epoch + 1:03d}/{args.epochs}: "
+                f"loss={train_metrics['total']:.4f}, "
+                f"CE={train_metrics['main_ce']:.4f}, "
+                f"Dice={train_metrics['main_dice']:.4f}, "
+                f"center={train_metrics['aux']:.4f} "
+                f"(w={train_metrics['aux_weight']:.3f}), "
+                f"road_fraction={train_metrics['road_fraction']:.4f}, "
+                f"lr={train_metrics['lr']:.2e}, "
+                f"grad={train_metrics['max_gradient']:.2f}, "
+                f"skipped={int(train_metrics['skipped_nonfinite'])}"
+            )
+
+            validation: Optional[Dict[str, float]] = None
+            validate_now = (
+                (epoch + 1) % args.val_interval == 0
+                or epoch + 1 == args.epochs
+            )
+            if validate_now:
+                broadcast_module(ema.module, source=0)
+                validation = validate(ema.module, val_loader, device, args)
+                rank_zero_print(
+                    f"  Val EMA fixed@0.50: road IoU="
+                    f"{validation['fixed_road_iou']:.4f}, "
+                    f"mIoU={validation['fixed_miou']:.4f}, "
+                    f"F1={validation['fixed_f1']:.4f}"
+                )
+                rank_zero_print(
+                    f"  Calibrated@{validation['selected_threshold']:.2f}: "
+                    f"IoU micro={validation['selected_road_iou_micro']:.4f}, "
+                    f"macro={validation['selected_road_iou_macro']:.4f}, "
+                    f"P={validation['selected_precision']:.4f}, "
+                    f"R={validation['selected_recall']:.4f}"
+                )
+                rank_zero_print(
+                    f"  Relaxed ±{args.relaxed_buffer_px}px: "
+                    f"P={validation['relaxed_precision']:.4f}, "
+                    f"R={validation['relaxed_recall']:.4f}, "
+                    f"F1={validation['relaxed_f1']:.4f}"
                 )
 
-        state = checkpoint_state(
-            model,
-            ema,
-            optimizer,
-            scheduler,
-            scaler,
-            epoch,
-            best_fixed_iou,
-            best_selected_iou,
-            best_threshold,
-            args,
-        )
-        atomic_torch_save(state, save_dir / "last.pt")
-        record = {
-            "epoch": epoch + 1,
-            "train": train_metrics,
-            "validation": validation,
-            "best_fixed_iou": best_fixed_iou,
-            "best_selected_iou": best_selected_iou,
-        }
-        append_jsonl(log_path, record)
+                fixed_improved = validation["fixed_road_iou"] > best_fixed_iou
+                selected_improved = (
+                    validation["selected_road_iou_micro"] > best_selected_iou
+                )
+                if fixed_improved:
+                    best_fixed_iou = validation["fixed_road_iou"]
+                    best_threshold = 0.5
+                if selected_improved:
+                    best_selected_iou = validation[
+                        "selected_road_iou_micro"
+                    ]
 
-    print(
-        f"Finished. Best fixed@0.50 IoU={best_fixed_iou:.4f}; "
-        f"best calibrated IoU={best_selected_iou:.4f}"
-    )
+                if is_main_process():
+                    state = checkpoint_state(
+                        model,
+                        ema,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch,
+                        best_fixed_iou,
+                        best_selected_iou,
+                        validation["selected_threshold"],
+                        args,
+                    )
+                    if fixed_improved:
+                        atomic_torch_save(
+                            state, save_dir / "best_fixed_iou.pt"
+                        )
+                        print(
+                            f"  Saved new best fixed IoU="
+                            f"{best_fixed_iou:.4f}"
+                        )
+                    if selected_improved:
+                        atomic_torch_save(
+                            state, save_dir / "best_selected_iou.pt"
+                        )
+                        print(
+                            "  Saved new best calibrated IoU="
+                            f"{best_selected_iou:.4f}"
+                        )
+
+            if is_main_process():
+                state = checkpoint_state(
+                    model,
+                    ema,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    best_fixed_iou,
+                    best_selected_iou,
+                    best_threshold,
+                    args,
+                )
+                atomic_torch_save(state, save_dir / "last.pt")
+                record = {
+                    "epoch": epoch + 1,
+                    "train": train_metrics,
+                    "validation": validation,
+                    "best_fixed_iou": best_fixed_iou,
+                    "best_selected_iou": best_selected_iou,
+                }
+                append_jsonl(log_path, record)
+            if distributed_active():
+                dist.barrier()
+
+        rank_zero_print(
+            f"Finished. Best fixed@0.50 IoU={best_fixed_iou:.4f}; "
+            f"best calibrated IoU={best_selected_iou:.4f}"
+        )
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
