@@ -14,6 +14,7 @@ attention/Transformer dependency.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -513,6 +514,7 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         centerline_beta: float = 0.70,
         skeleton_iterations: int = 8,
         centerline_dilation: int = 1,
+        fast_centerline_target: bool = True,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
@@ -522,6 +524,7 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         self.centerline_beta = float(centerline_beta)
         self.skeleton_iterations = int(skeleton_iterations)
         self.centerline_dilation = int(centerline_dilation)
+        self.fast_centerline_target = bool(fast_centerline_target)
 
     def forward(
         self,
@@ -539,21 +542,52 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
 
         with torch.no_grad():
-            centerline_target = soft_skeletonize(
-                road_mask.float(), self.skeleton_iterations
-            )
-            if self.centerline_dilation > 0:
-                kernel = 2 * self.centerline_dilation + 1
+            target_dilation = self.centerline_dilation
+            if self.fast_centerline_target:
+                # The auxiliary head lives at S4. Skeletonizing a 512x512 mask
+                # performs roughly 40 full-resolution pooling passes for the
+                # default settings. Pooling first preserves thin positives and
+                # cuts this auxiliary-target cost by well over an order of
+                # magnitude without changing the Tversky objective.
+                target_height, target_width = centerline_logits.shape[-2:]
+                scale = max(
+                    road_mask.shape[-2] / max(target_height, 1),
+                    road_mask.shape[-1] / max(target_width, 1),
+                )
+                skeleton_input = F.adaptive_max_pool2d(
+                    road_mask.float(), (target_height, target_width)
+                )
+                target_iterations = (
+                    max(1, math.ceil(self.skeleton_iterations / scale))
+                    if self.skeleton_iterations > 0
+                    else 0
+                )
+                # The CLI dilation is expressed in input pixels. Convert it
+                # to the auxiliary grid so dilation=1 does not accidentally
+                # become a +/-4-pixel tolerance at S4.
+                target_dilation = max(
+                    0, int(math.floor(self.centerline_dilation / scale + 0.5))
+                )
+                centerline_target = soft_skeletonize(
+                    skeleton_input, target_iterations
+                )
+            else:
+                centerline_target = soft_skeletonize(
+                    road_mask.float(), self.skeleton_iterations
+                )
+            if target_dilation > 0:
+                kernel = 2 * target_dilation + 1
                 centerline_target = F.max_pool2d(
                     centerline_target,
                     kernel,
                     stride=1,
-                    padding=self.centerline_dilation,
+                    padding=target_dilation,
                 )
-            # Max pooling preserves a thin centerline when mapping HxW to S4.
-            centerline_target = F.adaptive_max_pool2d(
-                centerline_target, centerline_logits.shape[-2:]
-            )
+            if centerline_target.shape[-2:] != centerline_logits.shape[-2:]:
+                # Full-resolution compatibility/ablation path.
+                centerline_target = F.adaptive_max_pool2d(
+                    centerline_target, centerline_logits.shape[-2:]
+                )
 
         loss_centerline = binary_tversky_loss(
             centerline_logits.float().sigmoid(),
