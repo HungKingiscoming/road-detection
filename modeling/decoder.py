@@ -1,19 +1,15 @@
-"""Lightweight asymmetric decoder and road-specific auxiliary loss.
+"""Road reconstruction decoder and its single centerline supervision.
 
-The decoder intentionally stops at output stride 2 and uses bilinear resize for
-the final logits.  It is therefore much cheaper than a symmetric U-Net decoder.
-
-Training output:
-    centerline_logits_s4, road_logits_full
-
-Evaluation output:
-    road_logits_full
-
-The complete objective contains exactly four primitive terms::
+The decoder restores spatial detail in two inexpensive stages (S8 -> S4 ->
+S2), then predicts the full-resolution road mask. During training it also
+returns one S4 centerline logit map. The auxiliary head is discarded during
+evaluation and is supervised by one Tversky loss only::
 
     L = CE_road + lambda_dice * Dice_road
-        + lambda_aux * (BCE_centerline + lambda_center * Dice_centerline)
+        + lambda_aux * Tversky_centerline
 
+There is no auxiliary BCE, auxiliary Dice, boundary loss, Lovasz loss, or
+attention/Transformer dependency.
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ from torch import Tensor
 
 
 class ConvBNAct(nn.Sequential):
-    """Convolution followed by BatchNorm and an optional ReLU."""
+    """Convolution, BatchNorm, and an optional ReLU."""
 
     def __init__(
         self,
@@ -38,20 +34,53 @@ class ConvBNAct(nn.Sequential):
         padding: Optional[int] = None,
         groups: int = 1,
         activation: bool = True,
+        zero_init_bn: bool = False,
     ) -> None:
         if padding is None:
             padding = kernel_size // 2
+        convolution = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=False,
+        )
+        norm = nn.BatchNorm2d(out_channels)
+        if zero_init_bn:
+            nn.init.zeros_(norm.weight)
+        layers: list[nn.Module] = [convolution, norm]
+        if activation:
+            layers.append(nn.ReLU(inplace=True))
+        super().__init__(*layers)
+
+
+class ConvGNAct(nn.Sequential):
+    """Conv-GroupNorm-ReLU used on pooled maps, including 1x1 maps."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        padding: Optional[int] = None,
+        activation: bool = True,
+    ) -> None:
+        if padding is None:
+            padding = kernel_size // 2
+        groups = min(8, out_channels)
+        while out_channels % groups:
+            groups -= 1
         layers: list[nn.Module] = [
             nn.Conv2d(
                 in_channels,
                 out_channels,
                 kernel_size,
-                stride=stride,
                 padding=padding,
-                groups=groups,
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(groups, out_channels),
         ]
         if activation:
             layers.append(nn.ReLU(inplace=True))
@@ -59,15 +88,16 @@ class ConvBNAct(nn.Sequential):
 
 
 class ConvBN(nn.Sequential):
-    """Linear Conv-BN branch used by :class:`RepVGGBlock`."""
+    """Linear Conv-BN branch used by re-parameterizable blocks."""
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int,
+        kernel_size: Union[int, Tuple[int, int]],
         stride: int,
-        padding: int,
+        padding: Union[int, Tuple[int, int]],
+        groups: int = 1,
     ) -> None:
         super().__init__(
             nn.Conv2d(
@@ -76,6 +106,7 @@ class ConvBN(nn.Sequential):
                 kernel_size,
                 stride=stride,
                 padding=padding,
+                groups=groups,
                 bias=False,
             ),
             nn.BatchNorm2d(out_channels),
@@ -90,8 +121,19 @@ class ConvBN(nn.Sequential):
         return self[1]
 
 
+def _fuse_conv_bn(branch: ConvBN) -> Tuple[Tensor, Tensor]:
+    weight = branch.conv.weight
+    norm = branch.bn
+    std = torch.sqrt(norm.running_var + norm.eps)
+    scale = norm.weight / std
+    return (
+        weight * scale.reshape(-1, 1, 1, 1),
+        norm.bias - norm.running_mean * scale,
+    )
+
+
 class RepVGGBlock(nn.Module):
-    """RepVGG block that can be exactly fused to one 3x3 convolution."""
+    """RepVGG block exactly fused to one dense 3x3 convolution at deploy."""
 
     def __init__(
         self,
@@ -140,38 +182,27 @@ class RepVGGBlock(nn.Module):
             self.branch_3x3(x) + self.branch_1x1(x) + identity
         )
 
-    @staticmethod
-    def _fuse_conv_bn(branch: ConvBN) -> Tuple[Tensor, Tensor]:
-        weight = branch.conv.weight
-        bn = branch.bn
-        std = torch.sqrt(bn.running_var + bn.eps)
-        scale = bn.weight / std
-        return (
-            weight * scale.reshape(-1, 1, 1, 1),
-            bn.bias - bn.running_mean * scale,
-        )
-
     def _fuse_identity_bn(self) -> Tuple[Union[Tensor, int], Union[Tensor, int]]:
         if self.branch_identity is None:
             return 0, 0
-        bn = self.branch_identity
-        kernel = bn.weight.new_zeros(
+        norm = self.branch_identity
+        kernel = norm.weight.new_zeros(
             self.out_channels, self.in_channels, 3, 3
         )
         indices = torch.arange(self.in_channels, device=kernel.device)
         kernel[indices, indices, 1, 1] = 1.0
-        std = torch.sqrt(bn.running_var + bn.eps)
-        scale = bn.weight / std
+        std = torch.sqrt(norm.running_var + norm.eps)
+        scale = norm.weight / std
         return (
             kernel * scale.reshape(-1, 1, 1, 1),
-            bn.bias - bn.running_mean * scale,
+            norm.bias - norm.running_mean * scale,
         )
 
     def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
         if self.deploy:
             return self.reparam.weight, self.reparam.bias
-        kernel_3, bias_3 = self._fuse_conv_bn(self.branch_3x3)
-        kernel_1, bias_1 = self._fuse_conv_bn(self.branch_1x1)
+        kernel_3, bias_3 = _fuse_conv_bn(self.branch_3x3)
+        kernel_1, bias_1 = _fuse_conv_bn(self.branch_1x1)
         kernel_id, bias_id = self._fuse_identity_bn()
         kernel = kernel_3 + F.pad(kernel_1, (1, 1, 1, 1)) + kernel_id
         return kernel, bias_3 + bias_1 + bias_id
@@ -198,115 +229,217 @@ class RepVGGBlock(nn.Module):
         self.deploy = True
 
 
-class SemanticSpatialRefinement(nn.Module):
-    """Use OS16 semantics to suppress or amplify the detailed OS4 feature.
+class RepDepthwiseBlock(nn.Module):
+    """Road refinement with a deployable depthwise 5x5 spatial kernel.
 
-    The zero-initialized gate starts as an identity mapping.  This is safer
-    than forcing a random sigmoid gate onto pretrained encoder features.
+    During training, 3x3, 1x5, 5x1, and identity paths learn complementary
+    road geometry. The four paths are exactly fused into one depthwise 5x5
+    convolution for inference. The inexpensive pointwise mixer remains.
     """
 
-    def __init__(self, shallow_channels: int, deep_channels: int) -> None:
+    def __init__(self, channels: int, deploy: bool = False) -> None:
         super().__init__()
-        self.gate = nn.Conv2d(deep_channels, shallow_channels, 1, bias=True)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
-
-    def forward(self, shallow: Tensor, deep: Tensor) -> Tensor:
-        guidance = F.interpolate(
-            deep,
-            size=shallow.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
+        self.channels = int(channels)
+        self.deploy = bool(deploy)
+        self.spatial_activation = nn.ReLU(inplace=True)
+        self.output_activation = nn.ReLU(inplace=True)
+        if self.deploy:
+            self.spatial_reparam = nn.Conv2d(
+                channels,
+                channels,
+                5,
+                padding=2,
+                groups=channels,
+                bias=True,
+            )
+        else:
+            self.branch_3x3 = ConvBN(
+                channels, channels, 3, 1, 1, groups=channels
+            )
+            self.branch_1x5 = ConvBN(
+                channels, channels, (1, 5), 1, (0, 2), groups=channels
+            )
+            self.branch_5x1 = ConvBN(
+                channels, channels, (5, 1), 1, (2, 0), groups=channels
+            )
+            self.branch_identity = nn.BatchNorm2d(channels)
+        self.pointwise = ConvBNAct(
+            channels, channels, 1, padding=0, activation=False
         )
-        modulation = torch.tanh(self.gate(guidance))
-        return shallow * (1.0 + modulation)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.deploy:
+            spatial = self.spatial_reparam(x)
+        else:
+            spatial = (
+                self.branch_3x3(x)
+                + self.branch_1x5(x)
+                + self.branch_5x1(x)
+                + self.branch_identity(x)
+            )
+        spatial = self.spatial_activation(spatial)
+        return self.output_activation(x + self.pointwise(spatial))
+
+    @staticmethod
+    def _pad_to_5x5(kernel: Tensor) -> Tensor:
+        height, width = kernel.shape[-2:]
+        pad_h, pad_w = 5 - height, 5 - width
+        return F.pad(
+            kernel,
+            (
+                pad_w // 2,
+                pad_w - pad_w // 2,
+                pad_h // 2,
+                pad_h - pad_h // 2,
+            ),
+        )
+
+    def _fuse_identity(self) -> Tuple[Tensor, Tensor]:
+        norm = self.branch_identity
+        kernel = norm.weight.new_zeros(self.channels, 1, 5, 5)
+        kernel[:, 0, 2, 2] = 1.0
+        std = torch.sqrt(norm.running_var + norm.eps)
+        scale = norm.weight / std
+        return (
+            kernel * scale.reshape(-1, 1, 1, 1),
+            norm.bias - norm.running_mean * scale,
+        )
+
+    def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        if self.deploy:
+            return self.spatial_reparam.weight, self.spatial_reparam.bias
+        kernels, biases = [], []
+        for branch in (self.branch_3x3, self.branch_1x5, self.branch_5x1):
+            kernel, bias = _fuse_conv_bn(branch)
+            kernels.append(self._pad_to_5x5(kernel))
+            biases.append(bias)
+        kernel_id, bias_id = self._fuse_identity()
+        return sum(kernels, kernel_id), sum(biases, bias_id)
+
+    def switch_to_deploy(self) -> None:
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        reparam = nn.Conv2d(
+            self.channels,
+            self.channels,
+            5,
+            padding=2,
+            groups=self.channels,
+            bias=True,
+        ).to(device=kernel.device, dtype=kernel.dtype)
+        with torch.no_grad():
+            reparam.weight.copy_(kernel)
+            reparam.bias.copy_(bias)
+        self.spatial_reparam = reparam
+        del self.branch_3x3
+        del self.branch_1x5
+        del self.branch_5x1
+        del self.branch_identity
+        self.deploy = True
 
 
-class CompactRoadDecoder(nn.Module):
-    """Asymmetric additive decoder with one train-only centerline head."""
+class SeparableConvBNAct(nn.Sequential):
+    """Depthwise-separable full-resolution prediction refinement."""
+
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__(
+            ConvBNAct(
+                in_channels,
+                in_channels,
+                3,
+                groups=in_channels,
+            ),
+            ConvBNAct(in_channels, out_channels, 1, padding=0),
+        )
+
+
+class RoadReconstructionDecoder(nn.Module):
+    """S8-to-S1 road decoder with S4/S2 skips and one centerline head."""
 
     def __init__(
         self,
         stem_channels: int = 64,
         shallow_channels: int = 64,
-        middle_channels: int = 128,
-        deep_channels: int = 96,
-        decoder_channels: int = 96,
-        half_channels: int = 48,
+        fused_channels: int = 96,
+        s4_channels: int = 64,
+        s2_channels: int = 32,
+        full_channels: int = 24,
         num_classes: int = 2,
         dropout: float = 0.05,
         deploy: bool = False,
     ) -> None:
         super().__init__()
-        self.semantic_refine = SemanticSpatialRefinement(
-            shallow_channels, deep_channels
-        )
+        shallow_skip_channels = max(24, s4_channels // 2)
+        stem_skip_channels = max(16, s2_channels // 2)
 
-        # Three features meet only at OS4. Additive fusion keeps memory and
-        # parameters far below concatenation-heavy U-Net decoders.
+        self.fused_proj = ConvBNAct(fused_channels, s4_channels, 1, padding=0)
         self.shallow_proj = ConvBNAct(
-            shallow_channels, decoder_channels, 1, padding=0
+            shallow_channels, shallow_skip_channels, 1, padding=0
         )
-        self.middle_proj = ConvBNAct(
-            middle_channels, decoder_channels, 1, padding=0
+        self.s4_fuse = ConvBNAct(
+            s4_channels + shallow_skip_channels,
+            s4_channels,
+            1,
+            padding=0,
         )
-        self.deep_proj = ConvBNAct(
-            deep_channels, decoder_channels, 1, padding=0
-        )
-        self.p4_refine = RepVGGBlock(
-            decoder_channels, decoder_channels, deploy=deploy
+        self.s4_refine = nn.Sequential(
+            RepDepthwiseBlock(s4_channels, deploy=deploy),
+            RepDepthwiseBlock(s4_channels, deploy=deploy),
         )
 
-        self.p4_to_p2 = ConvBNAct(
-            decoder_channels, half_channels, 1, padding=0
+        self.stem_proj = ConvBNAct(
+            stem_channels, stem_skip_channels, 1, padding=0
         )
-        self.stem_proj = ConvBNAct(stem_channels, half_channels, 1, padding=0)
-        self.p2_refine = RepVGGBlock(
-            half_channels, half_channels, deploy=deploy
+        self.s2_fuse = ConvBNAct(
+            s4_channels + stem_skip_channels,
+            s2_channels,
+            1,
+            padding=0,
         )
+        self.s2_refine = nn.Sequential(
+            RepDepthwiseBlock(s2_channels, deploy=deploy),
+            RepDepthwiseBlock(s2_channels, deploy=deploy),
+        )
+
+        self.full_refine = SeparableConvBNAct(s2_channels, full_channels)
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
-        self.classifier = nn.Conv2d(half_channels, num_classes, 1)
+        self.classifier = nn.Conv2d(full_channels, num_classes, 1)
 
-        # The only auxiliary. It is never evaluated at inference time.
-        aux_channels = max(24, decoder_channels // 2)
+        auxiliary_channels = max(24, s4_channels // 2)
         self.centerline_head = nn.Sequential(
-            ConvBNAct(decoder_channels, aux_channels, 3),
-            nn.Conv2d(aux_channels, 1, 1),
+            ConvBNAct(s4_channels, auxiliary_channels, 3),
+            nn.Conv2d(auxiliary_channels, 1, 1),
         )
 
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
-        return F.interpolate(
-            x, size=size, mode="bilinear", align_corners=False
-        )
+        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
     def forward(
         self,
         stem_s2: Tensor,
         shallow_s4: Tensor,
-        middle_s8: Tensor,
-        deep_s16: Tensor,
+        fused_s8: Tensor,
         output_size: Tuple[int, int],
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        shallow_s4 = self.semantic_refine(shallow_s4, deep_s16)
-        p4_size = shallow_s4.shape[-2:]
-        p4 = self.shallow_proj(shallow_s4)
-        p4 = p4 + self._resize(self.middle_proj(middle_s8), p4_size)
-        p4 = p4 + self._resize(self.deep_proj(deep_s16), p4_size)
-        p4 = self.p4_refine(p4)
+        p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
+        p4 = self.s4_fuse(torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1))
+        p4 = self.s4_refine(p4)
 
-        p2 = self._resize(self.p4_to_p2(p4), stem_s2.shape[-2:])
-        p2 = self.p2_refine(p2 + self.stem_proj(stem_s2))
-        road_logits = self.classifier(self.dropout(p2))
-        road_logits = self._resize(road_logits, output_size)
+        p2 = self._resize(p4, stem_s2.shape[-2:])
+        p2 = self.s2_fuse(torch.cat((p2, self.stem_proj(stem_s2)), dim=1))
+        p2 = self.s2_refine(p2)
 
+        full = self._resize(p2, output_size)
+        road_logits = self.classifier(self.dropout(self.full_refine(full)))
         if self.training:
             return self.centerline_head(p4), road_logits
         return road_logits
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
-            if isinstance(module, RepVGGBlock):
+            if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
                 module.switch_to_deploy()
 
 
@@ -324,8 +457,8 @@ def _soft_open(mask: Tensor) -> Tensor:
     return _soft_dilate(_soft_erode(mask))
 
 
-def soft_skeletonize(mask: Tensor, iterations: int = 6) -> Tensor:
-    """Differentiability is not required; this creates a target from the mask."""
+def soft_skeletonize(mask: Tensor, iterations: int = 8) -> Tensor:
+    """Morphological skeleton target generation using only PyTorch ops."""
     opened = _soft_open(mask)
     skeleton = F.relu(mask - opened)
     for _ in range(max(0, int(iterations))):
@@ -346,25 +479,49 @@ def binary_dice_loss(
     return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
 
 
-class RoadSegCenterlineLoss(nn.Module):
-    """Weighted road CE + Dice and one centerline BCE + Dice auxiliary."""
+def binary_tversky_loss(
+    probability: Tensor,
+    target: Tensor,
+    alpha: float = 0.30,
+    beta: float = 0.70,
+    eps: float = 1e-6,
+) -> Tensor:
+    """One centerline loss; beta > alpha penalizes broken roads more."""
+    probability = probability.float().flatten(1)
+    target = target.float().flatten(1)
+    true_positive = (probability * target).sum(dim=1)
+    false_positive = (probability * (1.0 - target)).sum(dim=1)
+    false_negative = ((1.0 - probability) * target).sum(dim=1)
+    score = (true_positive + eps) / (
+        true_positive
+        + float(alpha) * false_positive
+        + float(beta) * false_negative
+        + eps
+    )
+    return (1.0 - score).mean()
+
+
+class RoadSegCenterlineTverskyLoss(nn.Module):
+    """Main road CE+Dice and exactly one auxiliary centerline Tversky."""
 
     def __init__(
         self,
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
         aux_weight: float = 0.20,
-        centerline_pos_weight: float = 8.0,
-        centerline_dice_weight: float = 1.0,
-        skeleton_iterations: int = 6,
+        centerline_alpha: float = 0.30,
+        centerline_beta: float = 0.70,
+        skeleton_iterations: int = 8,
+        centerline_dilation: int = 1,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
         self.main_dice_weight = float(main_dice_weight)
         self.aux_weight = float(aux_weight)
-        self.centerline_pos_weight = float(centerline_pos_weight)
-        self.centerline_dice_weight = float(centerline_dice_weight)
+        self.centerline_alpha = float(centerline_alpha)
+        self.centerline_beta = float(centerline_beta)
         self.skeleton_iterations = int(skeleton_iterations)
+        self.centerline_dilation = int(centerline_dilation)
 
     def forward(
         self,
@@ -381,55 +538,49 @@ class RoadSegCenterlineLoss(nn.Module):
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
 
-        # Build the topology-oriented target on GPU, then supervise at OS4.
         with torch.no_grad():
             centerline_target = soft_skeletonize(
                 road_mask.float(), self.skeleton_iterations
             )
-            centerline_target = F.interpolate(
-                centerline_target,
-                size=centerline_logits.shape[-2:],
-                mode="nearest",
+            if self.centerline_dilation > 0:
+                kernel = 2 * self.centerline_dilation + 1
+                centerline_target = F.max_pool2d(
+                    centerline_target,
+                    kernel,
+                    stride=1,
+                    padding=self.centerline_dilation,
+                )
+            # Max pooling preserves a thin centerline when mapping HxW to S4.
+            centerline_target = F.adaptive_max_pool2d(
+                centerline_target, centerline_logits.shape[-2:]
             )
-        centerline_logits_f = centerline_logits.float()
-        pos_weight = centerline_logits_f.new_tensor(
-            [self.centerline_pos_weight]
-        )
-        loss_centerline_bce = F.binary_cross_entropy_with_logits(
-            centerline_logits_f,
+
+        loss_centerline = binary_tversky_loss(
+            centerline_logits.float().sigmoid(),
             centerline_target,
-            pos_weight=pos_weight,
-        )
-        loss_centerline_dice = binary_dice_loss(
-            centerline_logits_f.sigmoid(), centerline_target
-        )
-        loss_aux = (
-            loss_centerline_bce
-            + self.centerline_dice_weight * loss_centerline_dice
+            alpha=self.centerline_alpha,
+            beta=self.centerline_beta,
         )
         total = (
             loss_main_ce
             + self.main_dice_weight * loss_main_dice
-            + self.aux_weight * loss_aux
+            + self.aux_weight * loss_centerline
         )
         return {
             "loss_total": total,
             "loss_main_ce": loss_main_ce.detach(),
             "loss_main_dice": loss_main_dice.detach(),
-            "loss_aux_centerline": loss_aux.detach(),
-            "loss_centerline_bce": loss_centerline_bce.detach(),
-            "loss_centerline_dice": loss_centerline_dice.detach(),
+            "loss_aux_centerline": loss_centerline.detach(),
+            "loss_centerline_tversky": loss_centerline.detach(),
         }
 
 
 @torch.no_grad()
 def verify_reparameterization(
-    block: RepVGGBlock,
-    shape: Tuple[int, int, int, int] = (2, 48, 32, 32),
+    block: Union[RepVGGBlock, RepDepthwiseBlock],
+    shape: Tuple[int, int, int, int],
 ) -> float:
-    """Return maximum absolute error before/after RepVGG fusion."""
-    if block.in_channels != shape[1]:
-        raise ValueError("shape channels must match block.in_channels")
+    """Return max absolute output error before and after branch fusion."""
     block.eval()
     x = torch.randn(shape, device=next(block.parameters()).device)
     reference = block(x)
