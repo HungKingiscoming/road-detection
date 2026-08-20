@@ -1,8 +1,8 @@
-from .decoder import RoadSegCenterlineLoss
-from .model import CompactRoadNet, build_model
+from .decoder import RoadSegCenterlineTverskyLoss
+from .model import DualBranchRoadNet, build_model
 
 __all__ = [
-    "CompactRoadNet",
-    "RoadSegCenterlineLoss",
+    "DualBranchRoadNet",
+    "RoadSegCenterlineTverskyLoss",
     "build_model",
 ]
