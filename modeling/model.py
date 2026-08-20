@@ -1,15 +1,17 @@
-"""Compact local-global road extraction network.
+"""Dual-resolution ResNet road extraction network.
 
 Architecture
 ------------
-* one ImageNet-pretrained ResNet-34 encoder truncated after ``layer3`` (OS16);
-* one compact bilateral bottleneck at OS16;
-* local branch: a re-parameterizable RepVGG block at 96 channels;
-* global branch: 96 -> 32, pooled grids 1/2/4/8, depthwise processing,
-  aggregation, then 32 -> 96;
-* a light asymmetric additive decoder, not a second U-Net;
-* one centerline auxiliary head used during training only.
+* ImageNet ResNet-34 is shared through layer2 (output stride 8).
+* The detail branch remains narrow at stride 8.
+* The semantic branch uses ResNet layer3 at stride 16, a lightweight stride-32
+  stage, and a progressive DAPPM.
+* Two bilateral exchanges connect detail S8 with semantic S16/S32.
+* The branches merge at S8 and a road decoder restores S4, S2, and S1.
+* One train-only centerline head is supervised by Tversky loss.
 
+The network exposes stable optimizer groups and autograd-safe progressive
+unfreezing for DDP transfer learning.
 """
 
 from __future__ import annotations
@@ -22,7 +24,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .decoder import CompactRoadDecoder, ConvBNAct, RepVGGBlock
+from .decoder import (
+    ConvBNAct,
+    ConvGNAct,
+    RepDepthwiseBlock,
+    RepVGGBlock,
+    RoadReconstructionDecoder,
+)
 
 
 def _extract_state_dict(checkpoint: object) -> Dict[str, Tensor]:
@@ -61,11 +69,8 @@ def _build_resnet34(
         )
         backbone = resnet34(weights=weights)
     except ImportError as error:
-        raise ImportError(
-            "torchvision is required for the ResNet-34 encoder"
-        ) from error
+        raise ImportError("torchvision is required for ResNet-34") from error
     except TypeError:
-        # torchvision < 0.13 compatibility.
         from torchvision.models import resnet34
 
         backbone = resnet34(
@@ -81,20 +86,17 @@ def _build_resnet34(
         except TypeError:
             checkpoint = torch.load(path, map_location="cpu")
         state = _extract_state_dict(checkpoint)
-        missing, unexpected = backbone.load_state_dict(state, strict=False)
-        # layer4/fc may be absent in a deliberately truncated checkpoint.  A
-        # completely unrelated file, however, should fail loudly.
+        missing, _ = backbone.load_state_dict(state, strict=False)
         matched = len(backbone.state_dict()) - len(missing)
         if matched < 100:
             raise RuntimeError(
                 f"Only {matched} ResNet tensors matched {path}; wrong weights?"
             )
-        del unexpected
     return backbone
 
 
 class TruncatedResNet34(nn.Module):
-    """ResNet-34 feature encoder returning strides 2, 4, 8, and 16."""
+    """Return ResNet features C2/S2, C4/S4, C8/S8, and C16/S16."""
 
     out_channels = (64, 64, 128, 256)
 
@@ -117,118 +119,210 @@ class TruncatedResNet34(nn.Module):
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         stem_s2 = self.stem(x)
         shallow_s4 = self.layer1(self.maxpool(stem_s2))
-        middle_s8 = self.layer2(shallow_s4)
-        deep_s16 = self.layer3(middle_s8)
-        return stem_s2, shallow_s4, middle_s8, deep_s16
+        shared_s8 = self.layer2(shallow_s4)
+        semantic_s16 = self.layer3(shared_s8)
+        return stem_s2, shallow_s4, shared_s8, semantic_s16
 
 
-class GlobalPoolBranch(nn.Module):
-    """Pool cheaply, resize, then apply spatial depthwise processing."""
-
-    def __init__(self, channels: int, pool_size: int) -> None:
-        super().__init__()
-        self.pool_size = int(pool_size)
-        groups = 8 if channels % 8 == 0 else 1
-        self.channel_mix = nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.GroupNorm(groups, channels),
-            nn.ReLU(inplace=True),
-        )
-        self.depthwise = nn.Sequential(
-            nn.Conv2d(
-                channels,
-                channels,
-                3,
-                padding=1,
-                groups=channels,
-                bias=False,
-                padding_mode="replicate",
-            ),
-            nn.GroupNorm(groups, channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: Tensor, output_size: Tuple[int, int]) -> Tensor:
-        x = F.adaptive_avg_pool2d(x, self.pool_size)
-        x = self.channel_mix(x)
-        x = F.interpolate(
-            x, size=output_size, mode="bilinear", align_corners=False
-        )
-        return self.depthwise(x)
+def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
+    return nn.Sequential(
+        *[
+            RepVGGBlock(channels, channels, deploy=deploy)
+            for _ in range(max(1, int(blocks)))
+        ]
+    )
 
 
-class CompactPyramidGlobal(nn.Module):
-    """96 -> 32 multi-grid context -> 96 with depthwise spatial mixing."""
+class ProgressiveDAPPM(nn.Module):
+    """Progressively aggregate adaptive pooled context at the semantic S32 map.
+
+    GroupNorm keeps the global 1x1 branch valid for small per-GPU batches.
+    Pooling proceeds from finer to coarser grids, so each stage adds broader
+    context to the previous representation before concatenation.
+    """
 
     def __init__(
         self,
-        channels: int = 96,
-        global_channels: int = 32,
+        in_channels: int,
+        branch_channels: int,
+        out_channels: int,
         pool_sizes: Sequence[int] = (1, 2, 4, 8),
     ) -> None:
         super().__init__()
-        pool_sizes = tuple(sorted({int(size) for size in pool_sizes}))
-        if not pool_sizes or pool_sizes[0] < 1:
-            raise ValueError("pool_sizes must contain positive integers")
-        self.pool_sizes = pool_sizes
-        self.reduce = ConvBNAct(channels, global_channels, 1, padding=0)
-        self.branches = nn.ModuleList(
-            GlobalPoolBranch(global_channels, size) for size in pool_sizes
+        sizes = tuple(sorted({int(size) for size in pool_sizes}, reverse=True))
+        if not sizes or min(sizes) < 1:
+            raise ValueError("DAPPM pool sizes must be positive")
+        self.pool_sizes = sizes
+        self.scale0 = ConvGNAct(in_channels, branch_channels, 1, padding=0)
+        self.pool_projections = nn.ModuleList(
+            ConvGNAct(in_channels, branch_channels, 1, padding=0)
+            for _ in sizes
         )
-        self.expand = ConvBNAct(
-            global_channels, channels, 1, padding=0, activation=False
+        self.processes = nn.ModuleList(
+            ConvGNAct(branch_channels, branch_channels, 3)
+            for _ in sizes
         )
+        self.compression = ConvGNAct(
+            branch_channels * (len(sizes) + 1),
+            out_channels,
+            1,
+            padding=0,
+            activation=False,
+        )
+        self.shortcut = ConvGNAct(
+            in_channels,
+            out_channels,
+            1,
+            padding=0,
+            activation=False,
+        )
+        self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.reduce(x)
         output_size = x.shape[-2:]
-        context = torch.stack(
-            [branch(x, output_size) for branch in self.branches], dim=0
-        ).mean(dim=0)
-        return self.expand(context)
+        previous = self.scale0(x)
+        outputs = [previous]
+        for configured_size, projection, process in zip(
+            self.pool_sizes, self.pool_projections, self.processes
+        ):
+            grid = max(1, min(configured_size, *output_size))
+            pooled = F.adaptive_avg_pool2d(x, (grid, grid))
+            pooled = projection(pooled)
+            pooled = F.interpolate(
+                pooled,
+                size=output_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            previous = process(previous + pooled)
+            outputs.append(previous)
+        context = self.compression(torch.cat(outputs, dim=1))
+        return self.activation(context + self.shortcut(x))
 
 
-class CompactLocalGlobalBottleneck(nn.Module):
-    """Bilateral local/global processing at OS16 with gated residual fusion."""
+class DualResolutionContext(nn.Module):
+    """Detail S8 and semantic S16/S32 branches with two bilateral fusions."""
 
     def __init__(
         self,
-        in_channels: int = 256,
-        channels: int = 96,
-        global_channels: int = 32,
-        pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        detail_channels: int = 96,
+        semantic_channels: int = 192,
+        dappm_channels: int = 32,
+        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        detail_blocks: Sequence[int] = (2, 2, 1),
+        semantic_blocks: int = 2,
+        fusion_blocks: int = 2,
         deploy: bool = False,
     ) -> None:
         super().__init__()
-        self.reduce = ConvBNAct(in_channels, channels, 1, padding=0)
-        self.local = RepVGGBlock(channels, channels, deploy=deploy)
-        self.global_context = CompactPyramidGlobal(
-            channels=channels,
-            global_channels=global_channels,
-            pool_sizes=pool_sizes,
+        if len(detail_blocks) != 3:
+            raise ValueError("detail_blocks must contain three stage depths")
+        self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
+        self.detail_stages = nn.ModuleList(
+            _rep_stage(detail_channels, depth, deploy)
+            for depth in detail_blocks
         )
-        self.fusion_gate = nn.Conv2d(channels * 2, channels, 1, bias=True)
-        nn.init.zeros_(self.fusion_gate.weight)
-        nn.init.zeros_(self.fusion_gate.bias)
-        self.refine = RepVGGBlock(channels, channels, deploy=deploy)
 
-    def forward(self, x: Tensor) -> Tensor:
-        residual = self.reduce(x)
-        local = self.local(residual)
-        global_context = self.global_context(residual)
-        gate = torch.sigmoid(
-            self.fusion_gate(torch.cat((local, global_context), dim=1))
+        self.semantic_downstage = nn.Sequential(
+            ConvBNAct(256, semantic_channels, 3, stride=2),
+            _rep_stage(semantic_channels, semantic_blocks, deploy),
         )
-        fused = residual + gate * local + (1.0 - gate) * global_context
-        return self.refine(fused)
+
+        # S16 <-> S8. Only detail-to-semantic is zero-initialized, protecting
+        # the pretrained ResNet semantic representation at the start.
+        self.semantic_to_detail_1 = ConvBNAct(
+            256, detail_channels, 1, padding=0, activation=False
+        )
+        self.detail_to_semantic_1 = ConvBNAct(
+            detail_channels,
+            256,
+            3,
+            stride=2,
+            activation=False,
+            zero_init_bn=True,
+        )
+
+        # S32 <-> S8. The detail path is downsampled twice to align exactly.
+        self.semantic_to_detail_2 = ConvBNAct(
+            semantic_channels,
+            detail_channels,
+            1,
+            padding=0,
+            activation=False,
+        )
+        intermediate_channels = max(128, detail_channels)
+        self.detail_to_semantic_2 = nn.Sequential(
+            ConvBNAct(
+                detail_channels,
+                intermediate_channels,
+                3,
+                stride=2,
+            ),
+            ConvBNAct(
+                intermediate_channels,
+                semantic_channels,
+                3,
+                stride=2,
+                activation=False,
+                zero_init_bn=True,
+            ),
+        )
+
+        self.dappm = ProgressiveDAPPM(
+            semantic_channels,
+            dappm_channels,
+            detail_channels,
+            pool_sizes=dappm_pool_sizes,
+        )
+        self.final_refine = _rep_stage(detail_channels, fusion_blocks, deploy)
+        self.activation = nn.ReLU(inplace=True)
+
+    @staticmethod
+    def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
+        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+
+    def forward(self, shared_s8: Tensor, semantic_s16: Tensor) -> Tensor:
+        detail = self.detail_stages[0](self.detail_projection(shared_s8))
+        semantic = semantic_s16
+
+        detail_before, semantic_before = detail, semantic
+        detail = self.activation(
+            detail_before
+            + self._resize(
+                self.semantic_to_detail_1(semantic_before),
+                detail_before.shape[-2:],
+            )
+        )
+        semantic = self.activation(
+            semantic_before + self.detail_to_semantic_1(detail_before)
+        )
+
+        detail = self.detail_stages[1](detail)
+        semantic = self.semantic_downstage(semantic)
+        detail_before, semantic_before = detail, semantic
+        detail = self.activation(
+            detail_before
+            + self._resize(
+                self.semantic_to_detail_2(semantic_before),
+                detail_before.shape[-2:],
+            )
+        )
+        semantic = self.activation(
+            semantic_before + self.detail_to_semantic_2(detail_before)
+        )
+
+        detail = self.detail_stages[2](detail)
+        semantic = self.dappm(semantic)
+        semantic = self._resize(semantic, detail.shape[-2:])
+        return self.final_refine(detail + semantic)
 
 
-class CompactRoadNet(nn.Module):
-    """Resource-efficient road model with progressive-unfreezing support."""
+class DualBranchRoadNet(nn.Module):
+    """Dual-resolution road model with progressive-unfreezing support."""
 
     PHASE_NAMES = {
         0: "head_only",
-        1: "head_plus_bottleneck",
+        1: "head_plus_dual_branch",
         2: "plus_resnet_layer3",
         3: "plus_resnet_layer2",
         4: "all_trainable",
@@ -237,11 +331,16 @@ class CompactRoadNet(nn.Module):
     def __init__(
         self,
         num_classes: int = 2,
-        bottleneck_channels: int = 96,
-        global_channels: int = 32,
-        decoder_channels: int = 96,
-        half_channels: int = 48,
-        pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        detail_channels: int = 96,
+        semantic_channels: int = 192,
+        dappm_channels: int = 32,
+        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        detail_blocks: Sequence[int] = (2, 2, 1),
+        semantic_blocks: int = 2,
+        fusion_blocks: int = 2,
+        decoder_s4_channels: int = 64,
+        decoder_s2_channels: int = 32,
+        full_channels: int = 24,
         dropout: float = 0.05,
         imagenet_pretrained: bool = True,
         encoder_weights_path: Optional[str] = None,
@@ -252,20 +351,23 @@ class CompactRoadNet(nn.Module):
             imagenet_pretrained=imagenet_pretrained,
             encoder_weights_path=encoder_weights_path,
         )
-        self.bottleneck = CompactLocalGlobalBottleneck(
-            in_channels=256,
-            channels=bottleneck_channels,
-            global_channels=global_channels,
-            pool_sizes=pool_sizes,
+        self.dual_branch = DualResolutionContext(
+            detail_channels=detail_channels,
+            semantic_channels=semantic_channels,
+            dappm_channels=dappm_channels,
+            dappm_pool_sizes=dappm_pool_sizes,
+            detail_blocks=detail_blocks,
+            semantic_blocks=semantic_blocks,
+            fusion_blocks=fusion_blocks,
             deploy=deploy,
         )
-        self.decode_head = CompactRoadDecoder(
+        self.decode_head = RoadReconstructionDecoder(
             stem_channels=64,
             shallow_channels=64,
-            middle_channels=128,
-            deep_channels=bottleneck_channels,
-            decoder_channels=decoder_channels,
-            half_channels=half_channels,
+            fused_channels=detail_channels,
+            s4_channels=decoder_s4_channels,
+            s2_channels=decoder_s2_channels,
+            full_channels=full_channels,
             num_classes=num_classes,
             dropout=dropout,
             deploy=deploy,
@@ -274,44 +376,32 @@ class CompactRoadNet(nn.Module):
 
     def forward(self, image: Tensor):
         output_size = image.shape[-2:]
-        # During progressive fine-tuning, frozen stages run under no_grad.
-        # Parameters keep requires_grad=True so DDP hooks remain valid when a
-        # later epoch opens the stage; find_unused_parameters handles the
-        # temporarily detached stages.
         if not self.training or self.current_phase >= 4:
-            stem, shallow, middle, deep = self.encoder(image)
+            stem, shallow, shared, semantic = self.encoder(image)
         elif self.current_phase <= 1:
             with torch.no_grad():
-                stem, shallow, middle, deep = self.encoder(image)
+                stem, shallow, shared, semantic = self.encoder(image)
         elif self.current_phase == 2:
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
-                middle = self.encoder.layer2(shallow)
-            deep = self.encoder.layer3(middle)
+                shared = self.encoder.layer2(shallow)
+            semantic = self.encoder.layer3(shared)
         else:
             with torch.no_grad():
                 stem = self.encoder.stem(image)
                 shallow = self.encoder.layer1(self.encoder.maxpool(stem))
-            middle = self.encoder.layer2(shallow)
-            deep = self.encoder.layer3(middle)
+            shared = self.encoder.layer2(shallow)
+            semantic = self.encoder.layer3(shared)
 
         if self.training and self.current_phase == 0:
             with torch.no_grad():
-                deep = self.bottleneck(deep)
+                fused = self.dual_branch(shared, semantic)
         else:
-            deep = self.bottleneck(deep)
-        return self.decode_head(
-            stem, shallow, middle, deep, output_size=output_size
-        )
+            fused = self.dual_branch(shared, semantic)
+        return self.decode_head(stem, shallow, fused, output_size)
 
     def set_trainable_phase(self, phase: int) -> str:
-        """Configure the requested fine-tuning phase.
-
-        This changes the autograd path rather than mutating ``requires_grad``.
-        That distinction makes gradual unfreezing safe after DDP has installed
-        its reducer hooks.  Optimizer groups also stay stable across phases.
-        """
         phase = int(phase)
         if phase not in self.PHASE_NAMES:
             raise ValueError(f"Unknown trainable phase: {phase}")
@@ -319,10 +409,9 @@ class CompactRoadNet(nn.Module):
         return self.PHASE_NAMES[phase]
 
     def enforce_frozen_norm_eval(self, freeze_encoder_bn: bool = True) -> None:
-        """Prevent small per-GPU batches from corrupting pretrained BN stats."""
         frozen_modules: list[nn.Module] = []
         if self.current_phase == 0:
-            frozen_modules.append(self.bottleneck)
+            frozen_modules.append(self.dual_branch)
         if self.current_phase <= 1:
             frozen_modules.append(self.encoder.layer3)
         if self.current_phase <= 2:
@@ -342,7 +431,7 @@ class CompactRoadNet(nn.Module):
         total = sum(parameter.numel() for parameter in self.parameters())
         modules: list[nn.Module] = [self.decode_head]
         if self.current_phase >= 1:
-            modules.append(self.bottleneck)
+            modules.append(self.dual_branch)
         if self.current_phase >= 2:
             modules.append(self.encoder.layer3)
         if self.current_phase >= 3:
@@ -357,10 +446,9 @@ class CompactRoadNet(nn.Module):
         return trainable, total
 
     def optimization_modules(self) -> Dict[str, Iterable[nn.Parameter]]:
-        """Stable module groups for head/bottleneck/backbone differential LR."""
         return {
             "head": self.decode_head.parameters(),
-            "bottleneck": self.bottleneck.parameters(),
+            "dual_branch": self.dual_branch.parameters(),
             "layer3": self.encoder.layer3.parameters(),
             "layer2": self.encoder.layer2.parameters(),
             "early_encoder": (
@@ -372,19 +460,24 @@ class CompactRoadNet(nn.Module):
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
-            if isinstance(module, RepVGGBlock):
+            if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
                 module.switch_to_deploy()
 
 
-def build_model(args) -> CompactRoadNet:
-    """Build from an argparse Namespace or another attribute container."""
-    return CompactRoadNet(
+def build_model(args) -> DualBranchRoadNet:
+    """Build from an argparse Namespace or compatible attribute container."""
+    return DualBranchRoadNet(
         num_classes=2,
-        bottleneck_channels=int(args.bottleneck_channels),
-        global_channels=int(args.global_channels),
-        decoder_channels=int(args.decoder_channels),
-        half_channels=int(args.half_channels),
-        pool_sizes=tuple(int(value) for value in args.global_pool_sizes),
+        detail_channels=int(args.detail_channels),
+        semantic_channels=int(args.semantic_channels),
+        dappm_channels=int(args.dappm_channels),
+        dappm_pool_sizes=tuple(int(value) for value in args.dappm_pool_sizes),
+        detail_blocks=tuple(int(value) for value in args.detail_blocks),
+        semantic_blocks=int(args.semantic_blocks),
+        fusion_blocks=int(args.fusion_blocks),
+        decoder_s4_channels=int(args.decoder_s4_channels),
+        decoder_s2_channels=int(args.decoder_s2_channels),
+        full_channels=int(args.full_channels),
         dropout=float(args.dropout),
         imagenet_pretrained=bool(args.imagenet_pretrained),
         encoder_weights_path=args.encoder_weights_path,
