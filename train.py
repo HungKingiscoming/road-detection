@@ -26,7 +26,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from time import perf_counter
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -656,16 +655,7 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
                 )
     if len(seen) != len(list(model.parameters())):
         raise RuntimeError("Some model parameters were not assigned to the optimizer")
-    optimizer_kwargs = {"betas": (0.9, 0.999)}
-    try:
-        return AdamW(
-            groups,
-            fused=bool(torch.cuda.is_available()),
-            **optimizer_kwargs,
-        )
-    except (TypeError, RuntimeError):
-        # Compatibility fallback for older PyTorch builds/accelerators.
-        return AdamW(groups, **optimizer_kwargs)
+    return AdamW(groups, betas=(0.9, 0.999))
 
 
 def build_scheduler(
@@ -765,7 +755,6 @@ def train_one_epoch(
     epoch: int,
     args: argparse.Namespace,
 ) -> Dict[str, float]:
-    epoch_start = perf_counter()
     model.train()
     base_model = unwrap_model(model)
     base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
@@ -786,7 +775,6 @@ def train_one_epoch(
         desc=f"Train {epoch + 1:03d}",
         leave=False,
         disable=not is_main_process(),
-        mininterval=1.0,
     )
     for step, (images, masks) in enumerate(progress):
         images = images.to(device, non_blocking=True)
@@ -810,10 +798,17 @@ def train_one_epoch(
             ):
                 losses = criterion(model(images), masks)
                 scaled_loss = losses["loss_total"] / group_size
-            # All ranks always enter backward. DDP propagates non-finite
-            # gradients across ranks and GradScaler then skips the update on
-            # every rank consistently. This removes a blocking all-reduce and
-            # two device synchronizations from every healthy batch.
+            finite = torch.tensor(
+                int(torch.isfinite(scaled_loss).item()),
+                dtype=torch.int32,
+                device=device,
+            )
+            if distributed_active():
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+            if not bool(finite.item()):
+                skipped_nonfinite += 1
+                optimizer.zero_grad(set_to_none=True)
+                continue
             scaler.scale(scaled_loss).backward()
 
         if do_update:
@@ -827,22 +822,13 @@ def train_one_epoch(
                 scheduler.step()
                 ema.update(base_model)
                 successful_updates += 1
-            else:
-                skipped_nonfinite += 1
 
         batch = int(images.shape[0])
-        # One device-to-host copy replaces five scalar synchronizations.
-        metric_values = torch.stack(
-            (
-                losses["loss_total"].detach(),
-                losses["loss_main_ce"],
-                losses["loss_main_dice"],
-                losses["loss_aux_centerline"],
-                (masks > 0).float().mean(),
-            )
-        ).float().cpu().tolist()
-        for name, value in zip(meters, metric_values):
-            meters[name].update(value, batch)
+        meters["total"].update(float(losses["loss_total"].detach()), batch)
+        meters["main_ce"].update(float(losses["loss_main_ce"]), batch)
+        meters["main_dice"].update(float(losses["loss_main_dice"]), batch)
+        meters["aux"].update(float(losses["loss_aux_centerline"]), batch)
+        meters["road_fraction"].update(float((masks > 0).float().mean()), batch)
         progress.set_postfix(
             loss=f"{meters['total'].mean:.4f}",
             lr=f"{head_lr(optimizer):.2e}",
@@ -863,14 +849,11 @@ def train_one_epoch(
         )
         dist.all_reduce(counters, op=dist.ReduceOp.MAX)
         successful_updates, skipped_nonfinite = map(int, counters.tolist())
-    elapsed = max(perf_counter() - epoch_start, 1e-6)
     return {name: meter.mean for name, meter in meters.items()} | {
         "lr": head_lr(optimizer),
         "aux_weight": criterion.aux_weight,
         "successful_updates": float(successful_updates),
         "skipped_nonfinite": float(skipped_nonfinite),
-        "seconds": elapsed,
-        "images_per_second": meters["total"].count / elapsed,
     }
 
 
@@ -1302,12 +1285,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--centerline_beta", type=float, default=0.70)
     parser.add_argument("--centerline_dilation", type=int, default=1)
     parser.add_argument("--skeleton_iterations", type=int, default=8)
-    parser.add_argument(
-        "--fast_centerline_target",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skeletonize directly at the auxiliary S4 resolution",
-    )
 
     parser.add_argument(
         "--progressive_unfreeze",
@@ -1525,10 +1502,10 @@ def main() -> None:
         )
     )
     if distributed and rank != 0 and needs_imagenet_cache:
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
     model = build_model(build_args).to(device)
     if distributed and rank == 0 and needs_imagenet_cache:
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     if args.pretrained_checkpoint:
@@ -1554,7 +1531,6 @@ def main() -> None:
         centerline_beta=args.centerline_beta,
         skeleton_iterations=args.skeleton_iterations,
         centerline_dilation=args.centerline_dilation,
-        fast_centerline_target=args.fast_centerline_target,
     ).to(device)
 
     start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
@@ -1605,10 +1581,6 @@ def main() -> None:
         f"(alpha={args.centerline_alpha:.2f}, beta={args.centerline_beta:.2f})"
     )
     rank_zero_print(
-        "centerline target="
-        + ("fast S4 morphology" if args.fast_centerline_target else "full resolution")
-    )
-    rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
         f"epochs={args.epochs} | head LR={args.lr:.2e}"
     )
@@ -1650,7 +1622,6 @@ def main() -> None:
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
-                f"throughput={train_metrics['images_per_second']:.1f} img/s | "
                 f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
