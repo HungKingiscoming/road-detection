@@ -1,17 +1,3 @@
-"""Road reconstruction decoder and its single centerline supervision.
-
-The decoder restores spatial detail in two inexpensive stages (S8 -> S4 ->
-S2), then predicts the full-resolution road mask. During training it also
-returns one S4 centerline logit map. The auxiliary head is discarded during
-evaluation and is supervised by one Tversky loss only::
-
-    L = CE_road + lambda_dice * Dice_road
-        + lambda_aux * Tversky_centerline
-
-There is no auxiliary BCE, auxiliary Dice, boundary loss, Lovasz loss, or
-attention/Transformer dependency.
-"""
-
 from __future__ import annotations
 
 import math
