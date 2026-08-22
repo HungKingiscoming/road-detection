@@ -9,11 +9,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .decoder import (
+    ConvBN,
     ConvBNAct,
     ConvGNAct,
+    ModernRoadDecoder,
     RepDepthwiseBlock,
     RepVGGBlock,
-    RoadReconstructionDecoder,
+    _fuse_conv_bn,
 )
 
 
@@ -80,7 +82,7 @@ def _build_resnet34(
 
 
 class TruncatedResNet34(nn.Module):
-    """Return ResNet features C2/S2, C4/S4, C8/S8, and C16/S16."""
+    """ImageNet ResNet-34 stages required by the two-stream model."""
 
     out_channels = (64, 64, 128, 256)
 
@@ -100,51 +102,245 @@ class TruncatedResNet34(nn.Module):
         self.layer2 = backbone.layer2
         self.layer3 = backbone.layer3
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        stem_s2 = self.stem(x)
-        shallow_s4 = self.layer1(self.maxpool(stem_s2))
-        shared_s8 = self.layer2(shallow_s4)
-        semantic_s16 = self.layer3(shared_s8)
-        return stem_s2, shallow_s4, shared_s8, semantic_s16
+
+class SqueezeExcite(nn.Module):
+    """Small channel gate used only on low-resolution semantic maps."""
+
+    def __init__(self, channels: int, reduction: int = 8) -> None:
+        super().__init__()
+        hidden = max(8, channels // max(1, reduction))
+        self.reduce = nn.Conv2d(channels, hidden, 1)
+        self.expand = nn.Conv2d(hidden, channels, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        gate = F.adaptive_avg_pool2d(x, 1)
+        gate = F.relu(self.reduce(gate), inplace=True)
+        return x * torch.sigmoid(self.expand(gate))
 
 
-def _rep_stage(channels: int, blocks: int, deploy: bool) -> nn.Sequential:
+class UniversalInvertedBottleneck(nn.Module):
+    """Efficient Extra-DW UIB instantiation inspired by MobileNetV4."""
+
+    def __init__(
+        self,
+        channels: int,
+        expansion: float = 1.5,
+        start_kernel: int = 5,
+        middle_kernel: int = 3,
+    ) -> None:
+        super().__init__()
+        hidden = max(channels, int(round(channels * expansion / 8.0)) * 8)
+        if start_kernel > 0:
+            self.start_dw: nn.Module = ConvBNAct(
+                channels, channels, start_kernel, groups=channels
+            )
+        else:
+            self.start_dw = nn.Identity()
+        self.expand = ConvBNAct(channels, hidden, 1, padding=0)
+        if middle_kernel > 0:
+            self.middle_dw: nn.Module = ConvBNAct(
+                hidden, hidden, middle_kernel, groups=hidden
+            )
+        else:
+            self.middle_dw = nn.Identity()
+        self.project = ConvBN(hidden, channels, 1, 1, 0)
+        nn.init.zeros_(self.project.bn.weight)
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = self.project(self.middle_dw(self.expand(self.start_dw(x))))
+        return self.activation(x + residual)
+
+
+class DilatedReparamBlock(nn.Module):
+    """Dilated training branches exactly fused to one DW large kernel.
+
+    The design follows the structural idea of UniRepLKNet: a large depthwise
+    branch sees wide context directly, while parallel small/dilated branches
+    ease optimization. Deployment retains one depthwise convolution.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 13,
+        deploy: bool = False,
+    ) -> None:
+        super().__init__()
+        if kernel_size < 7 or kernel_size % 2 == 0:
+            raise ValueError("large kernel must be odd and at least 7")
+        self.channels = int(channels)
+        self.kernel_size = int(kernel_size)
+        self.deploy = bool(deploy)
+        self.activation = nn.ReLU(inplace=True)
+        self.se = SqueezeExcite(channels)
+        self.channel_mixer = UniversalInvertedBottleneck(
+            channels, expansion=2.0, start_kernel=0, middle_kernel=0
+        )
+
+        if self.deploy:
+            self.reparam = nn.Conv2d(
+                channels,
+                channels,
+                kernel_size,
+                padding=kernel_size // 2,
+                groups=channels,
+                bias=True,
+            )
+        else:
+            self.large_branch = ConvBN(
+                channels,
+                channels,
+                kernel_size,
+                1,
+                kernel_size // 2,
+                groups=channels,
+            )
+            configurations = self._valid_branch_configurations(kernel_size)
+            self.small_branches = nn.ModuleList(
+                ConvBN(
+                    channels,
+                    channels,
+                    small_kernel,
+                    1,
+                    dilation * (small_kernel // 2),
+                    groups=channels,
+                    dilation=dilation,
+                )
+                for small_kernel, dilation in configurations
+            )
+            self.branch_configurations = configurations
+            self.identity = nn.BatchNorm2d(channels)
+
+    @staticmethod
+    def _valid_branch_configurations(
+        kernel_size: int,
+    ) -> Tuple[Tuple[int, int], ...]:
+        candidates = ((5, 1), (3, 2), (3, 3), (3, 5))
+        return tuple(
+            (kernel, dilation)
+            for kernel, dilation in candidates
+            if 1 + (kernel - 1) * dilation <= kernel_size
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.deploy:
+            spatial = self.reparam(x)
+        else:
+            spatial = self.large_branch(x) + self.identity(x)
+            for branch in self.small_branches:
+                spatial = spatial + branch(x)
+        x = x + self.se(self.activation(spatial))
+        return self.channel_mixer(x)
+
+    def _embed_dilated_kernel(self, kernel: Tensor, dilation: int) -> Tensor:
+        target = kernel.new_zeros(
+            kernel.shape[0], kernel.shape[1], self.kernel_size, self.kernel_size
+        )
+        small = kernel.shape[-1]
+        center = self.kernel_size // 2
+        start = center - (small // 2) * dilation
+        stop = start + small * dilation
+        target[:, :, start:stop:dilation, start:stop:dilation] = kernel
+        return target
+
+    def _fuse_identity(self) -> Tuple[Tensor, Tensor]:
+        norm = self.identity
+        kernel = norm.weight.new_zeros(
+            self.channels, 1, self.kernel_size, self.kernel_size
+        )
+        kernel[:, 0, self.kernel_size // 2, self.kernel_size // 2] = 1.0
+        std = torch.sqrt(norm.running_var + norm.eps)
+        scale = norm.weight / std
+        return (
+            kernel * scale.reshape(-1, 1, 1, 1),
+            norm.bias - norm.running_mean * scale,
+        )
+
+    def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        if self.deploy:
+            return self.reparam.weight, self.reparam.bias
+        kernel, bias = _fuse_conv_bn(self.large_branch)
+        identity_kernel, identity_bias = self._fuse_identity()
+        kernel, bias = kernel + identity_kernel, bias + identity_bias
+        for configuration, branch in zip(
+            self.branch_configurations, self.small_branches
+        ):
+            _, dilation = configuration
+            branch_kernel, branch_bias = _fuse_conv_bn(branch)
+            kernel += self._embed_dilated_kernel(branch_kernel, dilation)
+            bias += branch_bias
+        return kernel, bias
+
+    def switch_to_deploy(self) -> None:
+        if self.deploy:
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        reparam = nn.Conv2d(
+            self.channels,
+            self.channels,
+            self.kernel_size,
+            padding=self.kernel_size // 2,
+            groups=self.channels,
+            bias=True,
+        ).to(device=kernel.device, dtype=kernel.dtype)
+        with torch.no_grad():
+            reparam.weight.copy_(kernel)
+            reparam.bias.copy_(bias)
+        self.reparam = reparam
+        del self.large_branch
+        del self.small_branches
+        del self.identity
+        self.deploy = True
+
+
+def _uib_stage(channels: int, blocks: int) -> nn.Sequential:
     return nn.Sequential(
         *[
-            RepVGGBlock(channels, channels, deploy=deploy)
+            UniversalInvertedBottleneck(channels)
             for _ in range(max(1, int(blocks)))
         ]
     )
 
 
-class ProgressiveDAPPM(nn.Module):
-    """Progressively aggregate adaptive pooled context at the semantic S32 map.
+def _large_kernel_stage(
+    channels: int,
+    blocks: int,
+    kernel_size: int,
+    deploy: bool,
+) -> nn.Sequential:
+    return nn.Sequential(
+        *[
+            DilatedReparamBlock(
+                channels, kernel_size=kernel_size, deploy=deploy
+            )
+            for _ in range(max(1, int(blocks)))
+        ]
+    )
 
-    GroupNorm keeps the global 1x1 branch valid for small per-GPU batches.
-    Pooling proceeds from finer to coarser grids, so each stage adds broader
-    context to the previous representation before concatenation.
-    """
+
+class CompactPyramidContext(nn.Module):
+    """Independent 1/2/4-grid context aggregation on the S32 stream."""
 
     def __init__(
         self,
         in_channels: int,
         branch_channels: int,
         out_channels: int,
-        pool_sizes: Sequence[int] = (1, 2, 4, 8),
+        pool_sizes: Sequence[int] = (1, 2, 4),
     ) -> None:
         super().__init__()
-        sizes = tuple(sorted({int(size) for size in pool_sizes}, reverse=True))
+        sizes = tuple(sorted({int(size) for size in pool_sizes}))
         if not sizes or min(sizes) < 1:
-            raise ValueError("DAPPM pool sizes must be positive")
+            raise ValueError("context pool sizes must be positive")
         self.pool_sizes = sizes
-        self.scale0 = ConvGNAct(in_channels, branch_channels, 1, padding=0)
-        self.pool_projections = nn.ModuleList(
+        self.local = ConvGNAct(in_channels, branch_channels, 1, padding=0)
+        self.projections = nn.ModuleList(
             ConvGNAct(in_channels, branch_channels, 1, padding=0)
             for _ in sizes
         )
         self.processes = nn.ModuleList(
-            ConvGNAct(branch_channels, branch_channels, 3)
-            for _ in sizes
+            ConvGNAct(branch_channels, branch_channels, 3) for _ in sizes
         )
         self.compression = ConvGNAct(
             branch_channels * (len(sizes) + 1),
@@ -154,96 +350,84 @@ class ProgressiveDAPPM(nn.Module):
             activation=False,
         )
         self.shortcut = ConvGNAct(
-            in_channels,
-            out_channels,
-            1,
-            padding=0,
-            activation=False,
+            in_channels, out_channels, 1, padding=0, activation=False
         )
         self.activation = nn.ReLU(inplace=True)
 
     def forward(self, x: Tensor) -> Tensor:
         output_size = x.shape[-2:]
-        previous = self.scale0(x)
-        outputs = [previous]
+        outputs = [self.local(x)]
         for configured_size, projection, process in zip(
-            self.pool_sizes, self.pool_projections, self.processes
+            self.pool_sizes, self.projections, self.processes
         ):
             grid = max(1, min(configured_size, *output_size))
             pooled = F.adaptive_avg_pool2d(x, (grid, grid))
-            pooled = projection(pooled)
-            pooled = F.interpolate(
-                pooled,
-                size=output_size,
-                mode="bilinear",
-                align_corners=False,
+            pooled = process(projection(pooled))
+            outputs.append(
+                F.interpolate(
+                    pooled,
+                    size=output_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
             )
-            previous = process(previous + pooled)
-            outputs.append(previous)
-        context = self.compression(torch.cat(outputs, dim=1))
-        return self.activation(context + self.shortcut(x))
+        return self.activation(
+            self.compression(torch.cat(outputs, dim=1)) + self.shortcut(x)
+        )
 
 
-class DualResolutionContext(nn.Module):
-    """Detail S8 and semantic S16/S32 branches with two bilateral fusions."""
+class ModernDualResolutionContext(nn.Module):
+    """Detail S4 plus semantic S8/S16/S32 with bilateral exchange."""
 
     def __init__(
         self,
-        detail_channels: int = 96,
+        detail_channels: int = 64,
         semantic_channels: int = 192,
-        dappm_channels: int = 32,
-        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (2, 2, 1),
+        context_channels: int = 32,
+        context_pool_sizes: Sequence[int] = (1, 2, 4),
+        detail_blocks: Sequence[int] = (1, 1, 1),
         semantic_blocks: int = 2,
-        fusion_blocks: int = 2,
+        fusion_blocks: int = 1,
+        large_kernel_size: int = 13,
         deploy: bool = False,
     ) -> None:
         super().__init__()
         if len(detail_blocks) != 3:
             raise ValueError("detail_blocks must contain three stage depths")
-        self.detail_projection = ConvBNAct(128, detail_channels, 1, padding=0)
+        self.detail_projection = ConvBNAct(64, detail_channels, 1, padding=0)
         self.detail_stages = nn.ModuleList(
-            _rep_stage(detail_channels, depth, deploy)
-            for depth in detail_blocks
+            _uib_stage(detail_channels, depth) for depth in detail_blocks
         )
 
-        self.semantic_downstage = nn.Sequential(
-            ConvBNAct(256, semantic_channels, 3, stride=2),
-            _rep_stage(semantic_channels, semantic_blocks, deploy),
-        )
-
-        # S16 <-> S8. Only detail-to-semantic is zero-initialized, protecting
-        # the pretrained ResNet semantic representation at the start.
         self.semantic_to_detail_1 = ConvBNAct(
-            256, detail_channels, 1, padding=0, activation=False
+            128, detail_channels, 1, padding=0, activation=False
         )
         self.detail_to_semantic_1 = ConvBNAct(
             detail_channels,
-            256,
+            128,
             3,
             stride=2,
             activation=False,
             zero_init_bn=True,
         )
 
-        # S32 <-> S8. The detail path is downsampled twice to align exactly.
-        self.semantic_to_detail_2 = ConvBNAct(
-            semantic_channels,
-            detail_channels,
-            1,
-            padding=0,
-            activation=False,
+        self.semantic_s16_projection = ConvBNAct(
+            256, semantic_channels, 1, padding=0
         )
-        intermediate_channels = max(128, detail_channels)
+        self.semantic_s16_refine = _large_kernel_stage(
+            semantic_channels,
+            semantic_blocks,
+            large_kernel_size,
+            deploy,
+        )
+        self.semantic_to_detail_2 = ConvBNAct(
+            semantic_channels, detail_channels, 1, padding=0, activation=False
+        )
+        intermediate = max(96, detail_channels)
         self.detail_to_semantic_2 = nn.Sequential(
+            ConvBNAct(detail_channels, intermediate, 3, stride=2),
             ConvBNAct(
-                detail_channels,
-                intermediate_channels,
-                3,
-                stride=2,
-            ),
-            ConvBNAct(
-                intermediate_channels,
+                intermediate,
                 semantic_channels,
                 3,
                 stride=2,
@@ -252,24 +436,33 @@ class DualResolutionContext(nn.Module):
             ),
         )
 
-        self.dappm = ProgressiveDAPPM(
-            semantic_channels,
-            dappm_channels,
-            detail_channels,
-            pool_sizes=dappm_pool_sizes,
+        self.semantic_s32 = nn.Sequential(
+            ConvBNAct(semantic_channels, semantic_channels, 3, stride=2),
+            _large_kernel_stage(
+                semantic_channels,
+                max(1, semantic_blocks - 1),
+                large_kernel_size,
+                deploy,
+            ),
         )
-        self.final_refine = _rep_stage(detail_channels, fusion_blocks, deploy)
+        self.context = CompactPyramidContext(
+            semantic_channels,
+            context_channels,
+            detail_channels,
+            pool_sizes=context_pool_sizes,
+        )
+        self.final_refine = _uib_stage(detail_channels, fusion_blocks)
         self.activation = nn.ReLU(inplace=True)
 
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
         return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
-    def forward(self, shared_s8: Tensor, semantic_s16: Tensor) -> Tensor:
-        detail = self.detail_stages[0](self.detail_projection(shared_s8))
-        semantic = semantic_s16
-
-        detail_before, semantic_before = detail, semantic
+    def fuse_s8(
+        self, shallow_s4: Tensor, shared_s8: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        detail = self.detail_stages[0](self.detail_projection(shallow_s4))
+        detail_before, semantic_before = detail, shared_s8
         detail = self.activation(
             detail_before
             + self._resize(
@@ -280,10 +473,13 @@ class DualResolutionContext(nn.Module):
         semantic = self.activation(
             semantic_before + self.detail_to_semantic_1(detail_before)
         )
+        return self.detail_stages[1](detail), semantic
 
-        detail = self.detail_stages[1](detail)
-        semantic = self.semantic_downstage(semantic)
-        detail_before, semantic_before = detail, semantic
+    def finish(self, detail_s4: Tensor, resnet_s16: Tensor) -> Tensor:
+        semantic = self.semantic_s16_refine(
+            self.semantic_s16_projection(resnet_s16)
+        )
+        detail_before, semantic_before = detail_s4, semantic
         detail = self.activation(
             detail_before
             + self._resize(
@@ -294,15 +490,14 @@ class DualResolutionContext(nn.Module):
         semantic = self.activation(
             semantic_before + self.detail_to_semantic_2(detail_before)
         )
-
         detail = self.detail_stages[2](detail)
-        semantic = self.dappm(semantic)
+        semantic = self.context(self.semantic_s32(semantic))
         semantic = self._resize(semantic, detail.shape[-2:])
         return self.final_refine(detail + semantic)
 
 
-class DualBranchRoadNet(nn.Module):
-    """Dual-resolution road model with progressive-unfreezing support."""
+class ModernRoadNet(nn.Module):
+    """Modern compact road network with optional staged unfreezing support."""
 
     PHASE_NAMES = {
         0: "head_only",
@@ -315,13 +510,14 @@ class DualBranchRoadNet(nn.Module):
     def __init__(
         self,
         num_classes: int = 2,
-        detail_channels: int = 96,
+        detail_channels: int = 64,
         semantic_channels: int = 192,
-        dappm_channels: int = 32,
-        dappm_pool_sizes: Sequence[int] = (1, 2, 4, 8),
-        detail_blocks: Sequence[int] = (2, 2, 1),
+        context_channels: int = 32,
+        context_pool_sizes: Sequence[int] = (1, 2, 4),
+        detail_blocks: Sequence[int] = (1, 1, 1),
         semantic_blocks: int = 2,
-        fusion_blocks: int = 2,
+        fusion_blocks: int = 1,
+        large_kernel_size: int = 13,
         decoder_s4_channels: int = 64,
         decoder_s2_channels: int = 32,
         full_channels: int = 24,
@@ -335,17 +531,18 @@ class DualBranchRoadNet(nn.Module):
             imagenet_pretrained=imagenet_pretrained,
             encoder_weights_path=encoder_weights_path,
         )
-        self.dual_branch = DualResolutionContext(
+        self.dual_branch = ModernDualResolutionContext(
             detail_channels=detail_channels,
             semantic_channels=semantic_channels,
-            dappm_channels=dappm_channels,
-            dappm_pool_sizes=dappm_pool_sizes,
+            context_channels=context_channels,
+            context_pool_sizes=context_pool_sizes,
             detail_blocks=detail_blocks,
             semantic_blocks=semantic_blocks,
             fusion_blocks=fusion_blocks,
+            large_kernel_size=large_kernel_size,
             deploy=deploy,
         )
-        self.decode_head = RoadReconstructionDecoder(
+        self.decode_head = ModernRoadDecoder(
             stem_channels=64,
             shallow_channels=64,
             fused_channels=detail_channels,
@@ -358,54 +555,54 @@ class DualBranchRoadNet(nn.Module):
         )
         self.current_phase = 4
 
-    def forward(self, image: Tensor):
+    def forward(self, image: Tensor) -> Tensor:
         output_size = image.shape[-2:]
-        if not self.training or self.current_phase >= 4:
-            stem, shallow, shared, semantic = self.encoder(image)
-        elif self.current_phase <= 1:
-            with torch.no_grad():
-                stem, shallow, shared, semantic = self.encoder(image)
-        elif self.current_phase == 2:
-            with torch.no_grad():
-                stem = self.encoder.stem(image)
-                shallow = self.encoder.layer1(self.encoder.maxpool(stem))
-                shared = self.encoder.layer2(shallow)
-            semantic = self.encoder.layer3(shared)
-        else:
-            with torch.no_grad():
-                stem = self.encoder.stem(image)
-                shallow = self.encoder.layer1(self.encoder.maxpool(stem))
-            shared = self.encoder.layer2(shallow)
-            semantic = self.encoder.layer3(shared)
+        stem = self.encoder.stem(image)
+        shallow = self.encoder.layer1(self.encoder.maxpool(stem))
+        shared = self.encoder.layer2(shallow)
+        detail, semantic_s8 = self.dual_branch.fuse_s8(shallow, shared)
+        semantic_s16 = self.encoder.layer3(semantic_s8)
+        fused_s4 = self.dual_branch.finish(detail, semantic_s16)
+        return self.decode_head(stem, shallow, fused_s4, output_size)
 
-        if self.training and self.current_phase == 0:
-            with torch.no_grad():
-                fused = self.dual_branch(shared, semantic)
-        else:
-            fused = self.dual_branch(shared, semantic)
-        return self.decode_head(stem, shallow, fused, output_size)
+    def _phase_modules(self, phase: int) -> Tuple[nn.Module, ...]:
+        modules: list[nn.Module] = [self.decode_head]
+        if phase >= 1:
+            modules.append(self.dual_branch)
+        if phase >= 2:
+            modules.append(self.encoder.layer3)
+        if phase >= 3:
+            modules.append(self.encoder.layer2)
+        if phase >= 4:
+            modules.extend((self.encoder.stem, self.encoder.layer1))
+        return tuple(modules)
 
     def set_trainable_phase(self, phase: int) -> str:
         phase = int(phase)
         if phase not in self.PHASE_NAMES:
             raise ValueError(f"Unknown trainable phase: {phase}")
         self.current_phase = phase
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+        for module in self._phase_modules(phase):
+            for parameter in module.parameters():
+                parameter.requires_grad_(True)
         return self.PHASE_NAMES[phase]
 
-    def enforce_frozen_norm_eval(self, freeze_encoder_bn: bool = True) -> None:
-        frozen_modules: list[nn.Module] = []
-        if self.current_phase == 0:
-            frozen_modules.append(self.dual_branch)
-        if self.current_phase <= 1:
-            frozen_modules.append(self.encoder.layer3)
-        if self.current_phase <= 2:
-            frozen_modules.append(self.encoder.layer2)
-        if self.current_phase <= 3:
-            frozen_modules.extend((self.encoder.stem, self.encoder.layer1))
-        for frozen in frozen_modules:
-            for module in frozen.modules():
-                if isinstance(module, nn.BatchNorm2d):
-                    module.eval()
+    def enforce_frozen_norm_eval(self, freeze_encoder_bn: bool = False) -> None:
+        trainable_modules = set(self._phase_modules(self.current_phase))
+        groups = (
+            self.dual_branch,
+            self.encoder.layer3,
+            self.encoder.layer2,
+            self.encoder.stem,
+            self.encoder.layer1,
+        )
+        for group in groups:
+            if group not in trainable_modules:
+                for module in group.modules():
+                    if isinstance(module, nn.BatchNorm2d):
+                        module.eval()
         if freeze_encoder_bn:
             for module in self.encoder.modules():
                 if isinstance(module, nn.BatchNorm2d):
@@ -413,19 +610,10 @@ class DualBranchRoadNet(nn.Module):
 
     def trainable_parameter_counts(self) -> Tuple[int, int]:
         total = sum(parameter.numel() for parameter in self.parameters())
-        modules: list[nn.Module] = [self.decode_head]
-        if self.current_phase >= 1:
-            modules.append(self.dual_branch)
-        if self.current_phase >= 2:
-            modules.append(self.encoder.layer3)
-        if self.current_phase >= 3:
-            modules.append(self.encoder.layer2)
-        if self.current_phase >= 4:
-            modules.extend((self.encoder.stem, self.encoder.layer1))
         trainable = sum(
             parameter.numel()
-            for module in modules
-            for parameter in module.parameters()
+            for parameter in self.parameters()
+            if parameter.requires_grad
         )
         return trainable, total
 
@@ -444,21 +632,27 @@ class DualBranchRoadNet(nn.Module):
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
-            if isinstance(module, (RepVGGBlock, RepDepthwiseBlock)):
+            if isinstance(
+                module, (RepVGGBlock, RepDepthwiseBlock, DilatedReparamBlock)
+            ):
                 module.switch_to_deploy()
 
 
-def build_model(args) -> DualBranchRoadNet:
+DualBranchRoadNet = ModernRoadNet
+
+
+def build_model(args) -> ModernRoadNet:
     """Build from an argparse Namespace or compatible attribute container."""
-    return DualBranchRoadNet(
+    return ModernRoadNet(
         num_classes=2,
         detail_channels=int(args.detail_channels),
         semantic_channels=int(args.semantic_channels),
-        dappm_channels=int(args.dappm_channels),
-        dappm_pool_sizes=tuple(int(value) for value in args.dappm_pool_sizes),
+        context_channels=int(args.dappm_channels),
+        context_pool_sizes=tuple(int(value) for value in args.dappm_pool_sizes),
         detail_blocks=tuple(int(value) for value in args.detail_blocks),
         semantic_blocks=int(args.semantic_blocks),
         fusion_blocks=int(args.fusion_blocks),
+        large_kernel_size=int(args.large_kernel_size),
         decoder_s4_channels=int(args.decoder_s4_channels),
         decoder_s2_channels=int(args.decoder_s2_channels),
         full_channels=int(args.full_channels),
@@ -466,3 +660,15 @@ def build_model(args) -> DualBranchRoadNet:
         imagenet_pretrained=bool(args.imagenet_pretrained),
         encoder_weights_path=args.encoder_weights_path,
     )
+
+
+@torch.no_grad()
+def verify_large_kernel_reparameterization(
+    block: DilatedReparamBlock,
+    shape: Tuple[int, int, int, int],
+) -> float:
+    block.eval()
+    sample = torch.randn(shape, device=next(block.parameters()).device)
+    reference = block(sample)
+    block.switch_to_deploy()
+    return float((reference - block(sample)).abs().max())
