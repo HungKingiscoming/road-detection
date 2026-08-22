@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -27,8 +28,16 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
-from modeling.decoder import RoadSegCenterlineTverskyLoss
-from modeling.model import DualBranchRoadNet, build_model
+from modeling.decoder import RoadSegSkeletonRecallLoss
+from modeling.model import ModernRoadNet, build_model
+
+try:
+    from skimage.morphology import binary_dilation, skeletonize
+except ImportError as error:
+    raise ImportError(
+        "scikit-image is required for offline tubed-skeleton targets; "
+        "run: pip install scikit-image"
+    ) from error
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -92,7 +101,7 @@ def rank_zero_print(*values, **kwargs) -> None:
         print(*values, **kwargs)
 
 
-def unwrap_model(model: nn.Module) -> DualBranchRoadNet:
+def unwrap_model(model: nn.Module) -> ModernRoadNet:
     return model.module if isinstance(model, DDP) else model  # type: ignore[return-value]
 
 
@@ -240,8 +249,9 @@ def configure_dataset_paths(args: argparse.Namespace) -> None:
         )
         args.train_image_dir = args.train_image_dir or str(root / "train")
         args.train_mask_dir = args.train_mask_dir or str(root / "train_labels")
-        args.val_image_dir = args.val_image_dir or str(root / "val")
-        args.val_mask_dir = args.val_mask_dir or str(root / "val_labels")
+        if args.use_official_val:
+            args.val_image_dir = args.val_image_dir or str(root / "val")
+            args.val_mask_dir = args.val_mask_dir or str(root / "val_labels")
         return
 
     root = Path(
@@ -363,6 +373,34 @@ def random_crop_pair(
     )
 
 
+def resize_pair(
+    image: np.ndarray, mask: np.ndarray, size: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resize a complete tile; bilinear RGB and nearest-neighbor labels."""
+    image_pil = Image.fromarray(np.ascontiguousarray(image)).resize(
+        (size, size), resample=Image.Resampling.BILINEAR
+    )
+    mask_pil = Image.fromarray(np.ascontiguousarray(mask)).resize(
+        (size, size), resample=Image.Resampling.NEAREST
+    )
+    return (
+        np.asarray(image_pil, dtype=np.uint8).copy(),
+        (np.asarray(mask_pil) > 0).astype(np.uint8),
+    )
+
+
+def tubed_skeleton_target(mask: np.ndarray, dilation_iterations: int) -> np.ndarray:
+    """Precompute the ECCV'24 Skeleton Recall target in a CPU worker."""
+    road = mask.astype(bool, copy=False)
+    if not road.any():
+        return np.zeros_like(mask, dtype=np.float32)
+    skeleton = skeletonize(road)
+    for _ in range(max(0, int(dilation_iterations))):
+        skeleton = binary_dilation(skeleton)
+    # Dilation must not supervise pixels outside the annotated road region.
+    return np.asarray(skeleton & road, dtype=np.float32)
+
+
 def augment_pair(
     image: np.ndarray, mask: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -404,31 +442,45 @@ class RoadCropDataset(Dataset):
         road_crop_probability: float,
         road_crop_min_fraction: float,
         road_crop_tries: int,
+        full_resize_probability: float,
+        samples_per_image: int,
+        skeleton_tube_iterations: int,
     ) -> None:
         self.pairs = list(pairs)
         self.crop_size = int(crop_size)
         self.road_crop_probability = float(road_crop_probability)
         self.road_crop_min_fraction = float(road_crop_min_fraction)
         self.road_crop_tries = int(road_crop_tries)
+        self.full_resize_probability = float(full_resize_probability)
+        self.samples_per_image = int(samples_per_image)
+        self.skeleton_tube_iterations = int(skeleton_tube_iterations)
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self.pairs) * self.samples_per_image
 
     def __getitem__(self, index: int):
-        image_path, mask_path = self.pairs[index]
+        image_path, mask_path = self.pairs[index % len(self.pairs)]
         image, mask = read_rgb(image_path), read_binary_mask(mask_path)
         if image.shape[:2] != mask.shape:
             raise RuntimeError(f"Shape mismatch: {image_path} vs {mask_path}")
-        image, mask = random_crop_pair(
-            image,
-            mask,
-            self.crop_size,
-            self.road_crop_probability,
-            self.road_crop_min_fraction,
-            self.road_crop_tries,
-        )
+        if random.random() < self.full_resize_probability:
+            image, mask = resize_pair(image, mask, self.crop_size)
+        else:
+            image, mask = random_crop_pair(
+                image,
+                mask,
+                self.crop_size,
+                self.road_crop_probability,
+                self.road_crop_min_fraction,
+                self.road_crop_tries,
+            )
         image, mask = augment_pair(image, mask)
-        return image_to_tensor(image), torch.from_numpy(mask).long()
+        skeleton = tubed_skeleton_target(mask, self.skeleton_tube_iterations)
+        return (
+            image_to_tensor(image),
+            torch.from_numpy(mask).long(),
+            torch.from_numpy(skeleton).float(),
+        )
 
 
 class RoadNativeValidationDataset(Dataset):
@@ -519,6 +571,9 @@ def make_loaders(
         road_crop_probability=args.road_crop_probability,
         road_crop_min_fraction=args.road_crop_min_fraction,
         road_crop_tries=args.road_crop_tries,
+        full_resize_probability=args.full_resize_probability,
+        samples_per_image=args.samples_per_image,
+        skeleton_tube_iterations=args.skeleton_tube_iterations,
     )
     val_dataset = RoadNativeValidationDataset(val_pairs)
     train_sampler: Optional[DistributedSampler]
@@ -607,7 +662,7 @@ def distributed_road_weight(
 # ---------------------------------------------------------------------------
 
 
-def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW:
+def build_optimizer(model: ModernRoadNet, args: argparse.Namespace) -> AdamW:
     factors = {
         "head": 1.0,
         "dual_branch": args.dual_branch_lr_factor,
@@ -639,7 +694,16 @@ def build_optimizer(model: DualBranchRoadNet, args: argparse.Namespace) -> AdamW
                 )
     if len(seen) != len(list(model.parameters())):
         raise RuntimeError("Some model parameters were not assigned to the optimizer")
-    return AdamW(groups, betas=(0.9, 0.999))
+    optimizer_kwargs = {"betas": (0.9, 0.999)}
+    try:
+        return AdamW(
+            groups,
+            fused=bool(torch.cuda.is_available()),
+            **optimizer_kwargs,
+        )
+    except (TypeError, RuntimeError):
+        # Compatibility fallback for older PyTorch builds/accelerators.
+        return AdamW(groups, **optimizer_kwargs)
 
 
 def build_scheduler(
@@ -731,7 +795,7 @@ def train_one_epoch(
     model: nn.Module,
     ema: ModelEMA,
     loader: DataLoader,
-    criterion: RoadSegCenterlineTverskyLoss,
+    criterion: RoadSegSkeletonRecallLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler,
@@ -739,18 +803,19 @@ def train_one_epoch(
     epoch: int,
     args: argparse.Namespace,
 ) -> Dict[str, float]:
+    epoch_start = perf_counter()
     model.train()
     base_model = unwrap_model(model)
     base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
-    if args.aux_warmup_epochs:
-        aux_scale = min(1.0, (epoch + 1) / args.aux_warmup_epochs)
-    else:
-        aux_scale = 1.0
-    criterion.aux_weight = args.aux_weight * aux_scale
-
     meters = {
         name: RunningAverage()
-        for name in ("total", "main_ce", "main_dice", "aux", "road_fraction")
+        for name in (
+            "total",
+            "main_ce",
+            "main_dice",
+            "skeleton_recall",
+            "road_fraction",
+        )
     }
     optimizer.zero_grad(set_to_none=True)
     successful_updates, skipped_nonfinite = 0, 0
@@ -759,10 +824,12 @@ def train_one_epoch(
         desc=f"Train {epoch + 1:03d}",
         leave=False,
         disable=not is_main_process(),
+        mininterval=1.0,
     )
-    for step, (images, masks) in enumerate(progress):
+    for step, (images, masks, skeletons) in enumerate(progress):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        skeletons = skeletons.to(device, non_blocking=True)
         if args.channels_last:
             images = images.contiguous(memory_format=torch.channels_last)
         group_start = (step // args.accumulation_steps) * args.accumulation_steps
@@ -780,19 +847,12 @@ def train_one_epoch(
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=args.use_amp
             ):
-                losses = criterion(model(images), masks)
+                losses = criterion(model(images), masks, skeletons)
                 scaled_loss = losses["loss_total"] / group_size
-            finite = torch.tensor(
-                int(torch.isfinite(scaled_loss).item()),
-                dtype=torch.int32,
-                device=device,
-            )
-            if distributed_active():
-                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-            if not bool(finite.item()):
-                skipped_nonfinite += 1
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            # All ranks always enter backward. DDP propagates non-finite
+            # gradients across ranks and GradScaler then skips the update on
+            # every rank consistently. This removes a blocking all-reduce and
+            # two device synchronizations from every healthy batch.
             scaler.scale(scaled_loss).backward()
 
         if do_update:
@@ -806,17 +866,26 @@ def train_one_epoch(
                 scheduler.step()
                 ema.update(base_model)
                 successful_updates += 1
+            else:
+                skipped_nonfinite += 1
 
         batch = int(images.shape[0])
-        meters["total"].update(float(losses["loss_total"].detach()), batch)
-        meters["main_ce"].update(float(losses["loss_main_ce"]), batch)
-        meters["main_dice"].update(float(losses["loss_main_dice"]), batch)
-        meters["aux"].update(float(losses["loss_aux_centerline"]), batch)
-        meters["road_fraction"].update(float((masks > 0).float().mean()), batch)
+        # One device-to-host copy replaces five scalar synchronizations.
+        metric_values = torch.stack(
+            (
+                losses["loss_total"].detach(),
+                losses["loss_main_ce"],
+                losses["loss_main_dice"],
+                losses["loss_skeleton_recall"],
+                (masks > 0).float().mean(),
+            )
+        ).float().cpu().tolist()
+        for name, value in zip(meters, metric_values):
+            meters[name].update(value, batch)
         progress.set_postfix(
             loss=f"{meters['total'].mean:.4f}",
             lr=f"{head_lr(optimizer):.2e}",
-            aux=f"{criterion.aux_weight:.3f}",
+            srec=f"{criterion.skeleton_recall_weight:.3f}",
         )
 
     if distributed_active():
@@ -833,11 +902,14 @@ def train_one_epoch(
         )
         dist.all_reduce(counters, op=dist.ReduceOp.MAX)
         successful_updates, skipped_nonfinite = map(int, counters.tolist())
+    elapsed = max(perf_counter() - epoch_start, 1e-6)
     return {name: meter.mean for name, meter in meters.items()} | {
         "lr": head_lr(optimizer),
-        "aux_weight": criterion.aux_weight,
+        "skeleton_recall_weight": criterion.skeleton_recall_weight,
         "successful_updates": float(successful_updates),
         "skipped_nonfinite": float(skipped_nonfinite),
+        "seconds": elapsed,
+        "images_per_second": meters["total"].count / elapsed,
     }
 
 
@@ -1111,9 +1183,8 @@ def transfer_weights(
         model.load_state_dict(clean_state_dict(state), strict=True)
     except RuntimeError as error:
         raise RuntimeError(
-            "Transfer checkpoint architecture does not match DualBranchRoadNet. "
-            "DeepGlobe pretraining and Massachusetts fine-tuning must use the "
-            "same branch/decoder/DAPPM configuration."
+            "Transfer checkpoint architecture does not match ModernRoadNet. "
+            "Only checkpoints created by this V2 architecture can be loaded."
         ) from error
     return checkpoint_path
 
@@ -1194,6 +1265,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_mask_dir", default=None)
     parser.add_argument("--val_image_dir", default=None)
     parser.add_argument("--val_mask_dir", default=None)
+    parser.add_argument(
+        "--use_official_val",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Massachusetts val14; default uses a deterministic train holdout",
+    )
     parser.add_argument("--val_ratio", type=float, default=0.10)
     parser.add_argument(
         "--test_ratio",
@@ -1203,22 +1280,36 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split_seed", type=int, default=3407)
 
-    parser.add_argument("--crop_size", type=int, default=1024)
+    parser.add_argument("--crop_size", type=int, default=768)
     parser.add_argument("--road_crop_probability", type=float, default=0.70)
     parser.add_argument("--road_crop_min_fraction", type=float, default=0.002)
     parser.add_argument("--road_crop_tries", type=int, default=8)
+    parser.add_argument(
+        "--full_resize_probability",
+        type=float,
+        default=0.50,
+        help="Probability of resizing a full 1500px tile instead of native crop",
+    )
+    parser.add_argument(
+        "--samples_per_image",
+        type=int,
+        default=2,
+        help="Stochastic samples drawn from each training tile per epoch",
+    )
+    parser.add_argument("--skeleton_tube_iterations", type=int, default=2)
 
-    parser.add_argument("--detail_channels", type=int, default=96)
+    parser.add_argument("--detail_channels", type=int, default=64)
     parser.add_argument("--semantic_channels", type=int, default=192)
     parser.add_argument("--dappm_channels", type=int, default=32)
     parser.add_argument(
-        "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4, 8)
+        "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4)
     )
     parser.add_argument(
-        "--detail_blocks", nargs=3, type=int, default=(2, 2, 1)
+        "--detail_blocks", nargs=3, type=int, default=(1, 1, 1)
     )
     parser.add_argument("--semantic_blocks", type=int, default=2)
-    parser.add_argument("--fusion_blocks", type=int, default=2)
+    parser.add_argument("--fusion_blocks", type=int, default=1)
+    parser.add_argument("--large_kernel_size", type=int, default=13)
     parser.add_argument("--decoder_s4_channels", type=int, default=64)
     parser.add_argument("--decoder_s2_channels", type=int, default=32)
     parser.add_argument("--full_channels", type=int, default=24)
@@ -1234,10 +1325,10 @@ def parse_args() -> argparse.Namespace:
         help="Local torchvision-format ResNet-34 weights; avoids downloading",
     )
 
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=2, help="Per GPU")
-    parser.add_argument("--accumulation_steps", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-4, help="Decoder/head LR")
+    parser.add_argument("--epochs", type=int, default=140)
+    parser.add_argument("--batch_size", type=int, default=4, help="Per GPU")
+    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=3e-4, help="Decoder/head LR")
     parser.add_argument(
         "--dual_branch_lr_factor",
         "--bottleneck_lr_factor",
@@ -1246,10 +1337,10 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help="LR factor for detail/semantic branches; old flag kept as alias",
     )
-    parser.add_argument("--backbone_lr_factor", type=float, default=0.20)
-    parser.add_argument("--early_encoder_lr_factor", type=float, default=0.10)
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.35)
+    parser.add_argument("--early_encoder_lr_factor", type=float, default=0.20)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--warmup_start_factor", type=float, default=0.10)
     parser.add_argument("--min_lr_ratio", type=float, default=0.02)
     parser.add_argument("--grad_clip", type=float, default=3.0)
@@ -1263,18 +1354,13 @@ def parse_args() -> argparse.Namespace:
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
     parser.add_argument("--main_dice_weight", type=float, default=1.0)
-    parser.add_argument("--aux_weight", type=float, default=0.20)
-    parser.add_argument("--aux_warmup_epochs", type=int, default=5)
-    parser.add_argument("--centerline_alpha", type=float, default=0.30)
-    parser.add_argument("--centerline_beta", type=float, default=0.70)
-    parser.add_argument("--centerline_dilation", type=int, default=1)
-    parser.add_argument("--skeleton_iterations", type=int, default=8)
+    parser.add_argument("--skeleton_recall_weight", type=float, default=0.30)
 
     parser.add_argument(
         "--progressive_unfreeze",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Default: enabled for transfer runs, disabled otherwise",
+        default=False,
+        help="Optional ablation; direct Massachusetts training should leave it off",
     )
     parser.add_argument(
         "--unfreeze_dual_branch_epoch",
@@ -1293,7 +1379,7 @@ def parse_args() -> argparse.Namespace:
         help="Negative keeps ResNet stem/layer1 frozen for the whole transfer run",
     )
     parser.add_argument(
-        "--freeze_encoder_bn", action=argparse.BooleanOptionalAction, default=True
+        "--freeze_encoder_bn", action=argparse.BooleanOptionalAction, default=False
     )
 
     parser.add_argument("--val_tile_size", type=int, default=1024)
@@ -1318,7 +1404,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained_checkpoint", default=None)
     parser.add_argument("--transfer_weights", choices=("ema", "model"), default="ema")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--save_dir", default="./checkpoints/dual_branch_roadnet")
+    parser.add_argument("--save_dir", default="./checkpoints/modern_roadnet_mass")
     return parser.parse_args()
 
 
@@ -1329,6 +1415,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("val_overlap must satisfy 0 <= overlap < tile size")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         raise ValueError("batch_size and accumulation_steps must be positive")
+    if not 0.0 <= args.full_resize_probability <= 1.0:
+        raise ValueError("full_resize_probability must be in [0, 1]")
+    if args.samples_per_image < 1:
+        raise ValueError("samples_per_image must be positive")
+    if args.skeleton_tube_iterations < 0:
+        raise ValueError("skeleton_tube_iterations cannot be negative")
     if args.fixed_road_weight is not None and args.fixed_road_weight <= 0.0:
         raise ValueError("fixed_road_weight must be positive")
     if not 0.0 < args.val_ratio < 1.0:
@@ -1353,14 +1445,10 @@ def validate_args(args: argparse.Namespace) -> None:
     )
     if min(channel_values) < 1:
         raise ValueError("All architecture channel counts must be positive")
-    if not 0.0 <= args.centerline_alpha <= 1.0:
-        raise ValueError("centerline_alpha must be in [0, 1]")
-    if not 0.0 <= args.centerline_beta <= 1.0:
-        raise ValueError("centerline_beta must be in [0, 1]")
-    if args.centerline_alpha + args.centerline_beta <= 0.0:
-        raise ValueError("centerline_alpha + centerline_beta must be positive")
-    if args.centerline_dilation < 0:
-        raise ValueError("centerline_dilation cannot be negative")
+    if args.large_kernel_size < 7 or args.large_kernel_size % 2 == 0:
+        raise ValueError("large_kernel_size must be odd and at least 7")
+    if args.skeleton_recall_weight < 0.0:
+        raise ValueError("skeleton_recall_weight cannot be negative")
     if args.progressive_unfreeze:
         epochs = (
             args.unfreeze_dual_branch_epoch,
@@ -1478,7 +1566,7 @@ def main() -> None:
         build_args.imagenet_pretrained and not build_args.encoder_weights_path
     )
     rank_zero_print(
-        "[startup 4/5] Building DualBranchRoadNet"
+        "[startup 4/5] Building ModernRoadNet"
         + (
             " and loading/downloading ImageNet ResNet-34 weights..."
             if needs_imagenet_cache
@@ -1486,10 +1574,10 @@ def main() -> None:
         )
     )
     if distributed and rank != 0 and needs_imagenet_cache:
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
     model = build_model(build_args).to(device)
     if distributed and rank == 0 and needs_imagenet_cache:
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
     if args.pretrained_checkpoint:
@@ -1507,14 +1595,10 @@ def main() -> None:
     scheduler = build_scheduler(optimizer, updates_per_epoch, args)
     scaler = make_grad_scaler(args.use_amp)
     ema = ModelEMA(model, args.ema_decay)
-    criterion = RoadSegCenterlineTverskyLoss(
+    criterion = RoadSegSkeletonRecallLoss(
         road_class_weight=road_weight,
         main_dice_weight=args.main_dice_weight,
-        aux_weight=args.aux_weight,
-        centerline_alpha=args.centerline_alpha,
-        centerline_beta=args.centerline_beta,
-        skeleton_iterations=args.skeleton_iterations,
-        centerline_dilation=args.centerline_dilation,
+        skeleton_recall_weight=args.skeleton_recall_weight,
     ).to(device)
 
     start_epoch, best_fixed, best_calibrated = 0, -1.0, -1.0
@@ -1537,7 +1621,7 @@ def main() -> None:
 
     effective_batch = args.batch_size * world_size * args.accumulation_steps
     rank_zero_print("=" * 78)
-    rank_zero_print("DualBranchRoadNet road training")
+    rank_zero_print("ModernRoadNet direct road training")
     rank_zero_print(
         f"dataset={args.dataset} | DDP={distributed} | GPUs={world_size} | "
         f"AMP={args.use_amp} | channels_last={args.channels_last}"
@@ -1547,9 +1631,10 @@ def main() -> None:
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
     rank_zero_print(
-        f"shared ResNet34 to S8 | detail={args.detail_channels}ch S8 | "
-        f"semantic={args.semantic_channels}ch S32 | DAPPM="
-        f"{args.dappm_channels}ch grids={tuple(args.dappm_pool_sizes)}"
+        f"ResNet34 S8/S16 | detail={args.detail_channels}ch S4 | "
+        f"semantic={args.semantic_channels}ch S16/S32 | large kernel="
+        f"{args.large_kernel_size} | context={args.dappm_channels}ch "
+        f"grids={tuple(args.dappm_pool_sizes)}"
     )
     rank_zero_print(
         f"decoder S4/S2/S1={args.decoder_s4_channels}/"
@@ -1561,8 +1646,13 @@ def main() -> None:
         f"road CE weight={road_weight:.3f}"
     )
     rank_zero_print(
-        "loss=weighted CE + Dice + auxiliary_weight*centerline Tversky "
-        f"(alpha={args.centerline_alpha:.2f}, beta={args.centerline_beta:.2f})"
+        "loss=weighted CE + Dice + skeleton_recall_weight*SkeletonRecall "
+        f"(weight={args.skeleton_recall_weight:.2f})"
+    )
+    rank_zero_print(
+        f"data mix=full resize {args.full_resize_probability:.0%} + native crop | "
+        f"samples/image={args.samples_per_image} | skeleton tube="
+        f"{args.skeleton_tube_iterations} dilation(s)"
     )
     rank_zero_print(
         f"progressive_unfreeze={args.progressive_unfreeze} | "
@@ -1606,6 +1696,7 @@ def main() -> None:
             best_fixed, best_calibrated = max(best_fixed, fixed), max(best_calibrated, calibrated)
             rank_zero_print(
                 f"train loss={train_metrics['total']:.5f} | "
+                f"throughput={train_metrics['images_per_second']:.1f} img/s | "
                 f"fixed@.50 road IoU={fixed:.5f} | "
                 f"calibrated road IoU={calibrated:.5f} "
                 f"@{validation_metrics['calibrated_threshold']:.2f} | "
