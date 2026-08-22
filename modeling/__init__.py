@@ -1,3 +1,5 @@
+"""Modern compact road extraction model package."""
+
 from .decoder import RoadSegSkeletonRecallLoss
 from .model import ModernRoadNet, build_model
 
