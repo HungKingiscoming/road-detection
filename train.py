@@ -1,3 +1,15 @@
+"""Modern DDP trainer for direct Massachusetts road extraction.
+
+The default workflow starts from ImageNet ResNet-34 weights only, trains every
+stage end-to-end, mixes native crops with whole-image resize samples, and adds
+Skeleton Recall supervision to the main road logits.  No DeepGlobe checkpoint
+or inference-time auxiliary head is required.
+
+Launch two T4 GPUs with::
+
+    torchrun --standalone --nproc_per_node=2 train.py [arguments]
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -389,6 +401,25 @@ def resize_pair(
     )
 
 
+def scale_pair(
+    image: np.ndarray, mask: np.ndarray, scale: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Joint scale jitter while preserving binary mask interpolation."""
+    height, width = mask.shape
+    new_height = max(32, int(round(height * float(scale))))
+    new_width = max(32, int(round(width * float(scale))))
+    image_pil = Image.fromarray(np.ascontiguousarray(image)).resize(
+        (new_width, new_height), resample=Image.Resampling.BILINEAR
+    )
+    mask_pil = Image.fromarray(np.ascontiguousarray(mask)).resize(
+        (new_width, new_height), resample=Image.Resampling.NEAREST
+    )
+    return (
+        np.asarray(image_pil, dtype=np.uint8).copy(),
+        (np.asarray(mask_pil) > 0).astype(np.uint8),
+    )
+
+
 def tubed_skeleton_target(mask: np.ndarray, dilation_iterations: int) -> np.ndarray:
     """Precompute the ECCV'24 Skeleton Recall target in a CPU worker."""
     road = mask.astype(bool, copy=False)
@@ -443,6 +474,8 @@ class RoadCropDataset(Dataset):
         road_crop_min_fraction: float,
         road_crop_tries: int,
         full_resize_probability: float,
+        scale_min: float,
+        scale_max: float,
         samples_per_image: int,
         skeleton_tube_iterations: int,
     ) -> None:
@@ -452,6 +485,8 @@ class RoadCropDataset(Dataset):
         self.road_crop_min_fraction = float(road_crop_min_fraction)
         self.road_crop_tries = int(road_crop_tries)
         self.full_resize_probability = float(full_resize_probability)
+        self.scale_min = float(scale_min)
+        self.scale_max = float(scale_max)
         self.samples_per_image = int(samples_per_image)
         self.skeleton_tube_iterations = int(skeleton_tube_iterations)
 
@@ -466,6 +501,9 @@ class RoadCropDataset(Dataset):
         if random.random() < self.full_resize_probability:
             image, mask = resize_pair(image, mask, self.crop_size)
         else:
+            image, mask = scale_pair(
+                image, mask, random.uniform(self.scale_min, self.scale_max)
+            )
             image, mask = random_crop_pair(
                 image,
                 mask,
@@ -572,6 +610,8 @@ def make_loaders(
         road_crop_min_fraction=args.road_crop_min_fraction,
         road_crop_tries=args.road_crop_tries,
         full_resize_probability=args.full_resize_probability,
+        scale_min=args.scale_min,
+        scale_max=args.scale_max,
         samples_per_image=args.samples_per_image,
         skeleton_tube_iterations=args.skeleton_tube_iterations,
     )
@@ -666,6 +706,7 @@ def build_optimizer(model: ModernRoadNet, args: argparse.Namespace) -> AdamW:
     factors = {
         "head": 1.0,
         "dual_branch": args.dual_branch_lr_factor,
+        "layer4": args.backbone_lr_factor,
         "layer3": args.backbone_lr_factor,
         "layer2": args.backbone_lr_factor,
         "early_encoder": args.early_encoder_lr_factor,
@@ -807,6 +848,15 @@ def train_one_epoch(
     model.train()
     base_model = unwrap_model(model)
     base_model.enforce_frozen_norm_eval(args.freeze_encoder_bn)
+    if args.skeleton_warmup_epochs > 0:
+        skeleton_scale = min(
+            1.0, (epoch + 1) / float(args.skeleton_warmup_epochs)
+        )
+    else:
+        skeleton_scale = 1.0
+    criterion.skeleton_recall_weight = (
+        args.skeleton_recall_weight * skeleton_scale
+    )
     meters = {
         name: RunningAverage()
         for name in (
@@ -1287,9 +1337,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--full_resize_probability",
         type=float,
-        default=0.50,
+        default=0.35,
         help="Probability of resizing a full 1500px tile instead of native crop",
     )
+    parser.add_argument("--scale_min", type=float, default=0.75)
+    parser.add_argument("--scale_max", type=float, default=1.25)
     parser.add_argument(
         "--samples_per_image",
         type=int,
@@ -1298,21 +1350,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skeleton_tube_iterations", type=int, default=2)
 
-    parser.add_argument("--detail_channels", type=int, default=64)
-    parser.add_argument("--semantic_channels", type=int, default=192)
-    parser.add_argument("--dappm_channels", type=int, default=32)
+    parser.add_argument("--detail_channels", type=int, default=80)
+    parser.add_argument("--semantic_channels", type=int, default=256)
+    parser.add_argument("--dappm_channels", type=int, default=48)
     parser.add_argument(
         "--dappm_pool_sizes", nargs="+", type=int, default=(1, 2, 4)
     )
     parser.add_argument(
-        "--detail_blocks", nargs=3, type=int, default=(1, 1, 1)
+        "--detail_blocks", nargs=3, type=int, default=(2, 1, 1)
     )
     parser.add_argument("--semantic_blocks", type=int, default=2)
-    parser.add_argument("--fusion_blocks", type=int, default=1)
+    parser.add_argument("--fusion_blocks", type=int, default=2)
     parser.add_argument("--large_kernel_size", type=int, default=13)
-    parser.add_argument("--decoder_s4_channels", type=int, default=64)
-    parser.add_argument("--decoder_s2_channels", type=int, default=32)
-    parser.add_argument("--full_channels", type=int, default=24)
+    parser.add_argument("--decoder_s4_channels", type=int, default=80)
+    parser.add_argument("--decoder_s2_channels", type=int, default=40)
+    parser.add_argument("--full_channels", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument(
         "--imagenet_pretrained",
@@ -1325,9 +1377,9 @@ def parse_args() -> argparse.Namespace:
         help="Local torchvision-format ResNet-34 weights; avoids downloading",
     )
 
-    parser.add_argument("--epochs", type=int, default=140)
-    parser.add_argument("--batch_size", type=int, default=4, help="Per GPU")
-    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=160)
+    parser.add_argument("--batch_size", type=int, default=2, help="Per GPU")
+    parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4, help="Decoder/head LR")
     parser.add_argument(
         "--dual_branch_lr_factor",
@@ -1354,7 +1406,8 @@ def parse_args() -> argparse.Namespace:
         help="Positive value skips the startup mask scan and uses this CE weight",
     )
     parser.add_argument("--main_dice_weight", type=float, default=1.0)
-    parser.add_argument("--skeleton_recall_weight", type=float, default=0.30)
+    parser.add_argument("--skeleton_recall_weight", type=float, default=0.15)
+    parser.add_argument("--skeleton_warmup_epochs", type=int, default=10)
 
     parser.add_argument(
         "--progressive_unfreeze",
@@ -1385,7 +1438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_tile_size", type=int, default=1024)
     parser.add_argument("--val_overlap", type=int, default=256)
     parser.add_argument("--val_tile_batch_size", type=int, default=2)
-    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_interval", type=int, default=5)
     parser.add_argument("--threshold_min", type=float, default=0.20)
     parser.add_argument("--threshold_max", type=float, default=0.80)
     parser.add_argument("--threshold_step", type=float, default=0.02)
@@ -1404,7 +1457,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained_checkpoint", default=None)
     parser.add_argument("--transfer_weights", choices=("ema", "model"), default="ema")
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--save_dir", default="./checkpoints/modern_roadnet_mass")
+    parser.add_argument(
+        "--save_dir", default="./checkpoints/modern_roadnet_mass_accuracy160"
+    )
     return parser.parse_args()
 
 
@@ -1417,6 +1472,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch_size and accumulation_steps must be positive")
     if not 0.0 <= args.full_resize_probability <= 1.0:
         raise ValueError("full_resize_probability must be in [0, 1]")
+    if args.scale_min <= 0.0 or args.scale_max < args.scale_min:
+        raise ValueError("scale range must satisfy 0 < scale_min <= scale_max")
     if args.samples_per_image < 1:
         raise ValueError("samples_per_image must be positive")
     if args.skeleton_tube_iterations < 0:
@@ -1449,6 +1506,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("large_kernel_size must be odd and at least 7")
     if args.skeleton_recall_weight < 0.0:
         raise ValueError("skeleton_recall_weight cannot be negative")
+    if args.skeleton_warmup_epochs < 0:
+        raise ValueError("skeleton_warmup_epochs cannot be negative")
     if args.progressive_unfreeze:
         epochs = (
             args.unfreeze_dual_branch_epoch,
@@ -1631,8 +1690,8 @@ def main() -> None:
         f"accumulation={args.accumulation_steps} | effective batch={effective_batch}"
     )
     rank_zero_print(
-        f"ResNet34 S8/S16 | detail={args.detail_channels}ch S4 | "
-        f"semantic={args.semantic_channels}ch S16/S32 | large kernel="
+        f"full ResNet34 S8/S16/S32 | detail={args.detail_channels}ch S4 | "
+        f"semantic projection={args.semantic_channels}ch S32 | large kernel="
         f"{args.large_kernel_size} | context={args.dappm_channels}ch "
         f"grids={tuple(args.dappm_pool_sizes)}"
     )
@@ -1647,10 +1706,12 @@ def main() -> None:
     )
     rank_zero_print(
         "loss=weighted CE + Dice + skeleton_recall_weight*SkeletonRecall "
-        f"(weight={args.skeleton_recall_weight:.2f})"
+        f"(target={args.skeleton_recall_weight:.2f}, warmup="
+        f"{args.skeleton_warmup_epochs} epochs)"
     )
     rank_zero_print(
-        f"data mix=full resize {args.full_resize_probability:.0%} + native crop | "
+        f"data mix=full resize {args.full_resize_probability:.0%} + "
+        f"scale-jitter crop [{args.scale_min:.2f}, {args.scale_max:.2f}] | "
         f"samples/image={args.samples_per_image} | skeleton tube="
         f"{args.skeleton_tube_iterations} dilation(s)"
     )
