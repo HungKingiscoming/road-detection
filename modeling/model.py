@@ -186,9 +186,11 @@ class DilatedReparamBlock(nn.Module):
         self.se = SqueezeExcite(channels)
         # Near-identity initialization protects the ImageNet feature
         # distribution seen by the following pretrained ResNet stage.
-        self.residual_scale = nn.Parameter(
-            torch.full((1, channels, 1, 1), 1e-3)
-        )
+        # Keep this learnable scale one-dimensional.  A 4-D parameter with
+        # singleton spatial dimensions is re-strided by ``channels_last``;
+        # the broadcast gradient then has a different layout from DDP's
+        # bucket view and triggers a reducer performance warning.
+        self.residual_scale = nn.Parameter(torch.full((channels,), 1e-3))
         self.channel_mixer = UniversalInvertedBottleneck(
             channels, expansion=2.0, start_kernel=0, middle_kernel=0
         )
@@ -245,7 +247,8 @@ class DilatedReparamBlock(nn.Module):
             spatial = self.large_branch(x) + self.identity(x)
             for branch in self.small_branches:
                 spatial = spatial + branch(x)
-        x = x + self.residual_scale * self.se(self.activation(spatial))
+        scale = self.residual_scale.view(1, -1, 1, 1)
+        x = x + scale * self.se(self.activation(spatial))
         return self.channel_mixer(x)
 
     def _embed_dilated_kernel(self, kernel: Tensor, dilation: int) -> Tensor:
