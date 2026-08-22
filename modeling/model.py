@@ -1,19 +1,3 @@
-"""Dual-resolution ResNet road extraction network.
-
-Architecture
-------------
-* ImageNet ResNet-34 is shared through layer2 (output stride 8).
-* The detail branch remains narrow at stride 8.
-* The semantic branch uses ResNet layer3 at stride 16, a lightweight stride-32
-  stage, and a progressive DAPPM.
-* Two bilateral exchanges connect detail S8 with semantic S16/S32.
-* The branches merge at S8 and a road decoder restores S4, S2, and S1.
-* One train-only centerline head is supervised by Tversky loss.
-
-The network exposes stable optimizer groups and autograd-safe progressive
-unfreezing for DDP transfer learning.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
