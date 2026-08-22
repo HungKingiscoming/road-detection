@@ -1,3 +1,10 @@
+"""Deployable road decoder and CE + Dice + Skeleton Recall objective.
+
+The decoder restores S4 features to S2/S1 and emits only the two-class road
+logits. Skeleton Recall is applied directly to those main logits; the model has
+no auxiliary head and therefore no auxiliary inference cost.
+"""
+
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union
@@ -470,7 +477,7 @@ class RoadSegSkeletonRecallLoss(nn.Module):
         self,
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
-        skeleton_recall_weight: float = 0.30,
+        skeleton_recall_weight: float = 0.15,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
