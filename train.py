@@ -1,19 +1,3 @@
-"""DDP trainer for DualBranchRoadNet on DeepGlobe and Massachusetts Roads.
-
-The default transfer workflow is:
-
-1. Train the new architecture on DeepGlobe from ImageNet ResNet-34 weights.
-2. Start a fresh Massachusetts run with ``--pretrained_checkpoint`` pointing
-   to the DeepGlobe checkpoint.  EMA weights are transferred by default.
-3. The Massachusetts run automatically enables progressive unfreezing:
-   head only -> dual branch -> ResNet layer3 -> ResNet layer2. The stem and
-   layer1 stay frozen unless ``--unfreeze_all_epoch`` is set.
-
-Launch two T4 GPUs with::
-
-    torchrun --standalone --nproc_per_node=2 train.py [arguments]
-"""
-
 from __future__ import annotations
 
 import argparse
