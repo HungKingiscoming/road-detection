@@ -1,3 +1,12 @@
+"""Modern compact two-stream network for aerial road extraction.
+
+The detail stream starts at stride 4; the semantic stream uses full pretrained
+ResNet-34 features at strides 8/16/32. Bilateral
+exchanges happen at S8 and S16. Low-resolution semantic stages use dilated
+large-kernel structural re-parameterization while detail stages use efficient
+MobileNetV4-style universal inverted bottlenecks.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -82,9 +91,9 @@ def _build_resnet34(
 
 
 class TruncatedResNet34(nn.Module):
-    """ImageNet ResNet-34 stages required by the two-stream model."""
+    """ImageNet ResNet-34 through layer4 (S32), without classifier."""
 
-    out_channels = (64, 64, 128, 256)
+    out_channels = (64, 64, 128, 256, 512)
 
     def __init__(
         self,
@@ -101,6 +110,7 @@ class TruncatedResNet34(nn.Module):
         self.layer1 = backbone.layer1
         self.layer2 = backbone.layer2
         self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
 
 
 class SqueezeExcite(nn.Module):
@@ -174,6 +184,11 @@ class DilatedReparamBlock(nn.Module):
         self.deploy = bool(deploy)
         self.activation = nn.ReLU(inplace=True)
         self.se = SqueezeExcite(channels)
+        # Near-identity initialization protects the ImageNet feature
+        # distribution seen by the following pretrained ResNet stage.
+        self.residual_scale = nn.Parameter(
+            torch.full((1, channels, 1, 1), 1e-3)
+        )
         self.channel_mixer = UniversalInvertedBottleneck(
             channels, expansion=2.0, start_kernel=0, middle_kernel=0
         )
@@ -230,7 +245,7 @@ class DilatedReparamBlock(nn.Module):
             spatial = self.large_branch(x) + self.identity(x)
             for branch in self.small_branches:
                 spatial = spatial + branch(x)
-        x = x + self.se(self.activation(spatial))
+        x = x + self.residual_scale * self.se(self.activation(spatial))
         return self.channel_mixer(x)
 
     def _embed_dilated_kernel(self, kernel: Tensor, dilation: int) -> Tensor:
@@ -381,13 +396,13 @@ class ModernDualResolutionContext(nn.Module):
 
     def __init__(
         self,
-        detail_channels: int = 64,
-        semantic_channels: int = 192,
-        context_channels: int = 32,
+        detail_channels: int = 80,
+        semantic_channels: int = 256,
+        context_channels: int = 48,
         context_pool_sizes: Sequence[int] = (1, 2, 4),
-        detail_blocks: Sequence[int] = (1, 1, 1),
+        detail_blocks: Sequence[int] = (2, 1, 1),
         semantic_blocks: int = 2,
-        fusion_blocks: int = 1,
+        fusion_blocks: int = 2,
         large_kernel_size: int = 13,
         deploy: bool = False,
     ) -> None:
@@ -411,24 +426,23 @@ class ModernDualResolutionContext(nn.Module):
             zero_init_bn=True,
         )
 
-        self.semantic_s16_projection = ConvBNAct(
-            256, semantic_channels, 1, padding=0
-        )
+        # Keep S16 at 256 channels so the pretrained ResNet layer4 remains
+        # structurally intact after the second bilateral exchange.
         self.semantic_s16_refine = _large_kernel_stage(
-            semantic_channels,
-            semantic_blocks,
+            256,
+            1,
             large_kernel_size,
             deploy,
         )
         self.semantic_to_detail_2 = ConvBNAct(
-            semantic_channels, detail_channels, 1, padding=0, activation=False
+            256, detail_channels, 1, padding=0, activation=False
         )
         intermediate = max(96, detail_channels)
         self.detail_to_semantic_2 = nn.Sequential(
             ConvBNAct(detail_channels, intermediate, 3, stride=2),
             ConvBNAct(
                 intermediate,
-                semantic_channels,
+                256,
                 3,
                 stride=2,
                 activation=False,
@@ -436,11 +450,11 @@ class ModernDualResolutionContext(nn.Module):
             ),
         )
 
-        self.semantic_s32 = nn.Sequential(
-            ConvBNAct(semantic_channels, semantic_channels, 3, stride=2),
+        self.semantic_s32_refine = nn.Sequential(
+            ConvBNAct(512, semantic_channels, 1, padding=0),
             _large_kernel_stage(
                 semantic_channels,
-                max(1, semantic_blocks - 1),
+                semantic_blocks,
                 large_kernel_size,
                 deploy,
             ),
@@ -475,10 +489,10 @@ class ModernDualResolutionContext(nn.Module):
         )
         return self.detail_stages[1](detail), semantic
 
-    def finish(self, detail_s4: Tensor, resnet_s16: Tensor) -> Tensor:
-        semantic = self.semantic_s16_refine(
-            self.semantic_s16_projection(resnet_s16)
-        )
+    def fuse_s16(
+        self, detail_s4: Tensor, resnet_s16: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        semantic = self.semantic_s16_refine(resnet_s16)
         detail_before, semantic_before = detail_s4, semantic
         detail = self.activation(
             detail_before
@@ -490,10 +504,12 @@ class ModernDualResolutionContext(nn.Module):
         semantic = self.activation(
             semantic_before + self.detail_to_semantic_2(detail_before)
         )
-        detail = self.detail_stages[2](detail)
-        semantic = self.context(self.semantic_s32(semantic))
-        semantic = self._resize(semantic, detail.shape[-2:])
-        return self.final_refine(detail + semantic)
+        return self.detail_stages[2](detail), semantic
+
+    def finish(self, detail_s4: Tensor, resnet_s32: Tensor) -> Tensor:
+        semantic = self.context(self.semantic_s32_refine(resnet_s32))
+        semantic = self._resize(semantic, detail_s4.shape[-2:])
+        return self.final_refine(detail_s4 + semantic)
 
 
 class ModernRoadNet(nn.Module):
@@ -502,7 +518,7 @@ class ModernRoadNet(nn.Module):
     PHASE_NAMES = {
         0: "head_only",
         1: "head_plus_dual_branch",
-        2: "plus_resnet_layer3",
+        2: "plus_resnet_layer3_layer4",
         3: "plus_resnet_layer2",
         4: "all_trainable",
     }
@@ -510,17 +526,17 @@ class ModernRoadNet(nn.Module):
     def __init__(
         self,
         num_classes: int = 2,
-        detail_channels: int = 64,
-        semantic_channels: int = 192,
-        context_channels: int = 32,
+        detail_channels: int = 80,
+        semantic_channels: int = 256,
+        context_channels: int = 48,
         context_pool_sizes: Sequence[int] = (1, 2, 4),
-        detail_blocks: Sequence[int] = (1, 1, 1),
+        detail_blocks: Sequence[int] = (2, 1, 1),
         semantic_blocks: int = 2,
-        fusion_blocks: int = 1,
+        fusion_blocks: int = 2,
         large_kernel_size: int = 13,
-        decoder_s4_channels: int = 64,
-        decoder_s2_channels: int = 32,
-        full_channels: int = 24,
+        decoder_s4_channels: int = 80,
+        decoder_s2_channels: int = 40,
+        full_channels: int = 32,
         dropout: float = 0.05,
         imagenet_pretrained: bool = True,
         encoder_weights_path: Optional[str] = None,
@@ -562,7 +578,11 @@ class ModernRoadNet(nn.Module):
         shared = self.encoder.layer2(shallow)
         detail, semantic_s8 = self.dual_branch.fuse_s8(shallow, shared)
         semantic_s16 = self.encoder.layer3(semantic_s8)
-        fused_s4 = self.dual_branch.finish(detail, semantic_s16)
+        detail, semantic_s16 = self.dual_branch.fuse_s16(
+            detail, semantic_s16
+        )
+        semantic_s32 = self.encoder.layer4(semantic_s16)
+        fused_s4 = self.dual_branch.finish(detail, semantic_s32)
         return self.decode_head(stem, shallow, fused_s4, output_size)
 
     def _phase_modules(self, phase: int) -> Tuple[nn.Module, ...]:
@@ -570,7 +590,7 @@ class ModernRoadNet(nn.Module):
         if phase >= 1:
             modules.append(self.dual_branch)
         if phase >= 2:
-            modules.append(self.encoder.layer3)
+            modules.extend((self.encoder.layer3, self.encoder.layer4))
         if phase >= 3:
             modules.append(self.encoder.layer2)
         if phase >= 4:
@@ -593,6 +613,7 @@ class ModernRoadNet(nn.Module):
         trainable_modules = set(self._phase_modules(self.current_phase))
         groups = (
             self.dual_branch,
+            self.encoder.layer4,
             self.encoder.layer3,
             self.encoder.layer2,
             self.encoder.stem,
@@ -621,6 +642,7 @@ class ModernRoadNet(nn.Module):
         return {
             "head": self.decode_head.parameters(),
             "dual_branch": self.dual_branch.parameters(),
+            "layer4": self.encoder.layer4.parameters(),
             "layer3": self.encoder.layer3.parameters(),
             "layer2": self.encoder.layer2.parameters(),
             "early_encoder": (
