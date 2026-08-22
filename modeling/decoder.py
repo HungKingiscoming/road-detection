@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -85,6 +84,7 @@ class ConvBN(nn.Sequential):
         stride: int,
         padding: Union[int, Tuple[int, int]],
         groups: int = 1,
+        dilation: Union[int, Tuple[int, int]] = 1,
     ) -> None:
         super().__init__(
             nn.Conv2d(
@@ -94,6 +94,7 @@ class ConvBN(nn.Sequential):
                 stride=stride,
                 padding=padding,
                 groups=groups,
+                dilation=dilation,
                 bias=False,
             ),
             nn.BatchNorm2d(out_channels),
@@ -341,14 +342,31 @@ class SeparableConvBNAct(nn.Sequential):
         )
 
 
-class RoadReconstructionDecoder(nn.Module):
-    """S8-to-S1 road decoder with S4/S2 skips and one centerline head."""
+def binary_dice_loss(
+    probability: Tensor, target: Tensor, eps: float = 1e-6
+) -> Tensor:
+    probability = probability.float().flatten(1)
+    target = target.float().flatten(1)
+    intersection = (probability * target).sum(dim=1)
+    denominator = probability.sum(dim=1) + target.sum(dim=1)
+    return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
+
+
+class ModernRoadDecoder(nn.Module):
+    """Light S4-to-S1 decoder for the modern two-stream model.
+
+    The high-resolution stream already arrives at stride 4, so the decoder
+    does not repeat an expensive S8-to-S4 reconstruction.  It merges the
+    pretrained ResNet S4/S2 skips, applies deployable depthwise refinement,
+    and emits only the segmentation logits.  There is no inference-time
+    auxiliary head.
+    """
 
     def __init__(
         self,
         stem_channels: int = 64,
         shallow_channels: int = 64,
-        fused_channels: int = 96,
+        fused_channels: int = 64,
         s4_channels: int = 64,
         s2_channels: int = 32,
         full_channels: int = 24,
@@ -388,16 +406,9 @@ class RoadReconstructionDecoder(nn.Module):
             RepDepthwiseBlock(s2_channels, deploy=deploy),
             RepDepthwiseBlock(s2_channels, deploy=deploy),
         )
-
         self.full_refine = SeparableConvBNAct(s2_channels, full_channels)
         self.dropout = nn.Dropout2d(dropout) if dropout > 0.0 else nn.Identity()
         self.classifier = nn.Conv2d(full_channels, num_classes, 1)
-
-        auxiliary_channels = max(24, s4_channels // 2)
-        self.centerline_head = nn.Sequential(
-            ConvBNAct(s4_channels, auxiliary_channels, 3),
-            nn.Conv2d(auxiliary_channels, 1, 1),
-        )
 
     @staticmethod
     def _resize(x: Tensor, size: Tuple[int, int]) -> Tensor:
@@ -407,22 +418,20 @@ class RoadReconstructionDecoder(nn.Module):
         self,
         stem_s2: Tensor,
         shallow_s4: Tensor,
-        fused_s8: Tensor,
+        fused_s4: Tensor,
         output_size: Tuple[int, int],
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        p4 = self._resize(self.fused_proj(fused_s8), shallow_s4.shape[-2:])
-        p4 = self.s4_fuse(torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1))
+    ) -> Tensor:
+        p4 = self.fused_proj(fused_s4)
+        p4 = self.s4_fuse(
+            torch.cat((p4, self.shallow_proj(shallow_s4)), dim=1)
+        )
         p4 = self.s4_refine(p4)
 
         p2 = self._resize(p4, stem_s2.shape[-2:])
         p2 = self.s2_fuse(torch.cat((p2, self.stem_proj(stem_s2)), dim=1))
         p2 = self.s2_refine(p2)
-
         full = self._resize(p2, output_size)
-        road_logits = self.classifier(self.dropout(self.full_refine(full)))
-        if self.training:
-            return self.centerline_head(p4), road_logits
-        return road_logits
+        return self.classifier(self.dropout(self.full_refine(full)))
 
     def switch_to_deploy(self) -> None:
         for module in list(self.modules()):
@@ -430,94 +439,50 @@ class RoadReconstructionDecoder(nn.Module):
                 module.switch_to_deploy()
 
 
-def _soft_erode(mask: Tensor) -> Tensor:
-    vertical = -F.max_pool2d(-mask, (3, 1), stride=1, padding=(1, 0))
-    horizontal = -F.max_pool2d(-mask, (1, 3), stride=1, padding=(0, 1))
-    return torch.minimum(vertical, horizontal)
-
-
-def _soft_dilate(mask: Tensor) -> Tensor:
-    return F.max_pool2d(mask, 3, stride=1, padding=1)
-
-
-def _soft_open(mask: Tensor) -> Tensor:
-    return _soft_dilate(_soft_erode(mask))
-
-
-def soft_skeletonize(mask: Tensor, iterations: int = 8) -> Tensor:
-    """Morphological skeleton target generation using only PyTorch ops."""
-    opened = _soft_open(mask)
-    skeleton = F.relu(mask - opened)
-    for _ in range(max(0, int(iterations))):
-        mask = _soft_erode(mask)
-        opened = _soft_open(mask)
-        delta = F.relu(mask - opened)
-        skeleton = skeleton + F.relu(delta - skeleton * delta)
-    return skeleton.clamp_(0.0, 1.0)
-
-
-def binary_dice_loss(
-    probability: Tensor, target: Tensor, eps: float = 1e-6
+def skeleton_recall_loss(
+    road_probability: Tensor,
+    tubed_skeleton: Tensor,
+    smooth: float = 1.0,
 ) -> Tensor:
-    probability = probability.float().flatten(1)
-    target = target.float().flatten(1)
-    intersection = (probability * target).sum(dim=1)
-    denominator = probability.sum(dim=1) + target.sum(dim=1)
-    return (1.0 - (2.0 * intersection + eps) / (denominator + eps)).mean()
+    """Soft recall on a precomputed GT tubed skeleton (ECCV 2024).
+
+    Skeletonization is deliberately absent from the autograd graph and is
+    performed by the dataset worker.  This keeps the topology term cheap and
+    differentiates only through the predicted road probability.
+    """
+    probability = road_probability.float().flatten(1)
+    skeleton = tubed_skeleton.float().flatten(1)
+    intersection = (probability * skeleton).sum(dim=1)
+    denominator = skeleton.sum(dim=1)
+    recall = (intersection + smooth) / (denominator + smooth).clamp_min(1e-8)
+    return 1.0 - recall.mean()
 
 
-def binary_tversky_loss(
-    probability: Tensor,
-    target: Tensor,
-    alpha: float = 0.30,
-    beta: float = 0.70,
-    eps: float = 1e-6,
-) -> Tensor:
-    """One centerline loss; beta > alpha penalizes broken roads more."""
-    probability = probability.float().flatten(1)
-    target = target.float().flatten(1)
-    true_positive = (probability * target).sum(dim=1)
-    false_positive = (probability * (1.0 - target)).sum(dim=1)
-    false_negative = ((1.0 - probability) * target).sum(dim=1)
-    score = (true_positive + eps) / (
-        true_positive
-        + float(alpha) * false_positive
-        + float(beta) * false_negative
-        + eps
-    )
-    return (1.0 - score).mean()
+class RoadSegSkeletonRecallLoss(nn.Module):
+    """Weighted CE + road Dice + one Skeleton Recall regularizer.
 
-
-class RoadSegCenterlineTverskyLoss(nn.Module):
-    """Main road CE+Dice and exactly one auxiliary centerline Tversky."""
+    This loss replaces the old train-only centerline head.  All three terms
+    optimize the same main segmentation output, so there is no auxiliary
+    branch or inference overhead.
+    """
 
     def __init__(
         self,
         road_class_weight: float = 2.0,
         main_dice_weight: float = 1.0,
-        aux_weight: float = 0.20,
-        centerline_alpha: float = 0.30,
-        centerline_beta: float = 0.70,
-        skeleton_iterations: int = 8,
-        centerline_dilation: int = 1,
-        fast_centerline_target: bool = True,
+        skeleton_recall_weight: float = 0.30,
     ) -> None:
         super().__init__()
         self.road_class_weight = float(road_class_weight)
         self.main_dice_weight = float(main_dice_weight)
-        self.aux_weight = float(aux_weight)
-        self.centerline_alpha = float(centerline_alpha)
-        self.centerline_beta = float(centerline_beta)
-        self.skeleton_iterations = int(skeleton_iterations)
-        self.centerline_dilation = int(centerline_dilation)
-        self.fast_centerline_target = bool(fast_centerline_target)
+        self.skeleton_recall_weight = float(skeleton_recall_weight)
 
     def forward(
         self,
-        outputs: Tuple[Tensor, Tensor],
+        road_logits: Tensor,
         target: Tensor,
+        tubed_skeleton: Tensor,
     ) -> Dict[str, Tensor]:
-        centerline_logits, road_logits = outputs
         labels = (target > 0).long()
         road_mask = labels.unsqueeze(1).float()
         class_weights = road_logits.new_tensor([1.0, self.road_class_weight])
@@ -526,72 +491,19 @@ class RoadSegCenterlineTverskyLoss(nn.Module):
         )
         road_probability = road_logits.float().softmax(dim=1)[:, 1:2]
         loss_main_dice = binary_dice_loss(road_probability, road_mask)
-
-        with torch.no_grad():
-            target_dilation = self.centerline_dilation
-            if self.fast_centerline_target:
-                # The auxiliary head lives at S4. Skeletonizing a 512x512 mask
-                # performs roughly 40 full-resolution pooling passes for the
-                # default settings. Pooling first preserves thin positives and
-                # cuts this auxiliary-target cost by well over an order of
-                # magnitude without changing the Tversky objective.
-                target_height, target_width = centerline_logits.shape[-2:]
-                scale = max(
-                    road_mask.shape[-2] / max(target_height, 1),
-                    road_mask.shape[-1] / max(target_width, 1),
-                )
-                skeleton_input = F.adaptive_max_pool2d(
-                    road_mask.float(), (target_height, target_width)
-                )
-                target_iterations = (
-                    max(1, math.ceil(self.skeleton_iterations / scale))
-                    if self.skeleton_iterations > 0
-                    else 0
-                )
-                # The CLI dilation is expressed in input pixels. Convert it
-                # to the auxiliary grid so dilation=1 does not accidentally
-                # become a +/-4-pixel tolerance at S4.
-                target_dilation = max(
-                    0, int(math.floor(self.centerline_dilation / scale + 0.5))
-                )
-                centerline_target = soft_skeletonize(
-                    skeleton_input, target_iterations
-                )
-            else:
-                centerline_target = soft_skeletonize(
-                    road_mask.float(), self.skeleton_iterations
-                )
-            if target_dilation > 0:
-                kernel = 2 * target_dilation + 1
-                centerline_target = F.max_pool2d(
-                    centerline_target,
-                    kernel,
-                    stride=1,
-                    padding=target_dilation,
-                )
-            if centerline_target.shape[-2:] != centerline_logits.shape[-2:]:
-                # Full-resolution compatibility/ablation path.
-                centerline_target = F.adaptive_max_pool2d(
-                    centerline_target, centerline_logits.shape[-2:]
-                )
-
-        loss_centerline = binary_tversky_loss(
-            centerline_logits.float().sigmoid(),
-            centerline_target,
-            alpha=self.centerline_alpha,
-            beta=self.centerline_beta,
+        loss_skeleton_recall = skeleton_recall_loss(
+            road_probability, tubed_skeleton
         )
         total = (
             loss_main_ce
             + self.main_dice_weight * loss_main_dice
-            + self.aux_weight * loss_centerline
+            + self.skeleton_recall_weight * loss_skeleton_recall
         )
         return {
             "loss_total": total,
             "loss_main_ce": loss_main_ce.detach(),
             "loss_main_dice": loss_main_dice.detach(),
-            "loss_aux_centerline": loss_centerline.detach(),
-            "loss_centerline_tversky": loss_centerline.detach(),
+            "loss_skeleton_recall": loss_skeleton_recall.detach(),
         }
 
 
